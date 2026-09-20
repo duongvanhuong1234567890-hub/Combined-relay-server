@@ -65,6 +65,7 @@ CHẠY TRÊN TERMUX:
 
 import subprocess
 import shlex
+import time
 import random
 import os
 import traceback
@@ -171,7 +172,7 @@ YT_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
 # [low-bw] Mặc định đã hạ xuống mức "tiết kiệm băng thông" (audio 8kHz ~16KB/s, JPEG nén mạnh) vì đường truyền
 # ESP32 <-> Render chỉ đạt ~25KB/s trong khi mặc định cũ (audio 16kHz + JPEG q20) cần ~47KB/s.
 # Muốn chất lượng cao hơn (khi chạy relay trong LAN nhà) thì đặt biến môi trường AUDIO_RATE=16000 MJPEG_Q=20.
-MJPEG_Q = os.environ.get("MJPEG_Q", "30")
+MJPEG_Q = os.environ.get("MJPEG_Q", "36")  # [low-bw] tăng từ 30 - log 20/9 cho thấy tổng audio+video (~33-34KB/s) gần chạm trần đo được (~35-38KB/s), gần như không có biên độ dư -> nén video nặng hơn 1 chút để chừa chỗ cho audio ổn định.
 FFMPEG_THREADS = os.environ.get("FFMPEG_THREADS", "1")
 AUDIO_RATE = os.environ.get("AUDIO_RATE", "8000")
 print(f"[config] AUDIO_RATE={AUDIO_RATE} MJPEG_Q={MJPEG_Q} FFMPEG_THREADS={FFMPEG_THREADS}", flush=True)  # xem dòng này trong Logs Render để biết bản mới đã chạy
@@ -465,15 +466,35 @@ def stream():
 
     # [perf] Đọc 64KB/lần thay vì 4KB: giảm số lần gọi syscall read() (mỗi
     # lần đọc nhỏ tốn thêm chi phí chuyển ngữ cảnh Python<->OS khi encode
-    # đang chạy nhanh, dồn dữ liệu). Vẫn forward NGAY từng chunk đọc được
-    # (không gộp thêm ở tầng ứng dụng) nên độ trễ audio/video giữa các
-    # chunk không đổi - chỉ đổi kích thước lần đọc, không đổi cách stream.
+    # đang chạy nhanh, dồn dữ liệu).
+    #
+    # [smooth-fix] Log thực tế (T-Display) cho thấy videoPayloadRead/realFrameGap
+    # thỉnh thoảng vọt lên gấp 3-5 lần trung bình dù trung bình vẫn nằm trong
+    # budget - đúng kiểu Render free tier bị hệ điều hành "phanh" CPU theo chu
+    # kỳ (CFS quota) rồi xả bù dữ liệu thành 1 cục lớn ngay khi được cấp lại
+    # CPU. Forward-ngay-lập-tức như cũ nghĩa là cục dữ liệu đó dội thẳng vào
+    # board, làm ring buffer audio tràn rồi lại rơi tự do. Ở đây rải đều
+    # (pace) dữ liệu ra theo STREAM_MAX_BPS thay vì đẩy nguyên cục - CHỈ làm
+    # chậm lại khi đang phát NHANH hơn target (không bao giờ cộng thêm độ trễ
+    # trong đúng lúc nguồn đang là nút thắt thật sự, tức là lúc mạng/CPU đã
+    # chậm sẵn). Đặt STREAM_MAX_BPS hơi cao hơn trần đo được (~35-38 KB/s)
+    # qua biến môi trường trên Render để không tự biến pacing thành nút thắt
+    # mới.
+    target_bps = int(os.environ.get("STREAM_MAX_BPS", "45000"))
+
     def generate():
+        t0 = time.monotonic()
+        sent = 0
         try:
             while True:
                 chunk = proc.stdout.read(65536)
                 if not chunk:
                     break
+                sent += len(chunk)
+                expected_elapsed = sent / target_bps
+                actual_elapsed = time.monotonic() - t0
+                if expected_elapsed > actual_elapsed:
+                    time.sleep(expected_elapsed - actual_elapsed)
                 yield chunk
         finally:
             proc.stdout.close()
