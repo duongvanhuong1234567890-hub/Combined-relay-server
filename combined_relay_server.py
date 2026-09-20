@@ -87,7 +87,9 @@ app = Flask(__name__)
 # /random - route này không ảnh hưởng gì tới logic phát video).
 @app.route("/")
 def health_check():
-    return "OK", 200
+    # [version-check] Mở https://<server>/ trên trình duyệt: thấy AUDIO_RATE=... nghĩa là BẢN MỚI đang chạy (bản cũ chỉ trả "OK").
+    return (f"OK | AUDIO_RATE={AUDIO_RATE} MJPEG_Q={MJPEG_Q} FFMPEG_THREADS={FFMPEG_THREADS} "
+            f"cookies={'yes' if os.path.exists(COOKIES_FILE) else 'NO'}"), 200
 
 PORT = 8000  # 1 cổng duy nhất cho cả /search, /stream (YouTube + TikTok), /random
 
@@ -166,9 +168,13 @@ YT_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
 #   MJPEG_Q    : độ nén JPEG của ffmpeg, số càng lớn ảnh càng mờ và càng nhẹ (mặc định 20)
 #   AUDIO_RATE : tần số lấy mẫu audio, 16000 -> ~32KB/s, 11025 -> ~22KB/s, 8000 -> ~16KB/s
 # Firmware đọc audioRate từ AVI header nên không cần nạp lại .ino.
-MJPEG_Q = os.environ.get("MJPEG_Q", "20")
+# [low-bw] Mặc định đã hạ xuống mức "tiết kiệm băng thông" (audio 8kHz ~16KB/s, JPEG nén mạnh) vì đường truyền
+# ESP32 <-> Render chỉ đạt ~25KB/s trong khi mặc định cũ (audio 16kHz + JPEG q20) cần ~47KB/s.
+# Muốn chất lượng cao hơn (khi chạy relay trong LAN nhà) thì đặt biến môi trường AUDIO_RATE=16000 MJPEG_Q=20.
+MJPEG_Q = os.environ.get("MJPEG_Q", "30")
 FFMPEG_THREADS = os.environ.get("FFMPEG_THREADS", "1")
-AUDIO_RATE = os.environ.get("AUDIO_RATE", "16000")
+AUDIO_RATE = os.environ.get("AUDIO_RATE", "8000")
+print(f"[config] AUDIO_RATE={AUDIO_RATE} MJPEG_Q={MJPEG_Q} FFMPEG_THREADS={FFMPEG_THREADS}", flush=True)  # xem dòng này trong Logs Render để biết bản mới đã chạy
 
 
 def _api_get(endpoint, params):
