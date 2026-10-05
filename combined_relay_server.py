@@ -67,7 +67,7 @@ def format_duration(seconds):
 YT_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
 
 
-MJPEG_Q = os.environ.get("MJPEG_Q", "36")
+MJPEG_Q = os.environ.get("MJPEG_Q", "10")
 FFMPEG_THREADS = os.environ.get("FFMPEG_THREADS", "1")
 AUDIO_RATE = os.environ.get("AUDIO_RATE", "8000")
 print(f"[config] AUDIO_RATE={AUDIO_RATE} MJPEG_Q={MJPEG_Q} FFMPEG_THREADS={FFMPEG_THREADS}", flush=True)
@@ -174,7 +174,8 @@ def resolve_stream_urls(video_url, height_cap):
     Trả về (video_url, audio_url, video_headers, audio_headers) - audio_url
     có thể None nếu video đó hiếm hoi vẫn có format gộp sẵn."""
     fmt = (
-        f"bestvideo[height<={height_cap}]+bestaudio"
+        f"bestvideo[height<={height_cap}][vcodec^=avc1]+bestaudio"
+        f"/bestvideo[height<={height_cap}]+bestaudio"
         f"/best[height<={height_cap}]"
         f"/best"
     )
@@ -245,10 +246,11 @@ def stream():
     height_cap = request.args.get("height_cap", "360")
 
 
+    min_height = int(os.environ.get("MIN_HEIGHT", "360"))
     try:
-        height_cap = str(max(int(height_cap), 144))
+        height_cap = str(max(int(height_cap), min_height))
     except ValueError:
-        height_cap = "144"
+        height_cap = str(min_height)
     fps = request.args.get("fps", "15")
 
     if not video_url:
@@ -281,7 +283,7 @@ def stream():
             f"{RECONNECT_ARGS}{audio_headers_arg}{THREADS_ARG}-i {shlex.quote(audio_direct_url)} "
             f"-map 0:v:0 -map 1:a:0 "
             f"{THREADS_ARG}"
-            f"-vf scale={w}:{h}:flags=fast_bilinear,fps={fps} "
+            f"-vf fps={fps},scale={w}:{h}:flags=bicubic "
 
 
             f"-c:v mjpeg -q:v {MJPEG_Q} "
@@ -294,7 +296,7 @@ def stream():
         cmd = (
             f"ffmpeg -v error {RECONNECT_ARGS}{video_headers_arg}{THREADS_ARG}-i {shlex.quote(video_direct_url)} "
             f"{THREADS_ARG}"
-            f"-vf scale={w}:{h}:flags=fast_bilinear,fps={fps} "
+            f"-vf fps={fps},scale={w}:{h}:flags=bicubic "
             f"-c:v mjpeg -q:v {MJPEG_Q} "
             f"-c:a pcm_s16le -ar {AUDIO_RATE} -ac 1 "
             f"-f avi pipe:1"
@@ -304,7 +306,7 @@ def stream():
     proc = subprocess.Popen(shlex.split(cmd), stdout=subprocess.PIPE, bufsize=1 << 20)
 
 
-    target_bps = int(os.environ.get("STREAM_MAX_BPS", "45000"))
+    target_bps = int(os.environ.get("STREAM_MAX_BPS", "150000"))
 
     def generate():
         t0 = time.monotonic()
