@@ -251,7 +251,13 @@ def stream():
         height_cap = str(max(int(height_cap), min_height))
     except ValueError:
         height_cap = str(min_height)
-    fps = request.args.get("fps", "15")
+    def _clamp(name, default, lo, hi):
+        try:
+            return str(max(lo, min(hi, int(request.args.get(name, default)))))
+        except ValueError:
+            return str(default)
+    fps = _clamp("fps", 15, 1, 30)
+    q = _clamp("q", MJPEG_Q, 2, 31)   # cang nho cang net (2..31)
 
     if not video_url:
         return Response(status=400)
@@ -286,7 +292,7 @@ def stream():
             f"-vf fps={fps},scale={w}:{h}:flags=bicubic "
 
 
-            f"-c:v mjpeg -q:v {MJPEG_Q} "
+            f"-c:v mjpeg -q:v {q} "
 
 
             f"-c:a pcm_s16le -ar {AUDIO_RATE} -ac 1 "
@@ -297,7 +303,7 @@ def stream():
             f"ffmpeg -v error {RECONNECT_ARGS}{video_headers_arg}{THREADS_ARG}-i {shlex.quote(video_direct_url)} "
             f"{THREADS_ARG}"
             f"-vf fps={fps},scale={w}:{h}:flags=bicubic "
-            f"-c:v mjpeg -q:v {MJPEG_Q} "
+            f"-c:v mjpeg -q:v {q} "
             f"-c:a pcm_s16le -ar {AUDIO_RATE} -ac 1 "
             f"-f avi pipe:1"
         )
@@ -306,7 +312,12 @@ def stream():
     proc = subprocess.Popen(shlex.split(cmd), stdout=subprocess.PIPE, bufsize=1 << 20)
 
 
-    target_bps = int(os.environ.get("STREAM_MAX_BPS", "150000"))
+    bps_cap = int(os.environ.get("STREAM_MAX_BPS_CAP", "400000"))
+    try:
+        target_bps = int(request.args.get("bps", os.environ.get("STREAM_MAX_BPS", "150000")))
+    except ValueError:
+        target_bps = int(os.environ.get("STREAM_MAX_BPS", "150000"))
+    target_bps = max(50000, min(bps_cap, target_bps))
 
     def generate():
         t0 = time.monotonic()
