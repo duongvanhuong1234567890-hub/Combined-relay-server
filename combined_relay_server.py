@@ -9,6 +9,8 @@ import re
 import html
 import urllib.request
 import urllib.parse
+import threading
+import fcntl
 from flask import Flask, request, Response, jsonify
 import yt_dlp
 from werkzeug.serving import WSGIRequestHandler
@@ -122,6 +124,7 @@ def search():
         try:
             res = search_via_api(query, n)
             print(f"[search] YouTube API OK: {len(res)} ket qua")
+            warm_results(res)
             return jsonify(res)
         except Exception as e:
             print(f"[search] YouTube API loi ({e}) - roi ve yt-dlp")
@@ -150,6 +153,7 @@ def search():
         print(f"[search] error: {e}")
         return jsonify([])
 
+    warm_results(results)
     return jsonify(results)
 
 
@@ -166,7 +170,7 @@ def format_ffmpeg_headers(fmt):
     return "".join(f"{k}: {v}\r\n" for k, v in headers.items())
 
 
-def resolve_stream_urls(video_url, height_cap):
+def _resolve_stream_urls_uncached(video_url, height_cap):
     """Dùng yt-dlp lấy URL luồng trực tiếp - dùng CHUNG cho cả YouTube lẫn
     TikTok, yt-dlp tự nhận diện domain trong video_url và xử lý đúng cách
     tương ứng. Đòi "bestvideo+bestaudio" (2 luồng tách biệt) rồi để ffmpeg
@@ -218,6 +222,66 @@ def resolve_stream_urls(video_url, height_cap):
         return info["url"], None, format_ffmpeg_headers(info), ""
 
 
+# ---- Bo nho dem link da resolve + lam nong (prefetch) ----
+# Resolve bang yt-dlp la buoc cham nhat (vai giay toi hon chuc giay). Link CDN song vai gio nen
+# giu lai 30 phut; sau khi tim kiem xong thi resolve san vai ket qua dau trong nen, luc nguoi dung
+# chon video thi da co san.
+RESOLVE_TTL = int(os.environ.get("RESOLVE_TTL", "1800"))
+WARM_TOP_N = int(os.environ.get("WARM_TOP_N", "3"))
+_resolve_cache = {}          # (video_url, height_cap) -> (thoi_diem, ket_qua)
+_resolve_locks = {}          # (video_url, height_cap) -> Lock, tranh resolve trung nhau
+_resolve_guard = threading.Lock()
+_active_streams = 0
+
+
+def resolve_stream_urls(video_url, height_cap):
+    key = (video_url, str(height_cap))
+    now = time.monotonic()
+    with _resolve_guard:
+        hit = _resolve_cache.get(key)
+        if hit and now - hit[0] < RESOLVE_TTL:
+            print(f"[resolve] CACHE HIT {video_url}", flush=True)
+            return hit[1]
+        lock = _resolve_locks.setdefault(key, threading.Lock())
+    with lock:                      # neu dang warm cung video thi doi no xong roi dung ket qua
+        with _resolve_guard:
+            hit = _resolve_cache.get(key)
+            if hit and time.monotonic() - hit[0] < RESOLVE_TTL:
+                print(f"[resolve] CACHE HIT (sau khi cho warm) {video_url}", flush=True)
+                return hit[1]
+        t0 = time.monotonic()
+        res = _resolve_stream_urls_uncached(video_url, height_cap)
+        print(f"[resolve] yt-dlp mat {time.monotonic() - t0:.1f}s cho {video_url}", flush=True)
+        with _resolve_guard:
+            _resolve_cache[key] = (time.monotonic(), res)
+            if len(_resolve_cache) > 60:    # don bot ban cu
+                for k in sorted(_resolve_cache, key=lambda k: _resolve_cache[k][0])[:20]:
+                    _resolve_cache.pop(k, None)
+        return res
+
+
+def _warm_worker(video_ids, height_cap):
+    for vid in video_ids:
+        if _active_streams > 0:
+            print("[warm] dang co luong phat, bo qua lam nong", flush=True)
+            return
+        try:
+            resolve_stream_urls(f"https://www.youtube.com/watch?v={vid}", height_cap)
+        except Exception as e:
+            print(f"[warm] loi {vid}: {e}", flush=True)
+
+
+def warm_results(results):
+    ids = [r["id"] for r in results if r.get("id")][:WARM_TOP_N]
+    if not ids:
+        return
+    try:
+        min_height = int(os.environ.get("MIN_HEIGHT", "360"))
+    except ValueError:
+        min_height = 360
+    threading.Thread(target=_warm_worker, args=(ids, str(min_height)), daemon=True).start()
+
+
 def load_playlist():
     """Đọc PLAYLIST_FILE, trả về list các link (đã bỏ dòng trống/comment)."""
     if not os.path.exists(PLAYLIST_FILE):
@@ -240,6 +304,7 @@ def random_link():
 
 @app.route("/stream")
 def stream():
+    t_req = time.monotonic()
     video_url = request.args.get("url", "")
     w = request.args.get("w", "320")
     h = request.args.get("h", "170")
@@ -283,12 +348,14 @@ def stream():
 
 
     THREADS_ARG = f"-threads {FFMPEG_THREADS} "
+    # Khoi dong ffmpeg nhanh hon: bot thoi gian do thong tin dau vao (mac dinh ~5s moi luong)
+    PROBE_ARG = "-probesize 500000 -analyzeduration 500000 -fflags +nobuffer "
 
     if audio_direct_url:
         cmd = (
             f"ffmpeg -v error "
-            f"{RECONNECT_ARGS}{video_headers_arg}{THREADS_ARG}-i {shlex.quote(video_direct_url)} "
-            f"{RECONNECT_ARGS}{audio_headers_arg}{THREADS_ARG}-i {shlex.quote(audio_direct_url)} "
+            f"{RECONNECT_ARGS}{video_headers_arg}{PROBE_ARG}{THREADS_ARG}-i {shlex.quote(video_direct_url)} "
+            f"{RECONNECT_ARGS}{audio_headers_arg}{PROBE_ARG}{THREADS_ARG}-i {shlex.quote(audio_direct_url)} "
             f"-map 0:v:0 -map 1:a:0 "
             f"{THREADS_ARG}"
             f"-vf fps={fps},scale={w}:{h}:flags=bicubic "
@@ -298,44 +365,59 @@ def stream():
 
 
             f"-c:a pcm_s16le -ar {ar} -ac 1 "
-            f"-f avi pipe:1"
+            f"-flush_packets 1 -f avi pipe:1"
         )
     else:
         cmd = (
-            f"ffmpeg -v error {RECONNECT_ARGS}{video_headers_arg}{THREADS_ARG}-i {shlex.quote(video_direct_url)} "
+            f"ffmpeg -v error {RECONNECT_ARGS}{video_headers_arg}{PROBE_ARG}{THREADS_ARG}-i {shlex.quote(video_direct_url)} "
             f"{THREADS_ARG}"
             f"-vf fps={fps},scale={w}:{h}:flags=bicubic "
             f"-c:v mjpeg -q:v {q} "
             f"-c:a pcm_s16le -ar {ar} -ac 1 "
-            f"-f avi pipe:1"
+            f"-flush_packets 1 -f avi pipe:1"
         )
 
 
     proc = subprocess.Popen(shlex.split(cmd), stdout=subprocess.PIPE, bufsize=1 << 20)
+    # Mo rong ong dan stdout cua ffmpeg (mac dinh 64KB) len 1MB de ffmpeg chay truoc, khong bi nghen khi mang cham
+    try:
+        fcntl.fcntl(proc.stdout.fileno(), 1031, 1 << 20)   # F_SETPIPE_SZ = 1031 (Linux)
+    except Exception:
+        pass
 
 
-    bps_cap = int(os.environ.get("STREAM_MAX_BPS_CAP", "400000"))
+    bps_cap = int(os.environ.get("STREAM_MAX_BPS_CAP", "1200000"))
     try:
         target_bps = int(request.args.get("bps", os.environ.get("STREAM_MAX_BPS", "150000")))
     except ValueError:
         target_bps = int(os.environ.get("STREAM_MAX_BPS", "150000"))
+    # Burst dau luong: gui khong han che ~768KB dau de thiet bi dem xong truoc nhanh (chi bi gioi han boi duong mang),
+    # sau do moi pacing theo target_bps. Giam thoi gian cho luc moi bam phat.
+    burst_bytes = int(os.environ.get("STREAM_BURST_BYTES", str(768 * 1024)))
     target_bps = max(25000, min(bps_cap, target_bps))   # san 25KB/s (truoc la 50KB/s) cho muc mang cuc yeu
 
     def generate():
+        global _active_streams
+        _active_streams += 1
         t0 = time.monotonic()
         sent = 0
+        first = True
         try:
             while True:
-                chunk = proc.stdout.read(65536)
+                chunk = proc.stdout.read(32768)
                 if not chunk:
                     break
+                if first:
+                    first = False
+                    print(f"[stream] byte dau tien sau {time.monotonic() - t_req:.1f}s ke tu luc nhan yeu cau", flush=True)
                 sent += len(chunk)
-                expected_elapsed = sent / target_bps
+                expected_elapsed = max(0, sent - burst_bytes) / target_bps
                 actual_elapsed = time.monotonic() - t0
                 if expected_elapsed > actual_elapsed:
                     time.sleep(expected_elapsed - actual_elapsed)
                 yield chunk
         finally:
+            _active_streams -= 1
             proc.stdout.close()
             proc.terminate()
 
