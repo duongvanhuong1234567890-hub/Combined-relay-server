@@ -71,7 +71,7 @@ YT_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
 
 MJPEG_Q = os.environ.get("MJPEG_Q", "10")
 FFMPEG_THREADS = os.environ.get("FFMPEG_THREADS", "1")
-AUDIO_RATE = os.environ.get("AUDIO_RATE", "8000")
+AUDIO_RATE = os.environ.get("AUDIO_RATE", "16000")
 print(f"[config] AUDIO_RATE={AUDIO_RATE} MJPEG_Q={MJPEG_Q} FFMPEG_THREADS={FFMPEG_THREADS}", flush=True)
 
 
