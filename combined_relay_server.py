@@ -258,6 +258,8 @@ def stream():
             return str(default)
     fps = _clamp("fps", 15, 1, 30)
     q = _clamp("q", MJPEG_Q, 2, 31)   # cang nho cang net (2..31)
+    # Toc do lay mau am thanh (PCM 16-bit mono = ar*2 byte/giay). Mang yeu thi thiet bi xin thap de giam bang thong
+    ar = _clamp("ar", AUDIO_RATE, 4000, 22050)
 
     if not video_url:
         return Response(status=400)
@@ -295,7 +297,7 @@ def stream():
             f"-c:v mjpeg -q:v {q} "
 
 
-            f"-c:a pcm_s16le -ar {AUDIO_RATE} -ac 1 "
+            f"-c:a pcm_s16le -ar {ar} -ac 1 "
             f"-f avi pipe:1"
         )
     else:
@@ -304,7 +306,7 @@ def stream():
             f"{THREADS_ARG}"
             f"-vf fps={fps},scale={w}:{h}:flags=bicubic "
             f"-c:v mjpeg -q:v {q} "
-            f"-c:a pcm_s16le -ar {AUDIO_RATE} -ac 1 "
+            f"-c:a pcm_s16le -ar {ar} -ac 1 "
             f"-f avi pipe:1"
         )
 
@@ -317,7 +319,7 @@ def stream():
         target_bps = int(request.args.get("bps", os.environ.get("STREAM_MAX_BPS", "150000")))
     except ValueError:
         target_bps = int(os.environ.get("STREAM_MAX_BPS", "150000"))
-    target_bps = max(50000, min(bps_cap, target_bps))
+    target_bps = max(25000, min(bps_cap, target_bps))   # san 25KB/s (truoc la 50KB/s) cho muc mang cuc yeu
 
     def generate():
         t0 = time.monotonic()
