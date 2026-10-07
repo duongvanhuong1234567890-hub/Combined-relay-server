@@ -190,17 +190,17 @@ def _resolve_stream_urls_uncached(video_url, height_cap):
         "skip_download": True,
 
 
-        "extractor_args": {
-            "youtube": {
-                "player_client": [
-                    "android", "ios", "tv", "mweb", "android_music",
-                    "web_embedded", "web",
-                ]
-            }
-        },
+        # De yt-dlp tu chon player client (ban moi tu xu ly PO token / cookies).
+        # Muon ep client thi dat bien moi truong YT_PLAYER_CLIENTS="tv,web_safari"
+        # Can JS runtime (node/deno) de giai chu ky YouTube - xem Dockerfile.
+        "js_runtimes": {"node": {}, "deno": {}},
+        "remote_components": ["ejs:github"],
         "geo_bypass": True,
         "socket_timeout": 15,
     }
+    _pc = os.environ.get("YT_PLAYER_CLIENTS", "").strip()
+    if _pc:
+        ydl_opts["extractor_args"] = {"youtube": {"player_client": [c.strip() for c in _pc.split(",") if c.strip()]}}
     if os.path.exists(COOKIES_FILE):
         ydl_opts["cookiefile"] = COOKIES_FILE
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -336,7 +336,7 @@ def stream():
 
         print(f"[stream] resolve error: {e}")
         traceback.print_exc()
-        return Response(status=502)
+        return jsonify({"error": "resolve_failed", "detail": str(e)[:300]}), 502
 
 
     RECONNECT_ARGS = (
