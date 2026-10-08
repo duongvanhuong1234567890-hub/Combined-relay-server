@@ -9,6 +9,7 @@ import json
 import re
 import html
 import urllib.request
+import urllib.error
 import urllib.parse
 import threading
 import fcntl
@@ -341,9 +342,18 @@ def _resolve_via_rapidapi(video_url, height_cap):
         raise RuntimeError("khong phai link YouTube")
     req = urllib.request.Request(
         f"https://{RAPIDAPI_HOST}/video/streaming-data/?id={vid}",
-        headers={"x-rapidapi-host": RAPIDAPI_HOST, "x-rapidapi-key": RAPIDAPI_KEY})
-    with urllib.request.urlopen(req, timeout=20) as r:
-        data = json.loads(r.read().decode("utf-8"))
+        headers={"x-rapidapi-host": RAPIDAPI_HOST, "x-rapidapi-key": RAPIDAPI_KEY.strip(),
+                 "User-Agent": "Mozilla/5.0 (compatible; relay/1.0)", "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", "replace")[:300]
+        except Exception:
+            pass
+        raise RuntimeError(f"HTTP {e.code}: {body}") from None
     picked = _pick_rapid_streams(data, height_cap)
     if not picked:
         keys = list(data.keys())[:15] if isinstance(data, dict) else type(data).__name__
