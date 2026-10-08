@@ -36,7 +36,10 @@ if os.path.exists(_SECRET_COOKIES):
 
 
     import shutil
-    shutil.copyfile(_SECRET_COOKIES, "/tmp/cookies.txt")
+    # Chi copy Secret lan dau. yt-dlp tu ghi lai cookies da duoc YouTube xoay vao file nay khi chay;
+    # neu moi lan restart (auto-update yt-dlp moi 12h) lai chep de Secret cu len thi mat ban moi -> bi het han.
+    if not os.path.exists("/tmp/cookies.txt"):
+        shutil.copyfile(_SECRET_COOKIES, "/tmp/cookies.txt")
     COOKIES_FILE = "/tmp/cookies.txt"
 
 
@@ -114,6 +117,24 @@ def search_via_api(query, n):
     ]
 
 
+@app.route("/myip")
+def myip():
+    """Xem IP dau ra cua server (truc tiep va qua YT_PROXY neu co) - mo tren trinh duyet de kiem tra nhanh."""
+    def _get(proxy=""):
+        try:
+            handlers = [urllib.request.ProxyHandler({"http": proxy, "https": proxy})] if proxy else []
+            with urllib.request.build_opener(*handlers).open("https://api.ipify.org", timeout=10) as r:
+                return r.read().decode().strip()
+        except Exception as e:
+            return f"loi: {str(e)[:120]}"
+    lines = [f"IP truc tiep (Render): {_get()}"]
+    if YT_PROXY:
+        lines.append(f"IP qua YT_PROXY:       {_get(YT_PROXY)}")
+    else:
+        lines.append("YT_PROXY: chua dat")
+    return Response("\n".join(lines), mimetype="text/plain; charset=utf-8")
+
+
 @app.route("/search")
 def search():
     query = request.args.get("q", "")
@@ -171,39 +192,60 @@ def format_ffmpeg_headers(fmt):
     return "".join(f"{k}: {v}\r\n" for k, v in headers.items())
 
 
-def _resolve_stream_urls_uncached(video_url, height_cap):
-    """Dùng yt-dlp lấy URL luồng trực tiếp - dùng CHUNG cho cả YouTube lẫn
-    TikTok, yt-dlp tự nhận diện domain trong video_url và xử lý đúng cách
-    tương ứng. Đòi "bestvideo+bestaudio" (2 luồng tách biệt) rồi để ffmpeg
-    tự ghép khi mux, vì phần lớn nguồn không còn phát format gộp sẵn.
-    Trả về (video_url, audio_url, video_headers, audio_headers) - audio_url
-    có thể None nếu video đó hiếm hoi vẫn có format gộp sẵn."""
-    fmt = (
-        f"bestvideo[height<={height_cap}][vcodec^=avc1]+bestaudio"
-        f"/bestvideo[height<={height_cap}]+bestaudio"
-        f"/best[height<={height_cap}]"
-        f"/best"
-    )
-    _dbg = os.environ.get("YT_DEBUG", "") == "1"   # dat YT_DEBUG=1 tren Render de xem ly do tung client that bai
-    ydl_opts = {
+# ---- Chuoi thu lai nhieu "player client" khi YouTube chan IP server ----
+# Loi "Failed to extract any player response" thuong la YouTube nghi IP datacenter cua Render la bot,
+# hoac cookies bi vo hieu (cookies dung chung nhieu IP se bi YouTube xoay/huy). Moi lan thu doi
+# cach hoi YouTube mot kieu khac; cach nao thanh cong thi nho lai de lan sau thu truoc.
+# (ten, player_client, dung cookies?, bat js runtime + ejs?)
+_YT_ATTEMPTS = [
+    # Cach khong cookies truoc: khong lam "chay" cookies tren IP datacenter
+    ("android_vr",   ["android_vr"],     False, False),
+    ("ios",          ["ios"],            False, False),
+    ("web_embedded", ["web_embedded"],   False, True),
+    # Cach can cookies de sau cung
+    ("tv",           ["tv"],             True,  True),
+    ("mac-dinh",     None,               True,  False),
+    ("runtime+ejs",  None,               True,  True),
+]
+_yt_preferred = None     # ten cach da thanh cong gan nhat
+
+# Dau ra qua proxy (chi dung cho YouTube): YT_PROXY="http://user:pass@host:port" (yt-dlp con ho tro socks5://...,
+# nhung phan ffmpeg phat luong chi dung duoc proxy http://). Link YouTube gan voi IP luc resolve nen CA yt-dlp
+# lan ffmpeg deu phai di qua cung proxy.
+YT_PROXY = os.environ.get("YT_PROXY", "").strip()
+
+
+def _is_youtube(url):
+    return re.search(r"(youtube\.com|youtu\.be)", url or "") is not None
+
+
+def _build_ydl_opts(fmt, client=None, use_cookies=True, runtimes=False, proxy=""):
+    _dbg = os.environ.get("YT_DEBUG", "") == "1"   # dat YT_DEBUG=1 tren Render de xem log chi tiet
+    opts = {
         "quiet": not _dbg,
         "no_warnings": not _dbg,
         "verbose": _dbg,
         "format": fmt,
         "skip_download": True,
-
-
-        # De yt-dlp tu chon player client (ban moi tu xu ly PO token / cookies).
-        # Muon ep client thi dat bien moi truong YT_PLAYER_CLIENTS="tv,web_safari"
-        # Can JS runtime (node/deno) de giai chu ky YouTube - xem Dockerfile.
         "geo_bypass": True,
         "socket_timeout": 15,
     }
-    _pc = os.environ.get("YT_PLAYER_CLIENTS", "").strip()
-    if _pc:
-        ydl_opts["extractor_args"] = {"youtube": {"player_client": [c.strip() for c in _pc.split(",") if c.strip()]}}
-    if os.path.exists(COOKIES_FILE):
-        ydl_opts["cookiefile"] = COOKIES_FILE
+    if client:
+        opts["extractor_args"] = {"youtube": {"player_client": list(client)}}
+    if runtimes:
+        # Can deno/node de giai chu ky YouTube (xem Dockerfile); runtime nao khong co thi yt-dlp bo qua
+        opts["js_runtimes"] = {"deno": {}, "node": {}}
+        opts["remote_components"] = ["ejs:github"]
+    if proxy:
+        opts["proxy"] = proxy
+    if use_cookies and os.path.exists(COOKIES_FILE):
+        opts["cookiefile"] = COOKIES_FILE
+    return opts
+
+
+def _extract_with(video_url, ydl_opts):
+    """Chay yt-dlp mot lan voi ydl_opts, tra ve (video_url, audio_url, video_headers, audio_headers).
+    audio_url co the None neu video do van co format gop san."""
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(video_url, download=False)
         if "entries" in info:
@@ -221,6 +263,55 @@ def _resolve_stream_urls_uncached(video_url, height_cap):
             return video_url_out, audio_url_out, video_headers, audio_headers
 
         return info["url"], None, format_ffmpeg_headers(info), ""
+
+
+_NO_RETRY_HINTS = ("Video unavailable", "Private video", "has been removed", "not available in your country")
+
+
+def _resolve_stream_urls_uncached(video_url, height_cap):
+    """Dung yt-dlp lay URL luong truc tiep (YouTube, TikTok, Facebook... yt-dlp tu nhan dien domain).
+    Doi "bestvideo+bestaudio" (2 luong tach biet) roi de ffmpeg ghep khi mux.
+    Voi YouTube: thu lan luot nhieu cach (_YT_ATTEMPTS), cach nao ra truoc thi dung."""
+    global _yt_preferred
+    fmt = (
+        f"bestvideo[height<={height_cap}][vcodec^=avc1]+bestaudio"
+        f"/bestvideo[height<={height_cap}]+bestaudio"
+        f"/best[height<={height_cap}]"
+        f"/best"
+    )
+    is_yt = _is_youtube(video_url)
+    if not is_yt:
+        return _extract_with(video_url, _build_ydl_opts(fmt, use_cookies=True))
+
+    attempts = list(_YT_ATTEMPTS)
+    # Muon ep client thi dat YT_PLAYER_CLIENTS="tv,web_safari" - se duoc thu dau tien
+    _pc = [c.strip() for c in os.environ.get("YT_PLAYER_CLIENTS", "").split(",") if c.strip()]
+    if _pc:
+        attempts.insert(0, ("env", _pc, True, True))
+    if _yt_preferred:
+        attempts.sort(key=lambda a: a[0] != _yt_preferred)   # sort on dinh: cach tot nhat len dau
+
+    budget = float(os.environ.get("YT_RESOLVE_BUDGET", "45"))   # tong thoi gian toi da cho moi lan resolve
+    t_start = time.monotonic()
+    errors = []
+    for name, client, use_cookies, runtimes in attempts:
+        if errors and time.monotonic() - t_start > budget:
+            break
+        try:
+            res = _extract_with(video_url, _build_ydl_opts(fmt, client, use_cookies, runtimes, YT_PROXY))
+            if _yt_preferred != name:
+                print(f"[resolve] cach '{name}' thanh cong", flush=True)
+            _yt_preferred = name
+            return res
+        except Exception as e:
+            msg = str(e)
+            print(f"[resolve] cach '{name}' that bai: {msg[:140]}", flush=True)
+            errors.append(f"{name}: {msg[:110]}")
+            if any(h in msg for h in _NO_RETRY_HINTS):
+                break
+    _yt_preferred = None
+    raise RuntimeError(" | ".join(errors)[:700])
+
 
 
 # ---- Bo nho dem link da resolve + lam nong (prefetch) ----
@@ -416,6 +507,8 @@ def stream():
         "-reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 "
         "-reconnect_delay_max 5 "
     )
+    if YT_PROXY and _is_youtube(video_url):
+        RECONNECT_ARGS += f"-http_proxy {shlex.quote(YT_PROXY)} "
     video_headers_arg = f"-headers {shlex.quote(video_headers)} " if video_headers else ""
     audio_headers_arg = f"-headers {shlex.quote(audio_headers)} " if audio_headers else ""
 
@@ -515,7 +608,7 @@ class _DiagLogger:
 @app.route("/diag")
 def diag():
     """Mo tren trinh duyet: /diag?v=<id video>&mode=cur|def|noremote|deno
-    cur      = giu nguyen cau hinh dang dung cua server
+    cur      = giu nguyen cau hinh dang dung cua server (js_runtimes + remote_components)
     def      = de yt-dlp tu chon JS runtime (khong ep js_runtimes / remote_components)
     noremote = giong cur nhung bo remote_components
     deno     = chi bat deno"""
@@ -545,7 +638,11 @@ def diag():
         opts["js_runtimes"] = {"node": {}, "deno": {}}
     elif mode == "deno":
         opts["js_runtimes"] = {"deno": {}}
-    if os.path.exists(COOKIES_FILE):
+    # Thu rieng 1 player client: /diag?v=<id>&mode=def&client=android_vr   (them &nocookie=1 de bo cookies)
+    _cl = request.args.get("client", "").strip()
+    if _cl:
+        opts["extractor_args"] = {"youtube": {"player_client": [c.strip() for c in _cl.split(",") if c.strip()]}}
+    if os.path.exists(COOKIES_FILE) and request.args.get("nocookie") != "1":
         opts["cookiefile"] = COOKIES_FILE
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
