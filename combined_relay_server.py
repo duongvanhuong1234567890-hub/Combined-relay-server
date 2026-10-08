@@ -1,4 +1,5 @@
 import subprocess
+import sys
 import shlex
 import time
 import random
@@ -183,9 +184,11 @@ def _resolve_stream_urls_uncached(video_url, height_cap):
         f"/best[height<={height_cap}]"
         f"/best"
     )
+    _dbg = os.environ.get("YT_DEBUG", "") == "1"   # dat YT_DEBUG=1 tren Render de xem ly do tung client that bai
     ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
+        "quiet": not _dbg,
+        "no_warnings": not _dbg,
+        "verbose": _dbg,
         "format": fmt,
         "skip_download": True,
 
@@ -232,6 +235,72 @@ _resolve_cache = {}          # (video_url, height_cap) -> (thoi_diem, ket_qua)
 _resolve_locks = {}          # (video_url, height_cap) -> Lock, tranh resolve trung nhau
 _resolve_guard = threading.Lock()
 _active_streams = 0
+
+
+# ---- Tu dong cap nhat yt-dlp ----
+# YouTube doi co che lien tuc nen yt-dlp ban cu hay hong. Server tu chay pip upgrade luc khoi dong,
+# dinh ky, va khi gap loi extract; neu co ban moi thi tu khoi dong lai tien trinh (doi luc khong phat).
+AUTO_UPDATE = os.environ.get("YTDLP_AUTO_UPDATE", "1") == "1"
+UPDATE_HOURS = float(os.environ.get("YTDLP_UPDATE_HOURS", "12"))
+_update_lock = threading.Lock()
+_last_update_try = 0.0
+
+
+def _ytdlp_version():
+    try:
+        from importlib.metadata import version
+        return version("yt-dlp")
+    except Exception:
+        return "?"
+
+
+def _update_ytdlp(min_gap=600):
+    """Chay pip upgrade yt-dlp. Tra ve True neu phien ban thay doi. Khong chay lai trong min_gap giay."""
+    global _last_update_try
+    with _update_lock:
+        if time.monotonic() - _last_update_try < min_gap and _last_update_try:
+            return False
+        _last_update_try = time.monotonic()
+        before = _ytdlp_version()
+        try:
+            r = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "-U", "--no-cache-dir", "--quiet", "yt-dlp[default]"],
+                capture_output=True, text=True, timeout=240)
+            if r.returncode != 0:
+                print(f"[update] pip loi: {r.stderr[-300:]}", flush=True)
+                return False
+        except Exception as e:
+            print(f"[update] khong chay duoc pip: {e}", flush=True)
+            return False
+        after = _ytdlp_version()
+        print(f"[update] yt-dlp {before} -> {after}", flush=True)
+        return before != after
+
+
+def _restart_when_idle():
+    for _ in range(360):                      # cho toi da ~1 gio de khong cat luong dang phat
+        if _active_streams == 0:
+            print("[update] khoi dong lai de nap yt-dlp moi", flush=True)
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        time.sleep(10)
+
+
+def _update_and_maybe_restart(min_gap=600):
+    if _update_ytdlp(min_gap):
+        _restart_when_idle()
+
+
+def _update_loop():
+    _update_and_maybe_restart(min_gap=0)
+    while True:
+        time.sleep(UPDATE_HOURS * 3600)
+        _update_and_maybe_restart(min_gap=0)
+
+
+def trigger_update_async():
+    """Goi khi gap loi extract: cap nhat nen (toi da 1 lan / 30 phut)."""
+    if AUTO_UPDATE:
+        threading.Thread(target=_update_and_maybe_restart, args=(1800,), daemon=True).start()
 
 
 def resolve_stream_urls(video_url, height_cap):
@@ -336,6 +405,8 @@ def stream():
 
         print(f"[stream] resolve error: {e}")
         traceback.print_exc()
+        if "player response" in str(e) or "Sign in" in str(e):
+            trigger_update_async()
         return jsonify({"error": "resolve_failed", "detail": str(e)[:300]}), 502
 
 
@@ -425,4 +496,7 @@ def stream():
 
 
 if __name__ == "__main__":
+    print(f"[update] yt-dlp hien tai: {_ytdlp_version()} | auto_update={AUTO_UPDATE} moi {UPDATE_HOURS}h", flush=True)
+    if AUTO_UPDATE:
+        threading.Thread(target=_update_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=PORT, threaded=True, request_handler=HTTP10RequestHandler)
