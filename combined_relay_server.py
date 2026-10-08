@@ -18,14 +18,14 @@ from werkzeug.serving import WSGIRequestHandler
 
 app = Flask(__name__)
 
-RELAY_URL = os.environ.get("RELAY_URL", "https://combined-relay-server-395q.onrender.com")
+RELAY_URL = os.environ.get("RELAY_URL", "https://combined-relay-server-33xi.onrender.com")
 
 
 @app.route("/")
 def health_check():
 
     return (f"OK | {RELAY_URL} | AUDIO_RATE={AUDIO_RATE} MJPEG_Q={MJPEG_Q} FFMPEG_THREADS={FFMPEG_THREADS} "
-            f"cookies={'yes' if os.path.exists(COOKIES_FILE) else 'NO'} | build=diag1"), 200
+            f"cookies={'yes' if os.path.exists(COOKIES_FILE) else 'NO'} | build=def1"), 200
 
 PORT = 8000
 
@@ -196,8 +196,6 @@ def _resolve_stream_urls_uncached(video_url, height_cap):
         # De yt-dlp tu chon player client (ban moi tu xu ly PO token / cookies).
         # Muon ep client thi dat bien moi truong YT_PLAYER_CLIENTS="tv,web_safari"
         # Can JS runtime (node/deno) de giai chu ky YouTube - xem Dockerfile.
-        "js_runtimes": {"node": {}, "deno": {}},
-        "remote_components": ["ejs:github"],
         "geo_bypass": True,
         "socket_timeout": 15,
     }
