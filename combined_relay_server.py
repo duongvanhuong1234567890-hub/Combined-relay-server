@@ -9,7 +9,6 @@ import json
 import re
 import html
 import urllib.request
-import urllib.error
 import urllib.parse
 import threading
 import fcntl
@@ -226,142 +225,6 @@ def _resolve_stream_urls_uncached(video_url, height_cap):
         return info["url"], None, format_ffmpeg_headers(info), ""
 
 
-# ---- Du phong: lay luong qua Piped (khi yt-dlp bi YouTube chan 429) ----
-# Piped la ban YouTube ma nguon mo co API JSON; instance cong cong co the chet/bi chan bat cu luc nao,
-# nen chi dung lam du phong, thu lan luot nhieu instance.
-PIPED_FALLBACK = os.environ.get("PIPED_FALLBACK", "1") == "1"
-PIPED_INSTANCES_ENV = os.environ.get("PIPED_INSTANCES", "")
-_piped_cache = {"t": 0.0, "list": []}
-
-
-def _http_json(url, timeout=8):
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; relay/1.0)"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8"))
-
-
-def _piped_instances():
-    if PIPED_INSTANCES_ENV.strip():
-        return [u.strip().rstrip("/") for u in PIPED_INSTANCES_ENV.split(",") if u.strip()]
-    if time.monotonic() - _piped_cache["t"] < 3600 and _piped_cache["list"]:
-        return _piped_cache["list"]
-    urls = []
-    try:
-        for it in _http_json("https://piped-instances.kavin.rocks/"):
-            u = (it.get("api_url") or "").rstrip("/")
-            if u.startswith("https://") and u not in urls:
-                urls.append(u)
-    except Exception as e:
-        print(f"[piped] khong lay duoc danh sach instance: {e}", flush=True)
-    if "https://pipedapi.kavin.rocks" not in urls:
-        urls.append("https://pipedapi.kavin.rocks")
-    _piped_cache.update(t=time.monotonic(), list=urls)
-    return urls
-
-
-def _youtube_id(video_url):
-    m = re.search(r"(?:v=|youtu\.be/|/shorts/|/embed/)([A-Za-z0-9_-]{11})", video_url)
-    return m.group(1) if m else None
-
-
-def _pick_piped_streams(data, height_cap):
-    cap = int(height_cap)
-    vids = [v for v in data.get("videoStreams", []) if v.get("url") and (v.get("height") or 0) and v["height"] <= cap]
-    combined = sorted((v for v in vids if not v.get("videoOnly")), key=lambda v: v["height"], reverse=True)
-    if combined:
-        return combined[0]["url"], None
-    only = sorted((v for v in vids if v.get("videoOnly")),
-                  key=lambda v: (str(v.get("codec", "")).startswith("avc1"), v["height"]), reverse=True)
-    auds = sorted((a for a in data.get("audioStreams", []) if a.get("url")),
-                  key=lambda a: a.get("bitrate") or 0, reverse=True)
-    if only and auds:
-        return only[0]["url"], auds[0]["url"]
-    return None
-
-
-def _resolve_via_piped(video_url, height_cap):
-    vid = _youtube_id(video_url)
-    if not vid:
-        raise RuntimeError("khong phai link YouTube, bo qua Piped")
-    last = None
-    for base in _piped_instances()[:6]:
-        try:
-            data = _http_json(f"{base}/streams/{vid}")
-            picked = _pick_piped_streams(data, height_cap)
-            if picked:
-                print(f"[piped] OK qua {base}", flush=True)
-                return picked[0], picked[1], "", ""
-            last = RuntimeError(f"{base}: khong co luong phu hop")
-        except Exception as e:
-            last = e
-            print(f"[piped] {base} loi: {e}", flush=True)
-    raise last or RuntimeError("khong co instance Piped nao")
-
-
-# ---- Du phong cuoi: RapidAPI (youtube138) - GIOI HAN CUNG 500 luot/thang nen chi dung khi yt-dlp va Piped deu that bai ----
-RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY", "")
-RAPIDAPI_HOST = os.environ.get("RAPIDAPI_HOST", "youtube138.p.rapidapi.com")
-
-
-def _fmt_height(f):
-    h = f.get("height")
-    if isinstance(h, int):
-        return h
-    m = re.match(r"(\d+)p", str(f.get("qualityLabel") or f.get("quality") or ""))
-    return int(m.group(1)) if m else 0
-
-
-def _pick_rapid_streams(data, height_cap):
-    """Do nhieu dinh dang phan hoi pho bien: formats (co san hinh+tieng) va adaptiveFormats (tach roi)."""
-    sd = data.get("streamingData") if isinstance(data.get("streamingData"), dict) else data
-    cap = int(height_cap)
-    usable = lambda f: isinstance(f, dict) and f.get("url")
-    formats = [f for f in (sd.get("formats") or []) if usable(f)]
-    adaptive = [f for f in (sd.get("adaptiveFormats") or []) if usable(f)]
-    mime = lambda f: str(f.get("mimeType") or "")
-
-    combined = [f for f in formats if _fmt_height(f) <= cap]
-    if combined:
-        return max(combined, key=_fmt_height)["url"], None
-    vids = [f for f in adaptive if mime(f).startswith("video/") and 0 < _fmt_height(f) <= cap]
-    auds = [f for f in adaptive if mime(f).startswith("audio/")]
-    if vids and auds:
-        vid = max(vids, key=lambda f: ("avc1" in mime(f), _fmt_height(f)))
-        aud = max(auds, key=lambda f: f.get("bitrate") or 0)
-        return vid["url"], aud["url"]
-    if formats:                                   # khong co luong nao <= cap thi lay luong nho nhat co san
-        return min(formats, key=_fmt_height)["url"], None
-    return None
-
-
-def _resolve_via_rapidapi(video_url, height_cap):
-    if not RAPIDAPI_KEY:
-        raise RuntimeError("chua dat RAPIDAPI_KEY")
-    vid = _youtube_id(video_url)
-    if not vid:
-        raise RuntimeError("khong phai link YouTube")
-    req = urllib.request.Request(
-        f"https://{RAPIDAPI_HOST}/video/streaming-data/?id={vid}",
-        headers={"x-rapidapi-host": RAPIDAPI_HOST, "x-rapidapi-key": RAPIDAPI_KEY.strip(),
-                 "User-Agent": "Mozilla/5.0 (compatible; relay/1.0)", "Accept": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=20) as r:
-            data = json.loads(r.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        body = ""
-        try:
-            body = e.read().decode("utf-8", "replace")[:300]
-        except Exception:
-            pass
-        raise RuntimeError(f"HTTP {e.code}: {body}") from None
-    picked = _pick_rapid_streams(data, height_cap)
-    if not picked:
-        keys = list(data.keys())[:15] if isinstance(data, dict) else type(data).__name__
-        raise RuntimeError(f"khong tim thay luong trong phan hoi RapidAPI, cac khoa: {keys}")
-    print("[rapidapi] OK (da tru 1 luot)", flush=True)
-    return picked[0], picked[1], "", ""
-
-
 # ---- Bo nho dem link da resolve + lam nong (prefetch) ----
 # Resolve bang yt-dlp la buoc cham nhat (vai giay toi hon chuc giay). Link CDN song vai gio nen
 # giu lai 30 phut; sau khi tim kiem xong thi resolve san vai ket qua dau trong nen, luc nguoi dung
@@ -440,7 +303,7 @@ def trigger_update_async():
         threading.Thread(target=_update_and_maybe_restart, args=(1800,), daemon=True).start()
 
 
-def resolve_stream_urls(video_url, height_cap, allow_paid=True):
+def resolve_stream_urls(video_url, height_cap):
     key = (video_url, str(height_cap))
     now = time.monotonic()
     with _resolve_guard:
@@ -459,20 +322,8 @@ def resolve_stream_urls(video_url, height_cap, allow_paid=True):
         try:
             res = _resolve_stream_urls_uncached(video_url, height_cap)
         except Exception as e_ytdlp:
-            res = None
             print(f"[resolve] yt-dlp that bai ({str(e_ytdlp)[:120]})", flush=True)
-            if PIPED_FALLBACK:
-                try:
-                    res = _resolve_via_piped(video_url, height_cap)
-                except Exception as e_piped:
-                    print(f"[resolve] Piped that bai: {e_piped}", flush=True)
-            if res is None and allow_paid and RAPIDAPI_KEY:
-                try:
-                    res = _resolve_via_rapidapi(video_url, height_cap)
-                except Exception as e_rapid:
-                    print(f"[resolve] RapidAPI that bai: {e_rapid}", flush=True)
-            if res is None:
-                raise e_ytdlp
+            raise
         print(f"[resolve] yt-dlp mat {time.monotonic() - t0:.1f}s cho {video_url}", flush=True)
         with _resolve_guard:
             _resolve_cache[key] = (time.monotonic(), res)
@@ -488,7 +339,7 @@ def _warm_worker(video_ids, height_cap):
             print("[warm] dang co luong phat, bo qua lam nong", flush=True)
             return
         try:
-            resolve_stream_urls(f"https://www.youtube.com/watch?v={vid}", height_cap, allow_paid=False)
+            resolve_stream_urls(f"https://www.youtube.com/watch?v={vid}", height_cap)
         except Exception as e:
             print(f"[warm] loi {vid}: {e}", flush=True)
 
