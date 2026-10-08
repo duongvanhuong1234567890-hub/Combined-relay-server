@@ -499,6 +499,66 @@ def stream():
     return Response(generate(), mimetype="video/avi")
 
 
+
+class _DiagLogger:
+    """Gom toan bo log cua yt-dlp (ke ca WARNING) de hien tren trinh duyet."""
+    def __init__(self):
+        self.lines = []
+    def debug(self, m):
+        self.lines.append(str(m))
+    def info(self, m):
+        self.lines.append(str(m))
+    def warning(self, m):
+        self.lines.append("WARNING: " + str(m))
+    def error(self, m):
+        self.lines.append("ERROR: " + str(m))
+
+
+@app.route("/diag")
+def diag():
+    """Mo tren trinh duyet: /diag?v=<id video>&mode=cur|def|noremote|deno
+    cur      = giu nguyen cau hinh dang dung cua server
+    def      = de yt-dlp tu chon JS runtime (khong ep js_runtimes / remote_components)
+    noremote = giong cur nhung bo remote_components
+    deno     = chi bat deno"""
+    vid = request.args.get("v", "dQw4w9WgXcQ")
+    mode = request.args.get("mode", "cur")
+    lg = _DiagLogger()
+    head = [f"mode={mode} video={vid}", f"python={sys.version.split()[0]} yt-dlp={_ytdlp_version()}"]
+    try:
+        from importlib.metadata import version as _v
+        head.append(f"yt-dlp-ejs={_v('yt-dlp-ejs')}")
+    except Exception as e:
+        head.append(f"yt-dlp-ejs: khong doc duoc ({e})")
+    for exe in ("deno", "node"):
+        try:
+            r = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=10)
+            head.append(f"{exe}: {(r.stdout or r.stderr).strip().splitlines()[0] if (r.stdout or r.stderr).strip() else 'khong co dau ra'}")
+        except Exception as e:
+            head.append(f"{exe}: KHONG CHAY DUOC ({e})")
+    head.append(f"cookies={'yes' if os.path.exists(COOKIES_FILE) else 'NO'}")
+
+    opts = {"quiet": False, "verbose": True, "logger": lg, "skip_download": True,
+            "format": "bestvideo+bestaudio/best", "socket_timeout": 15}
+    if mode == "cur":
+        opts["js_runtimes"] = {"node": {}, "deno": {}}
+        opts["remote_components"] = ["ejs:github"]
+    elif mode == "noremote":
+        opts["js_runtimes"] = {"node": {}, "deno": {}}
+    elif mode == "deno":
+        opts["js_runtimes"] = {"deno": {}}
+    if os.path.exists(COOKIES_FILE):
+        opts["cookiefile"] = COOKIES_FILE
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(f"https://www.youtube.com/watch?v={vid}", download=False)
+            lg.lines.append(f"=== THANH CONG: {info.get('title')} ===")
+    except Exception as e:
+        lg.lines.append(f"=== THAT BAI: {str(e)[:300]} ===")
+    text = "\n".join(head) + "\n\n" + "\n".join(lg.lines)
+    return Response(text, mimetype="text/plain; charset=utf-8")
+
+
 if __name__ == "__main__":
     print(f"[update] yt-dlp hien tai: {_ytdlp_version()} | auto_update={AUTO_UPDATE} moi {UPDATE_HOURS}h", flush=True)
     if AUTO_UPDATE:
