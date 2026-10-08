@@ -25,7 +25,7 @@ RELAY_URL = os.environ.get("RELAY_URL", "https://combined-relay-server-395q.onre
 def health_check():
 
     return (f"OK | {RELAY_URL} | AUDIO_RATE={AUDIO_RATE} MJPEG_Q={MJPEG_Q} FFMPEG_THREADS={FFMPEG_THREADS} "
-            f"cookies={'yes' if os.path.exists(COOKIES_FILE) else 'NO'}"), 200
+            f"cookies={'yes' if os.path.exists(COOKIES_FILE) else 'NO'} | build=diag1"), 200
 
 PORT = 8000
 
