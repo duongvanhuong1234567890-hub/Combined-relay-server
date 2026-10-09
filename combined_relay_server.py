@@ -769,7 +769,7 @@ BR_JPEG_Q = int(os.environ.get("BR_JPEG_Q", "40"))
 BR_ALLOW_MEDIA = os.environ.get("BR_ALLOW_MEDIA", "0") == "1"
 BR_GOTO_TIMEOUT = int(os.environ.get("BR_GOTO_TIMEOUT", "10")) * 1000   # cho tai trang toi da (ms)
 BR_SHOT_TIMEOUT = int(os.environ.get("BR_SHOT_TIMEOUT", "6")) * 1000    # moi lan chup anh toi da (ms)
-BR_REQ_TIMEOUT = int(os.environ.get("BR_REQ_TIMEOUT", "30"))            # tong thoi gian toi da tra loi 1 yeu cau (s) - tranh ESP bi -11
+BR_REQ_TIMEOUT = int(os.environ.get("BR_REQ_TIMEOUT", "10"))            # toi da bao lau thi tra anh tam (s) - Chrome van chay tiep o nen, tranh ESP bi -11/504
 BR_BLOCK_IMAGES = os.environ.get("BR_BLOCK_IMAGES", "0") == "1"   # =1: duyet chi chu, nhanh gap nhieu lan tren 0.1 CPU
 IDLE_SEC = int(os.environ.get("BR_IDLE_SEC", "300"))   # khoi dong lai Chrome mat 20-40s tren goi free -> khong tat qua som
 PROFILE = os.environ.get("BR_PROFILE", "/tmp/br_profile")
@@ -811,6 +811,24 @@ def _log(*a):
     print("[br]", *a, flush=True)
 
 
+import base64 as _b64
+_PLACEHOLDER_JPG = _b64.b64decode(
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDABQODxIPDRQSEBIXFRQYHjIhHhwcHj0sLiQySUBMS0dARkVQWnNiUFVtVkVGZIhlbXd7gYKBTmCNl4x9lnN+gXz/2wBDARUXFx4aHjshITt8U0ZTfHx8fHx8fHx8fHx8fHx8fHx8fHx8fHx8fHx8fHx8fHx8fHx8fHx8fHx8fHx8fHx8fHz/wAARCACqAUADASIAAhEBAxEB/8QAGgABAAMBAQEAAAAAAAAAAAAAAAIDBAEFBv/EADEQAQACAgECBQMDAAsAAAAAAAABAgMRBBIhBRMiMVEyQWEUI3EGNTZSc3SRkrHC8f/EABUBAQEAAAAAAAAAAAAAAAAAAAAB/8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAwDAQACEQMRAD8A+VAUAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAF/Cx1y83j48kbpfJWto+YmVDT4b/WXF/xqf8wDVysvBwcvNhngVmtLzXcZbRPaf5VczgxTLgnizbJi5Mbxb99+2p/LvP42fL4nyYx4clptmtrVZ7926cVb8rw3w6cs0vhi3mXpPetp76ifntoGDJ4Xlpjy2rlw5LYo3kpS+7V+UeP4bm5HFnk1tjrjrfotNra6e29z+Hq8Ovp8QmOFOCscfJHXabTaZ+J3OmKtpj+jVoiffl6n/aDLyuDk42OmWb48mK/aL47bjfwnTw3JOOl8uXDg8yN0rlvqbR8/+rp/s3H+b/6LPGsGXkc2mbBjtkxZaV8uaxuPb2Bh5vCy8G9KZ+nqvSL6id639p/PZp4PAxcnw7lZr5aUvjmsVm0zEV3Pffb7/ZPx+tqZOHS87tXi0iZ3vv3c8PrbJ4P4lSlZtb9udRG5+oGXBwb57ZenJjjHinVstrar+P8AVP8AQZMXL41L+XlpmtHRatvTfvr394X8PjxXw3PmviyZ5jLFPJi0xEdvqmI7/htzVmseCROGMM+dPojfp9cfPcHicvH5XLzY+mK9N7RqJ3Ed/lS387j5c3P5+THSbVxZLTeY+0blTHA5M2w1jDbeeN44/vQDMJWralpraNWrOpiftKIAAAAAAAAAAAAAAAAAAAAAAAACVbWpaLUma2rO4mJ1MSiA0W53LtExblZ5iftOSVETMTuJ1MfdwBfbl8m07tyMszqa97z7fCvzL+V5XXby99XTvtv518oAJ+ZfyvK67eXvq6d9t/Ovl6NedxbY6xaeVx56Yi9MFoil/wA6+zywGrn8v9Zni1adGOlIpSu96rHspxZsuC3VhyXx2+aWmJVgLacjPjva9M2St7fVaLTEz/JPIzT07zZJ6J6q+qfTPzCoBZ52Xd58y/7n1+qfV/PyRnzRNJjLeJxxqk9U+n+PhWA7MzMzMzuZ95cAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAH//Z")
+
+
+def _pending_response():
+    """Chrome con ban (0.1 CPU) -> tra NGAY anh gan nhat (hoac anh 'Dang tai...') de ESP khong cho qua lau.
+    Viec dang chay van tiep tuc o nen; yeu cau /br/frame ke tiep se lay anh moi."""
+    w = _worker
+    jpg = w.last_jpg if (w is not None and w.last_jpg) else _PLACEHOLDER_JPG
+    return Response(jpg, mimetype="image/jpeg", headers={
+        "X-Url": urllib.parse.quote(_br_last_url or "", safe=":/?&=%#")[:300],
+        "X-Edit": "0",
+        "X-Pending": "1",
+        "Cache-Control": "no-store",
+    })
+
+
 def _mem_info():
     """(dang dung MB, gioi han MB) cua container (cgroup v2/v1); None neu khong doc duoc.
     Chi tinh RAM that (anon), khong tinh page cache."""
@@ -849,6 +867,7 @@ class _Worker(threading.Thread):
         self.ctx = None
         self.page = None
         self.last_jpg = None
+        self.busy = False
         self.last = time.time()
 
     # ---- vong lap thread ----
@@ -865,6 +884,7 @@ class _Worker(threading.Thread):
                 _log("bo qua viec da qua han")
                 ev.set()
                 continue
+            self.busy = True
             try:
                 box["r"] = fn(self)
             except BaseException as e:  # noqa
@@ -872,14 +892,16 @@ class _Worker(threading.Thread):
                 box["tb"] = traceback.format_exc()
                 if "closed" in str(e).lower():
                     self._reset()
+            self.busy = False
             self.last = time.time()
             ev.set()
 
-    def submit(self, fn, timeout=100):
+    def submit(self, fn, timeout=100, keep=False):
         box, ev = {}, threading.Event()
         self.q.put((fn, box, ev))
         if not ev.wait(timeout):
-            box["cancel"] = True
+            if not keep:
+                box["cancel"] = True
             raise TimeoutError("browser busy/timeout")
         if "e" in box:
             _log(box.get("tb", ""))
@@ -1130,12 +1152,14 @@ def _handler(action):
             _log(f"thieu RAM de mo Chrome: dung {mi[0]:.0f}/{mi[1]:.0f}MB, can trong >= {need}MB")
             return Response("thieu RAM - thu lai sau it giay", 503, headers={"Retry-After": "10"})
     a = request.args.to_dict()
+    if action == "frame" and _worker is not None and _worker.busy:
+        return _pending_response()          # dang ban -> khong xep hang them, tra anh gan nhat
     try:
-        jpg, url, edit = _get_worker().submit(lambda w: _do(w, fn, a), timeout=BR_REQ_TIMEOUT)
+        jpg, url, edit = _get_worker().submit(lambda w: _do(w, fn, a), timeout=BR_REQ_TIMEOUT, keep=True)
     except ImportError:
         return Response("playwright chua duoc cai tren server", 503)
     except TimeoutError:
-        return Response("timeout", 504)
+        return _pending_response()
     except Exception as e:  # noqa
         return Response("loi: %s" % str(e)[:200], 500)
     _br_last_url = url
