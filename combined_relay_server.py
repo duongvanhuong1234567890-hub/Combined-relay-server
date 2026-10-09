@@ -767,6 +767,9 @@ SCALE = BR_W / float(OUT_W)          # toa do man hinh ESP32 -> toa do CSS
 BR_TOKEN = os.environ.get("BR_TOKEN", "")
 BR_JPEG_Q = int(os.environ.get("BR_JPEG_Q", "40"))
 BR_ALLOW_MEDIA = os.environ.get("BR_ALLOW_MEDIA", "0") == "1"
+BR_GOTO_TIMEOUT = int(os.environ.get("BR_GOTO_TIMEOUT", "10")) * 1000   # cho tai trang toi da (ms)
+BR_SHOT_TIMEOUT = int(os.environ.get("BR_SHOT_TIMEOUT", "6")) * 1000    # moi lan chup anh toi da (ms)
+BR_REQ_TIMEOUT = int(os.environ.get("BR_REQ_TIMEOUT", "30"))            # tong thoi gian toi da tra loi 1 yeu cau (s) - tranh ESP bi -11
 BR_BLOCK_IMAGES = os.environ.get("BR_BLOCK_IMAGES", "0") == "1"   # =1: duyet chi chu, nhanh gap nhieu lan tren 0.1 CPU
 IDLE_SEC = int(os.environ.get("BR_IDLE_SEC", "300"))   # khoi dong lai Chrome mat 20-40s tren goi free -> khong tat qua som
 PROFILE = os.environ.get("BR_PROFILE", "/tmp/br_profile")
@@ -845,6 +848,7 @@ class _Worker(threading.Thread):
         self.pw = None
         self.ctx = None
         self.page = None
+        self.last_jpg = None
         self.last = time.time()
 
     # ---- vong lap thread ----
@@ -966,7 +970,7 @@ class _Worker(threading.Thread):
     def shot(self):
         q = BR_JPEG_Q
         try:
-            data = self._snap(q, 12000)
+            data = self._snap(q, BR_SHOT_TIMEOUT)
         except Exception as e:
             if "imeout" not in str(e):
                 raise
@@ -977,10 +981,17 @@ class _Worker(threading.Thread):
                                    "document.querySelectorAll('video,audio').forEach(v => { try { v.pause(); } catch (e) {} }); }")
             except Exception:
                 pass
-            data = self._snap(q, 30000)
+            try:
+                data = self._snap(q, BR_SHOT_TIMEOUT)
+            except Exception as e2:
+                if "imeout" in str(e2) and self.last_jpg:
+                    _log("van cham -> tra anh cu de ESP khong bi timeout")
+                    return self.last_jpg
+                raise
         while len(data) > MAX_JPEG and q > 20:
             q -= 15
-            data = self._snap(q, 30000)
+            data = self._snap(q, BR_SHOT_TIMEOUT * 2)
+        self.last_jpg = data
         return data
 
 
@@ -1002,7 +1013,7 @@ def _f(a, k, d=0.0):
 
 def act_open(w, a):
     try:
-        w.page.goto(_norm_url(a.get("u")), wait_until="domcontentloaded", timeout=30000)
+        w.page.goto(_norm_url(a.get("u")), wait_until="domcontentloaded", timeout=BR_GOTO_TIMEOUT)
     except Exception as e:
         _log("goto:", e)
     try:
@@ -1120,7 +1131,7 @@ def _handler(action):
             return Response("thieu RAM - thu lai sau it giay", 503, headers={"Retry-After": "10"})
     a = request.args.to_dict()
     try:
-        jpg, url, edit = _get_worker().submit(lambda w: _do(w, fn, a))
+        jpg, url, edit = _get_worker().submit(lambda w: _do(w, fn, a), timeout=BR_REQ_TIMEOUT)
     except ImportError:
         return Response("playwright chua duoc cai tren server", 503)
     except TimeoutError:
