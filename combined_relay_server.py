@@ -513,9 +513,9 @@ def warm_results(results):
     if not ids:
         return
     try:
-        min_height = int(os.environ.get("MIN_HEIGHT", "360"))
+        min_height = int(os.environ.get("MIN_HEIGHT", "240"))
     except ValueError:
-        min_height = 360
+        min_height = 240
     threading.Thread(target=_warm_worker, args=(ids, str(min_height)), daemon=True).start()
 
 
@@ -541,14 +541,17 @@ def random_link():
 
 @app.route("/stream")
 def stream():
+    return _stream_impl(request.args.get("url", ""))
+
+
+def _stream_impl(video_url):
     t_req = time.monotonic()
-    video_url = request.args.get("url", "")
     w = request.args.get("w", "320")
     h = request.args.get("h", "170")
     height_cap = request.args.get("height_cap", "360")
 
 
-    min_height = int(os.environ.get("MIN_HEIGHT", "360"))
+    min_height = int(os.environ.get("MIN_HEIGHT", "240"))
     try:
         height_cap = str(max(int(height_cap), min_height))
     except ValueError:
@@ -560,6 +563,11 @@ def stream():
             return str(default)
     fps = _clamp("fps", 15, 1, 30)
     q = _clamp("q", MJPEG_Q, 2, 31)   # cang nho cang net (2..31)
+    # Uu tien MUOT hon do net: khong cho q nho hon STREAM_Q_MIN (anh nho hon -> ESP giai ma nhanh hon). Dat STREAM_Q_MIN=2 de tat.
+    q = str(min(31, max(int(q), int(os.environ.get("STREAM_Q_MIN", "12")))))
+    _fmin = int(os.environ.get("STREAM_FPS_MIN", "0"))     # >0: khong cho fps thap hon muc nay
+    if _fmin:
+        fps = str(min(30, max(int(fps), _fmin)))
     # Toc do lay mau am thanh (PCM 16-bit mono = ar*2 byte/giay). Mang yeu thi thiet bi xin thap de giam bang thong
     ar = _clamp("ar", AUDIO_RATE, 4000, 22050)
 
@@ -599,7 +607,7 @@ def stream():
             f"{RECONNECT_ARGS}{audio_headers_arg}{PROBE_ARG}{THREADS_ARG}-i {shlex.quote(audio_direct_url)} "
             f"-map 0:v:0 -map 1:a:0 "
             f"{THREADS_ARG}"
-            f"-vf fps={fps},scale={w}:{h}:flags=bicubic "
+            f"-vf fps={fps},scale={w}:{h}:flags=fast_bilinear "
 
 
             f"-c:v mjpeg -q:v {q} "
@@ -612,7 +620,7 @@ def stream():
         cmd = (
             f"ffmpeg -nostdin -v error {RECONNECT_ARGS}{video_headers_arg}{PROBE_ARG}{THREADS_ARG}-i {shlex.quote(video_direct_url)} "
             f"{THREADS_ARG}"
-            f"-vf fps={fps},scale={w}:{h}:flags=bicubic "
+            f"-vf fps={fps},scale={w}:{h}:flags=fast_bilinear "
             f"-c:v mjpeg -q:v {q} "
             f"-c:a pcm_s16le -ar {ar} -ac 1 "
             f"-flush_packets 1 -f avi pipe:1"
@@ -757,12 +765,18 @@ BR_H = int(os.environ.get("BR_H", "170"))
 OUT_W = 320
 SCALE = BR_W / float(OUT_W)          # toa do man hinh ESP32 -> toa do CSS
 BR_TOKEN = os.environ.get("BR_TOKEN", "")
-BR_JPEG_Q = int(os.environ.get("BR_JPEG_Q", "55"))
-IDLE_SEC = int(os.environ.get("BR_IDLE_SEC", "120"))
+BR_JPEG_Q = int(os.environ.get("BR_JPEG_Q", "40"))
+BR_ALLOW_MEDIA = os.environ.get("BR_ALLOW_MEDIA", "0") == "1"
+BR_BLOCK_IMAGES = os.environ.get("BR_BLOCK_IMAGES", "0") == "1"   # =1: duyet chi chu, nhanh gap nhieu lan tren 0.1 CPU
+IDLE_SEC = int(os.environ.get("BR_IDLE_SEC", "300"))   # khoi dong lai Chrome mat 20-40s tren goi free -> khong tat qua som
 PROFILE = os.environ.get("BR_PROFILE", "/tmp/br_profile")
 MAX_JPEG = 60000                      # khop BR_BUF_MAX trong firmware (61440)
 UA = ("Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36")
+
+_BLOCK_URL = ("google-analytics", "googletagmanager", "doubleclick", "googlesyndication", "adservice",
+              "scorecardresearch", "hotjar", "sentry.io", "/monitor_browser/", "mon-va.", "mcs-va.", "log-va.",
+              "connect.facebook.net")
 
 EDIT_JS = """() => {
   const e = document.activeElement; if (!e) return false;
@@ -903,11 +917,14 @@ class _Worker(threading.Thread):
                 has_touch=True,
                 user_agent=UA,
                 locale="vi-VN",
+                reduced_motion="reduce",
                 args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
                       "--disable-extensions", "--mute-audio",
                       "--disable-background-networking",
                       "--renderer-process-limit=1",
                       "--enable-low-end-device-mode",
+                      "--disable-smooth-scrolling", "--disable-lcd-text", "--disable-font-subpixel-positioning",
+                      "--disable-partial-raster", "--disable-histogram-customizer",
                       "--js-flags=--max-old-space-size=96",
                       "--disk-cache-size=1", "--media-cache-size=1",
                       "--disable-breakpad", "--disable-crash-reporter",
@@ -916,9 +933,14 @@ class _Worker(threading.Thread):
                       "--disable-component-update", "--disable-sync"],
             )
             self.ctx.on("page", self._on_page)
-            def _lite(route):            # chan video/font de nhe CPU (goi free)
+            def _lite(route):            # chan video/font/theo doi/quang cao de nhe CPU (goi free)
                 try:
-                    if route.request.resource_type in ("media", "font"):
+                    _rq = route.request
+                    if BR_BLOCK_IMAGES and _rq.resource_type == "image":
+                        route.abort()
+                    elif _rq.resource_type in (("font", "websocket", "eventsource", "ping") if BR_ALLOW_MEDIA
+                                             else ("media", "font", "websocket", "eventsource", "ping")) \
+                            or any(b in _rq.url for b in _BLOCK_URL):
                         route.abort()
                     else:
                         route.continue_()
@@ -931,9 +953,9 @@ class _Worker(threading.Thread):
         self.page = self.ctx.pages[0] if self.ctx.pages else self.ctx.new_page()
 
     # ---- thao tac ----
-    def settle(self, ms=350):
+    def settle(self, ms=150):
         try:
-            self.page.wait_for_load_state("domcontentloaded", timeout=2500)
+            self.page.wait_for_load_state("domcontentloaded", timeout=2000)
         except Exception:
             pass
         self.page.wait_for_timeout(ms)
@@ -944,7 +966,7 @@ class _Worker(threading.Thread):
     def shot(self):
         q = BR_JPEG_Q
         try:
-            data = self._snap(q, 20000)
+            data = self._snap(q, 12000)
         except Exception as e:
             if "imeout" not in str(e):
                 raise
@@ -980,25 +1002,25 @@ def _f(a, k, d=0.0):
 
 def act_open(w, a):
     try:
-        w.page.goto(_norm_url(a.get("u")), wait_until="domcontentloaded", timeout=45000)
+        w.page.goto(_norm_url(a.get("u")), wait_until="domcontentloaded", timeout=30000)
     except Exception as e:
         _log("goto:", e)
     try:
-        w.page.wait_for_load_state("load", timeout=4000)
+        w.page.wait_for_load_state("load", timeout=2500)
     except Exception:
         pass
-    w.page.wait_for_timeout(500)
+    w.page.wait_for_timeout(250)
 
 
 def act_tap(w, a):
     w.page.touchscreen.tap(_f(a, "x") * SCALE, _f(a, "y") * SCALE)
-    w.settle(600)
+    w.settle(300)
 
 
 def act_scroll(w, a):
     w.page.mouse.move(BR_W / 2.0, BR_H / 2.0)
     w.page.mouse.wheel(0, _f(a, "dy") * SCALE)
-    w.page.wait_for_timeout(250)
+    w.page.wait_for_timeout(120)
 
 
 def act_type(w, a):
@@ -1078,6 +1100,7 @@ def _do(w, fn, a):
 
 
 def _handler(action):
+    global _br_last_url
     if not BR_TOKEN:
         return Response("BR_TOKEN chua duoc dat tren server", 403)
     if not hmac.compare_digest(request.args.get("k", ""), BR_TOKEN):
@@ -1104,6 +1127,7 @@ def _handler(action):
         return Response("timeout", 504)
     except Exception as e:  # noqa
         return Response("loi: %s" % str(e)[:200], 500)
+    _br_last_url = url
     return Response(jpg, mimetype="image/jpeg", headers={
         "X-Url": urllib.parse.quote(url, safe=":/?&=%#")[:300],
         "X-Edit": "1" if edit else "0",
@@ -1112,6 +1136,7 @@ def _handler(action):
 
 
 _br_last_activity = 0.0
+_br_last_url = ""          # URL trang Chrome dang xem (de /br/play phat video that cua trang do)
 
 
 def _br_busy():
@@ -1125,6 +1150,27 @@ def _br_stop():
             _worker.submit(lambda ww: ww._reset(), timeout=10)
     except Exception:
         pass
+
+
+@app.route("/br/play")
+def br_play():
+    """Phat video THAT (hinh + tieng, giong /stream) cua trang dang xem trong trinh duyet.
+    /br/play?k=TOKEN            -> video cua trang hien tai (vd tiktok.com/@ten/video/123)
+    /br/play?k=TOKEN&u=<link>   -> link chi dinh. Them w,h,fps,q,bps,ar nhu /stream.
+    Chrome duoc tat de nhuong RAM cho ffmpeg (xem _stream_impl)."""
+    global _br_last_activity
+    _br_last_activity = time.time()
+    if not BR_TOKEN:
+        return Response("BR_TOKEN chua duoc dat tren server", 403)
+    if not hmac.compare_digest(request.args.get("k", ""), BR_TOKEN):
+        return Response("forbidden", 403)
+    url = (request.args.get("u") or _br_last_url or "").strip()
+    if not url or url.startswith("about:"):
+        return Response("chua co trang nao dang mo - mo link video truoc", 409)
+    if "://" not in url:
+        url = "https://" + url
+    print(f"[br] play {url}", flush=True)
+    return _stream_impl(url)
 
 
 @app.route("/br/<action>")
