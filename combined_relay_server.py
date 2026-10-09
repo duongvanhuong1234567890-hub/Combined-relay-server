@@ -388,6 +388,8 @@ _resolve_cache = {}          # (video_url, height_cap) -> (thoi_diem, ket_qua)
 _resolve_locks = {}          # (video_url, height_cap) -> Lock, tranh resolve trung nhau
 _resolve_guard = threading.Lock()
 _active_streams = 0
+_cur_proc = None                 # ffmpeg dang phat; yeu cau /stream moi se giet cai cu de khong chay 2 ffmpeg cung luc
+_cur_lock = threading.Lock()
 
 
 # ---- Tu dong cap nhat yt-dlp ----
@@ -630,7 +632,17 @@ def _stream_impl(video_url):
     if _worker is not None and _worker.ctx is not None:
         print("[stream] dang phat video -> dong Chrome de nhuong RAM", flush=True)
         threading.Thread(target=_br_stop, daemon=True).start()
-    proc = subprocess.Popen(shlex.split(cmd), stdout=subprocess.PIPE, bufsize=1 << 20)
+    global _cur_proc
+    with _cur_lock:
+        _old = _cur_proc
+        if _old is not None and _old.poll() is None:
+            print("[stream] co yeu cau moi -> tat ffmpeg cu de nhuong CPU", flush=True)
+            try:
+                _old.kill()
+            except Exception:
+                pass
+        proc = subprocess.Popen(shlex.split(cmd), stdout=subprocess.PIPE, bufsize=1 << 20)
+        _cur_proc = proc
     # Mo rong ong dan stdout cua ffmpeg (mac dinh 64KB) len 1MB de ffmpeg chay truoc, khong bi nghen khi mang cham
     try:
         fcntl.fcntl(proc.stdout.fileno(), 1031, 1 << 20)   # F_SETPIPE_SZ = 1031 (Linux)
