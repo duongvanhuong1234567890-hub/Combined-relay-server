@@ -211,6 +211,14 @@ _YT_ATTEMPTS = [
 ]
 _yt_preferred = None     # ten cach da thanh cong gan nhat
 
+# Cac cach KHONG cookies hay that bai lien tuc tren IP datacenter va moi lan ton ~15s tren goi Free,
+# an het ngan sach thoi gian truoc khi toi cach co cookies. Neu chung that bai YT_NOCOOKIE_MAX_FAILS lan
+# lien tiep thi tam bo qua chung YT_NOCOOKIE_COOLDOWN giay (chi khi co file cookies), thu cach co cookies truoc.
+YT_NOCOOKIE_MAX_FAILS = int(os.environ.get("YT_NOCOOKIE_MAX_FAILS", "2"))
+YT_NOCOOKIE_COOLDOWN = float(os.environ.get("YT_NOCOOKIE_COOLDOWN", "1800"))
+_nocookie_fails = 0
+_nocookie_skip_until = 0.0
+
 # Dau ra qua proxy (chi dung cho YouTube): YT_PROXY="http://user:pass@host:port" (yt-dlp con ho tro socks5://...,
 # nhung phan ffmpeg phat luong chi dung duoc proxy http://). Link YouTube gan voi IP luc resolve nen CA yt-dlp
 # lan ffmpeg deu phai di qua cung proxy.
@@ -274,7 +282,7 @@ def _resolve_stream_urls_uncached(video_url, height_cap):
     """Dung yt-dlp lay URL luong truc tiep (YouTube, TikTok, Facebook... yt-dlp tu nhan dien domain).
     Doi "bestvideo+bestaudio" (2 luong tach biet) roi de ffmpeg ghep khi mux.
     Voi YouTube: thu lan luot nhieu cach (_YT_ATTEMPTS), cach nao ra truoc thi dung."""
-    global _yt_preferred
+    global _yt_preferred, _nocookie_fails, _nocookie_skip_until
     fmt = (
         f"bestvideo[height<={height_cap}][vcodec^=avc1]+bestaudio"
         f"/bestvideo[height<={height_cap}]+bestaudio"
@@ -292,8 +300,13 @@ def _resolve_stream_urls_uncached(video_url, height_cap):
         attempts.insert(0, ("env", _pc, True, True))
     if _yt_preferred:
         attempts.sort(key=lambda a: a[0] != _yt_preferred)   # sort on dinh: cach tot nhat len dau
+    if os.path.exists(COOKIES_FILE) and time.monotonic() < _nocookie_skip_until:
+        with_cookies = [a for a in attempts if a[2]]
+        if with_cookies:
+            attempts = with_cookies
+            print("[resolve] tam bo cac cach khong cookies (that bai lien tiep), thu cach co cookies", flush=True)
 
-    budget = float(os.environ.get("YT_RESOLVE_BUDGET", "45"))   # tong thoi gian toi da cho moi lan resolve
+    budget = float(os.environ.get("YT_RESOLVE_BUDGET", "90"))   # tong thoi gian toi da cho moi lan resolve
     t_start = time.monotonic()
     errors = []
     for name, client, use_cookies, runtimes in attempts:
@@ -304,11 +317,18 @@ def _resolve_stream_urls_uncached(video_url, height_cap):
             if _yt_preferred != name:
                 print(f"[resolve] cach '{name}' thanh cong", flush=True)
             _yt_preferred = name
+            if not use_cookies:
+                _nocookie_fails = 0
+                _nocookie_skip_until = 0.0
             return res
         except Exception as e:
             msg = str(e)
             print(f"[resolve] cach '{name}' that bai: {msg[:140]}", flush=True)
             errors.append(f"{name}: {msg[:110]}")
+            if not use_cookies and "player response" in msg:
+                _nocookie_fails += 1
+                if _nocookie_fails >= YT_NOCOOKIE_MAX_FAILS:
+                    _nocookie_skip_until = time.monotonic() + YT_NOCOOKIE_COOLDOWN
             if any(h in msg for h in _NO_RETRY_HINTS):
                 break
     _yt_preferred = None
@@ -383,6 +403,9 @@ def _update_and_maybe_restart(min_gap=600):
 
 
 def _update_loop():
+    # Tre lan cap nhat dau tien: luc moi khoi dong goi Free CPU rat yeu, pip install chay song song
+    # lam cham/hong nhung yeu cau dau tien (YouTube, trinh duyet).
+    time.sleep(float(os.environ.get("YTDLP_FIRST_UPDATE_DELAY", "300")))
     _update_and_maybe_restart(min_gap=0)
     while True:
         time.sleep(UPDATE_HOURS * 3600)
@@ -587,8 +610,19 @@ def stream():
                 yield chunk
         finally:
             _active_streams -= 1
-            proc.stdout.close()
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
             proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except Exception:
+                proc.kill()
+                try:
+                    proc.wait(timeout=3)
+                except Exception:
+                    pass
 
     return Response(generate(), mimetype="video/avi")
 
@@ -729,6 +763,10 @@ class _Worker(threading.Thread):
                     _log("idle -> dong Chrome")
                     self._reset()
                 continue
+            if box.get("cancel"):      # nguoi goi da het gio -> khong ton CPU chay viec thua
+                _log("bo qua viec da qua han")
+                ev.set()
+                continue
             try:
                 box["r"] = fn(self)
             except BaseException as e:  # noqa
@@ -739,10 +777,11 @@ class _Worker(threading.Thread):
             self.last = time.time()
             ev.set()
 
-    def submit(self, fn, timeout=45):
+    def submit(self, fn, timeout=100):
         box, ev = {}, threading.Event()
         self.q.put((fn, box, ev))
         if not ev.wait(timeout):
+            box["cancel"] = True
             raise TimeoutError("browser busy/timeout")
         if "e" in box:
             _log(box.get("tb", ""))
@@ -786,9 +825,24 @@ class _Worker(threading.Thread):
                 locale="vi-VN",
                 args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
                       "--disable-extensions", "--mute-audio",
-                      "--disable-background-networking"],
+                      "--disable-background-networking",
+                      "--renderer-process-limit=1",
+                      "--disable-features=site-per-process,TranslateUI,BackForwardCache",
+                      "--disable-component-update", "--disable-sync"],
             )
             self.ctx.on("page", self._on_page)
+            def _lite(route):            # chan video/font de nhe CPU (goi free)
+                try:
+                    if route.request.resource_type in ("media", "font"):
+                        route.abort()
+                    else:
+                        route.continue_()
+                except Exception:
+                    pass
+            try:
+                self.ctx.route("**/*", _lite)
+            except Exception:
+                pass
         self.page = self.ctx.pages[0] if self.ctx.pages else self.ctx.new_page()
 
     # ---- thao tac ----
@@ -799,12 +853,27 @@ class _Worker(threading.Thread):
             pass
         self.page.wait_for_timeout(ms)
 
+    def _snap(self, q, timeout):
+        return self.page.screenshot(type="jpeg", quality=q, animations="disabled", timeout=timeout)
+
     def shot(self):
         q = BR_JPEG_Q
-        data = self.page.screenshot(type="jpeg", quality=q)
+        try:
+            data = self._snap(q, 20000)
+        except Exception as e:
+            if "imeout" not in str(e):
+                raise
+            # Trang qua nang (video/JS) lam Chrome khong chup kip: dung tai them va tam dung video roi thu lai
+            _log("chup anh cham -> dung tai trang + tam dung video, thu lai")
+            try:
+                self.page.evaluate("() => { try { window.stop(); } catch (e) {} "
+                                   "document.querySelectorAll('video,audio').forEach(v => { try { v.pause(); } catch (e) {} }); }")
+            except Exception:
+                pass
+            data = self._snap(q, 30000)
         while len(data) > MAX_JPEG and q > 20:
             q -= 15
-            data = self.page.screenshot(type="jpeg", quality=q)
+            data = self._snap(q, 30000)
         return data
 
 
@@ -826,7 +895,7 @@ def _f(a, k, d=0.0):
 
 def act_open(w, a):
     try:
-        w.page.goto(_norm_url(a.get("u")), wait_until="domcontentloaded", timeout=25000)
+        w.page.goto(_norm_url(a.get("u")), wait_until="domcontentloaded", timeout=45000)
     except Exception as e:
         _log("goto:", e)
     try:
