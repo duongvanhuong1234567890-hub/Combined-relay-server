@@ -27,9 +27,14 @@ RELAY_URL = os.environ.get("RELAY_URL", "https://combined-relay-server-33xi.onre
 def health_check():
 
     return (f"OK | {RELAY_URL} | AUDIO_RATE={AUDIO_RATE} MJPEG_Q={MJPEG_Q} FFMPEG_THREADS={FFMPEG_THREADS} "
-            f"cookies={'yes' if os.path.exists(COOKIES_FILE) else 'NO'} | browser={'token-ok' if os.environ.get('BR_TOKEN') else 'NO-TOKEN'} | build=def2"), 200
+            f"cookies={'yes' if os.path.exists(COOKIES_FILE) else 'NO'} | browser={'token-ok' if os.environ.get('BR_TOKEN') else 'NO-TOKEN'} | build=def3 | mem={_mem_str()}"), 200
 
 PORT = 8000
+
+
+def _mem_str():
+    mi = _mem_info()
+    return f"{mi[0]:.0f}/{mi[1]:.0f}MB" if mi else "?"
 
 
 _SECRET_COOKIES = "/etc/secrets/cookies.txt"
@@ -137,17 +142,33 @@ def myip():
     return Response("\n".join(lines), mimetype="text/plain; charset=utf-8")
 
 
+_search_cache = {}           # (q, n) -> (thoi_diem, ket_qua)
+SEARCH_TTL = int(os.environ.get("SEARCH_TTL", "600"))
+
+
 @app.route("/search")
 def search():
     query = request.args.get("q", "")
-    n = int(request.args.get("n", 5))
+    try:
+        n = max(1, min(25, int(request.args.get("n", 5))))
+    except ValueError:
+        n = 5
     if not query:
         return jsonify([])
+    _ck = (query.strip().lower(), n)
+    _hit = _search_cache.get(_ck)
+    if _hit and time.monotonic() - _hit[0] < SEARCH_TTL:
+        print(f"[search] CACHE HIT {query!r}", flush=True)
+        return jsonify(_hit[1])
 
     if YT_API_KEY:
         try:
             res = search_via_api(query, n)
             print(f"[search] YouTube API OK: {len(res)} ket qua")
+            if res:
+                if len(_search_cache) > 100:
+                    _search_cache.clear()
+                _search_cache[_ck] = (time.monotonic(), res)
             warm_results(res)
             return jsonify(res)
         except Exception as e:
@@ -177,6 +198,10 @@ def search():
         print(f"[search] error: {e}")
         return jsonify([])
 
+    if results:
+        if len(_search_cache) > 100:
+            _search_cache.clear()
+        _search_cache[_ck] = (time.monotonic(), results)
     warm_results(results)
     return jsonify(results)
 
@@ -199,7 +224,7 @@ def format_ffmpeg_headers(fmt):
 # hoac cookies bi vo hieu (cookies dung chung nhieu IP se bi YouTube xoay/huy). Moi lan thu doi
 # cach hoi YouTube mot kieu khac; cach nao thanh cong thi nho lai de lan sau thu truoc.
 # (ten, player_client, dung cookies?, bat js runtime + ejs?)
-_YT_ATTEMPTS = [
+_YT_ATTEMPTS_FULL = [
     # Cach khong cookies truoc: khong lam "chay" cookies tren IP datacenter
     ("android_vr",   ["android_vr"],     False, False),
     ("ios",          ["ios"],            False, False),
@@ -209,6 +234,15 @@ _YT_ATTEMPTS = [
     ("mac-dinh",     None,               True,  False),
     ("runtime+ejs",  None,               True,  True),
 ]
+# Ban gon (mac dinh): 3 cach thay vi 6. Bo ios/web_embedded (khong cookies, gan nhu luon hong tren IP datacenter)
+# va gop "mac-dinh" vao "runtime+ejs". Moi cach that bai ton ~15s CPU + RAM (deno/node), nen bot di giam OOM tren goi 512MB.
+# Dat YT_ATTEMPTS_FULL=1 tren Render de dung lai day du 6 cach.
+_YT_ATTEMPTS_LITE = [
+    ("android_vr",   ["android_vr"],     False, False),
+    ("tv",           ["tv"],             True,  True),
+    ("runtime+ejs",  None,               True,  True),
+]
+_YT_ATTEMPTS = _YT_ATTEMPTS_FULL if os.environ.get("YT_ATTEMPTS_FULL", "") == "1" else _YT_ATTEMPTS_LITE
 _yt_preferred = None     # ten cach da thanh cong gan nhat
 
 # Cac cach KHONG cookies hay that bai lien tuc tren IP datacenter va moi lan ton ~15s tren goi Free,
@@ -238,7 +272,7 @@ def _build_ydl_opts(fmt, client=None, use_cookies=True, runtimes=False, proxy=""
         "format": fmt,
         "skip_download": True,
         "geo_bypass": True,
-        "socket_timeout": 15,
+        "socket_timeout": 10,
     }
     if client:
         opts["extractor_args"] = {"youtube": {"player_client": list(client)}}
@@ -278,7 +312,15 @@ def _extract_with(video_url, ydl_opts):
 _NO_RETRY_HINTS = ("Video unavailable", "Private video", "has been removed", "not available in your country")
 
 
+_resolve_gate = threading.Lock()     # chi 1 lan resolve yt-dlp tai 1 thoi diem (tiet kiem RAM goi 512MB)
+
+
 def _resolve_stream_urls_uncached(video_url, height_cap):
+    with _resolve_gate:
+        return _resolve_stream_urls_inner(video_url, height_cap)
+
+
+def _resolve_stream_urls_inner(video_url, height_cap):
     """Dung yt-dlp lay URL luong truc tiep (YouTube, TikTok, Facebook... yt-dlp tu nhan dien domain).
     Doi "bestvideo+bestaudio" (2 luong tach biet) roi de ffmpeg ghep khi mux.
     Voi YouTube: thu lan luot nhieu cach (_YT_ATTEMPTS), cach nao ra truoc thi dung."""
@@ -306,7 +348,7 @@ def _resolve_stream_urls_uncached(video_url, height_cap):
             attempts = with_cookies
             print("[resolve] tam bo cac cach khong cookies (that bai lien tiep), thu cach co cookies", flush=True)
 
-    budget = float(os.environ.get("YT_RESOLVE_BUDGET", "90"))   # tong thoi gian toi da cho moi lan resolve
+    budget = float(os.environ.get("YT_RESOLVE_BUDGET", "45"))   # tong thoi gian toi da cho moi lan resolve
     t_start = time.monotonic()
     errors = []
     for name, client, use_cookies, runtimes in attempts:
@@ -398,6 +440,10 @@ def _restart_when_idle():
 
 
 def _update_and_maybe_restart(min_gap=600):
+    for _ in range(360):                      # pip install ton RAM/CPU: cho luc khong phat + khong dung trinh duyet
+        if _active_streams == 0 and not _br_busy():
+            break
+        time.sleep(10)
     if _update_ytdlp(min_gap):
         _restart_when_idle()
 
@@ -452,6 +498,9 @@ def _warm_worker(video_ids, height_cap):
     for vid in video_ids:
         if _active_streams > 0:
             print("[warm] dang co luong phat, bo qua lam nong", flush=True)
+            return
+        if _br_busy() or _resolve_gate.locked():
+            print("[warm] may dang ban (trinh duyet/resolve khac), bo qua lam nong", flush=True)
             return
         try:
             resolve_stream_urls(f"https://www.youtube.com/watch?v={vid}", height_cap)
@@ -545,7 +594,7 @@ def stream():
 
     if audio_direct_url:
         cmd = (
-            f"ffmpeg -v error "
+            f"ffmpeg -nostdin -v error "
             f"{RECONNECT_ARGS}{video_headers_arg}{PROBE_ARG}{THREADS_ARG}-i {shlex.quote(video_direct_url)} "
             f"{RECONNECT_ARGS}{audio_headers_arg}{PROBE_ARG}{THREADS_ARG}-i {shlex.quote(audio_direct_url)} "
             f"-map 0:v:0 -map 1:a:0 "
@@ -561,7 +610,7 @@ def stream():
         )
     else:
         cmd = (
-            f"ffmpeg -v error {RECONNECT_ARGS}{video_headers_arg}{PROBE_ARG}{THREADS_ARG}-i {shlex.quote(video_direct_url)} "
+            f"ffmpeg -nostdin -v error {RECONNECT_ARGS}{video_headers_arg}{PROBE_ARG}{THREADS_ARG}-i {shlex.quote(video_direct_url)} "
             f"{THREADS_ARG}"
             f"-vf fps={fps},scale={w}:{h}:flags=bicubic "
             f"-c:v mjpeg -q:v {q} "
@@ -570,6 +619,9 @@ def stream():
         )
 
 
+    if _worker is not None and _worker.ctx is not None:
+        print("[stream] dang phat video -> dong Chrome de nhuong RAM", flush=True)
+        threading.Thread(target=_br_stop, daemon=True).start()
     proc = subprocess.Popen(shlex.split(cmd), stdout=subprocess.PIPE, bufsize=1 << 20)
     # Mo rong ong dan stdout cua ffmpeg (mac dinh 64KB) len 1MB de ffmpeg chay truoc, khong bi nghen khi mang cham
     try:
@@ -706,7 +758,7 @@ OUT_W = 320
 SCALE = BR_W / float(OUT_W)          # toa do man hinh ESP32 -> toa do CSS
 BR_TOKEN = os.environ.get("BR_TOKEN", "")
 BR_JPEG_Q = int(os.environ.get("BR_JPEG_Q", "55"))
-IDLE_SEC = int(os.environ.get("BR_IDLE_SEC", "300"))
+IDLE_SEC = int(os.environ.get("BR_IDLE_SEC", "120"))
 PROFILE = os.environ.get("BR_PROFILE", "/tmp/br_profile")
 MAX_JPEG = 60000                      # khop BR_BUF_MAX trong firmware (61440)
 UA = ("Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
@@ -740,6 +792,34 @@ ENTER_JS = """() => {
 
 def _log(*a):
     print("[br]", *a, flush=True)
+
+
+def _mem_info():
+    """(dang dung MB, gioi han MB) cua container (cgroup v2/v1); None neu khong doc duoc.
+    Chi tinh RAM that (anon), khong tinh page cache."""
+    try:
+        for cur, lim, stat, keys in (
+                ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.stat", ("anon",)),
+                ("/sys/fs/cgroup/memory/memory.usage_in_bytes", "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+                 "/sys/fs/cgroup/memory/memory.stat", ("total_rss", "rss"))):
+            if not (os.path.exists(cur) and os.path.exists(lim)):
+                continue
+            limit_s = open(lim).read().strip()
+            if not limit_s.isdigit() or int(limit_s) >= (1 << 40):
+                continue
+            used = int(open(cur).read().strip())
+            try:
+                for line in open(stat):
+                    k, v = line.split()[:2]
+                    if k in keys:
+                        used = int(v)
+                        break
+            except Exception:
+                pass
+            return used / 1048576.0, int(limit_s) / 1048576.0
+    except Exception:
+        pass
+    return None
 
 
 class _Worker(threading.Thread):
@@ -827,7 +907,12 @@ class _Worker(threading.Thread):
                       "--disable-extensions", "--mute-audio",
                       "--disable-background-networking",
                       "--renderer-process-limit=1",
-                      "--disable-features=site-per-process,TranslateUI,BackForwardCache",
+                      "--enable-low-end-device-mode",
+                      "--js-flags=--max-old-space-size=96",
+                      "--disk-cache-size=1", "--media-cache-size=1",
+                      "--disable-breakpad", "--disable-crash-reporter",
+                      "--disable-features=site-per-process,TranslateUI,BackForwardCache,"
+                      "OptimizationHints,MediaRouter,AudioServiceOutOfProcess,IsolateOrigins",
                       "--disable-component-update", "--disable-sync"],
             )
             self.ctx.on("page", self._on_page)
@@ -966,9 +1051,23 @@ def _get_worker():
         return _worker
 
 
+def _close_extra_tabs(w):
+    """Chi giu 1 tab (tab dang xem); cac tab cu mo tu target=_blank van song se an RAM va lam OOM."""
+    try:
+        for pg in list(w.ctx.pages):
+            if pg is not w.page and not pg.is_closed():
+                try:
+                    pg.close()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
 def _do(w, fn, a):
     w.ensure()
     fn(w, a)
+    _close_extra_tabs(w)
     jpg = w.shot()
     url = w.page.url
     try:
@@ -990,6 +1089,12 @@ def _handler(action):
     fn = ACTIONS.get(action)
     if fn is None:
         return Response("unknown action", 404)
+    if _worker is None or _worker.ctx is None:       # Chrome chua chay -> kiem tra con du RAM de mo khong
+        mi = _mem_info()
+        need = int(os.environ.get("BR_MIN_FREE_MB", "170"))
+        if mi and mi[1] - mi[0] < need:
+            _log(f"thieu RAM de mo Chrome: dung {mi[0]:.0f}/{mi[1]:.0f}MB, can trong >= {need}MB")
+            return Response("thieu RAM - thu lai sau it giay", 503, headers={"Retry-After": "10"})
     a = request.args.to_dict()
     try:
         jpg, url, edit = _get_worker().submit(lambda w: _do(w, fn, a))
