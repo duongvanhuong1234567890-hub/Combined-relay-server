@@ -12,6 +12,8 @@ import urllib.request
 import urllib.parse
 import threading
 import fcntl
+import hmac
+import queue
 from flask import Flask, request, Response, jsonify
 import yt_dlp
 from werkzeug.serving import WSGIRequestHandler
@@ -25,7 +27,7 @@ RELAY_URL = os.environ.get("RELAY_URL", "https://combined-relay-server-33xi.onre
 def health_check():
 
     return (f"OK | {RELAY_URL} | AUDIO_RATE={AUDIO_RATE} MJPEG_Q={MJPEG_Q} FFMPEG_THREADS={FFMPEG_THREADS} "
-            f"cookies={'yes' if os.path.exists(COOKIES_FILE) else 'NO'} | build=def1"), 200
+            f"cookies={'yes' if os.path.exists(COOKIES_FILE) else 'NO'} | browser={'token-ok' if os.environ.get('BR_TOKEN') else 'NO-TOKEN'} | build=def2"), 200
 
 PORT = 8000
 
@@ -368,8 +370,9 @@ def _update_ytdlp(min_gap=600):
 
 def _restart_when_idle():
     for _ in range(360):                      # cho toi da ~1 gio de khong cat luong dang phat
-        if _active_streams == 0:
+        if _active_streams == 0 and not _br_busy():
             print("[update] khoi dong lai de nap yt-dlp moi", flush=True)
+            _br_stop()
             os.execv(sys.executable, [sys.executable] + sys.argv)
         time.sleep(10)
 
@@ -652,6 +655,309 @@ def diag():
         lg.lines.append(f"=== THAT BAI: {str(e)[:300]} ===")
     text = "\n".join(head) + "\n\n" + "\n".join(lg.lines)
     return Response(text, mimetype="text/plain; charset=utf-8")
+
+
+# =====================================================================
+# TRINH DUYET TU XA cho T-Display S3  (/br/<action>)
+# Chrome that (Playwright, giao dien dien thoai) chay NGAY TRONG server nay:
+# chup man hinh -> JPEG 320x170 gui ve ESP32; ESP32 gui lai cham / vuot / go chu.
+# - Chi khoi dong Chrome khi co nguoi dung /br/..., tu tat sau BR_IDLE_SEC giay roi.
+# - BR_TOKEN (bat buoc): mat khau, firmware phai khai bao cung gia tri, neu khong -> 403.
+# - BR_PROFILE: thu muc luu cookie/phien dang nhap (mac dinh /tmp/br_profile).
+# - BR_W, BR_H, BR_JPEG_Q, BR_IDLE_SEC: tinh chinh (mac dinh 320, 170, 55, 300).
+# =====================================================================
+BR_W = int(os.environ.get("BR_W", "320"))
+BR_H = int(os.environ.get("BR_H", "170"))
+OUT_W = 320
+SCALE = BR_W / float(OUT_W)          # toa do man hinh ESP32 -> toa do CSS
+BR_TOKEN = os.environ.get("BR_TOKEN", "")
+BR_JPEG_Q = int(os.environ.get("BR_JPEG_Q", "55"))
+IDLE_SEC = int(os.environ.get("BR_IDLE_SEC", "300"))
+PROFILE = os.environ.get("BR_PROFILE", "/tmp/br_profile")
+MAX_JPEG = 60000                      # khop BR_BUF_MAX trong firmware (61440)
+UA = ("Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36")
+
+EDIT_JS = """() => {
+  const e = document.activeElement; if (!e) return false;
+  const t = (e.tagName || '').toLowerCase();
+  if (t === 'textarea') return true;
+  if (t === 'input') {
+    const ty = (e.type || 'text').toLowerCase();
+    return !['button','submit','checkbox','radio','image','reset','file','range','color','hidden'].includes(ty);
+  }
+  return !!e.isContentEditable;
+}"""
+
+# Nhan Enter sau khi go neu o do la o tim kiem / form chi co 1 o nhap.
+ENTER_JS = """() => {
+  const e = document.activeElement; if (!e) return false;
+  const ty = (e.type || '').toLowerCase();
+  if (ty === 'search' || e.getAttribute('role') === 'searchbox' ||
+      e.getAttribute('enterkeyhint') === 'search') return true;
+  if (e.form) {
+    const n = e.form.querySelectorAll(
+      'input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=checkbox]):not([type=radio])').length;
+    return n === 1;
+  }
+  return false;
+}"""
+
+
+def _log(*a):
+    print("[br]", *a, flush=True)
+
+
+class _Worker(threading.Thread):
+    """Playwright (sync) chi dung duoc tren 1 thread -> moi viec xep hang vao day."""
+
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.q = queue.Queue()
+        self.pw = None
+        self.ctx = None
+        self.page = None
+        self.last = time.time()
+
+    # ---- vong lap thread ----
+    def run(self):
+        while True:
+            try:
+                fn, box, ev = self.q.get(timeout=30)
+            except queue.Empty:
+                if self.ctx and time.time() - self.last > IDLE_SEC:
+                    _log("idle -> dong Chrome")
+                    self._reset()
+                continue
+            try:
+                box["r"] = fn(self)
+            except BaseException as e:  # noqa
+                box["e"] = e
+                box["tb"] = traceback.format_exc()
+                if "closed" in str(e).lower():
+                    self._reset()
+            self.last = time.time()
+            ev.set()
+
+    def submit(self, fn, timeout=45):
+        box, ev = {}, threading.Event()
+        self.q.put((fn, box, ev))
+        if not ev.wait(timeout):
+            raise TimeoutError("browser busy/timeout")
+        if "e" in box:
+            _log(box.get("tb", ""))
+            raise box["e"]
+        return box["r"]
+
+    # ---- quan ly Chrome ----
+    def _reset(self):
+        for obj, meth in ((self.ctx, "close"), (self.pw, "stop")):
+            try:
+                if obj:
+                    getattr(obj, meth)()
+            except Exception:
+                pass
+        self.ctx = self.pw = self.page = None
+
+    def _on_page(self, p):
+        self.page = p            # tab moi (target=_blank) -> chuyen sang tab do
+
+    def ensure(self):
+        if self.page is not None and not self.page.is_closed():
+            return
+        if self.ctx is not None:
+            alive = [p for p in self.ctx.pages if not p.is_closed()]
+            if alive:
+                self.page = alive[-1]
+                return
+        from playwright.sync_api import sync_playwright   # import tre
+        if self.pw is None:
+            self.pw = sync_playwright().start()
+        if self.ctx is None:
+            os.makedirs(PROFILE, exist_ok=True)
+            self.ctx = self.pw.chromium.launch_persistent_context(
+                PROFILE,
+                headless=True,
+                viewport={"width": BR_W, "height": BR_H},
+                device_scale_factor=OUT_W / float(BR_W),
+                is_mobile=True,
+                has_touch=True,
+                user_agent=UA,
+                locale="vi-VN",
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+                      "--disable-extensions", "--mute-audio",
+                      "--disable-background-networking"],
+            )
+            self.ctx.on("page", self._on_page)
+        self.page = self.ctx.pages[0] if self.ctx.pages else self.ctx.new_page()
+
+    # ---- thao tac ----
+    def settle(self, ms=350):
+        try:
+            self.page.wait_for_load_state("domcontentloaded", timeout=2500)
+        except Exception:
+            pass
+        self.page.wait_for_timeout(ms)
+
+    def shot(self):
+        q = BR_JPEG_Q
+        data = self.page.screenshot(type="jpeg", quality=q)
+        while len(data) > MAX_JPEG and q > 20:
+            q -= 15
+            data = self.page.screenshot(type="jpeg", quality=q)
+        return data
+
+
+def _norm_url(u):
+    u = (u or "").strip()
+    if not u:
+        return "about:blank"
+    if "://" not in u:
+        u = "https://" + u
+    return u
+
+
+def _f(a, k, d=0.0):
+    try:
+        return float(a.get(k, d))
+    except Exception:
+        return d
+
+
+def act_open(w, a):
+    try:
+        w.page.goto(_norm_url(a.get("u")), wait_until="domcontentloaded", timeout=25000)
+    except Exception as e:
+        _log("goto:", e)
+    try:
+        w.page.wait_for_load_state("load", timeout=4000)
+    except Exception:
+        pass
+    w.page.wait_for_timeout(500)
+
+
+def act_tap(w, a):
+    w.page.touchscreen.tap(_f(a, "x") * SCALE, _f(a, "y") * SCALE)
+    w.settle(600)
+
+
+def act_scroll(w, a):
+    w.page.mouse.move(BR_W / 2.0, BR_H / 2.0)
+    w.page.mouse.wheel(0, _f(a, "dy") * SCALE)
+    w.page.wait_for_timeout(250)
+
+
+def act_type(w, a):
+    text = (a.get("t") or "")[:200]
+    if text:
+        w.page.keyboard.type(text, delay=20)
+        try:
+            if w.page.evaluate(ENTER_JS):
+                w.page.keyboard.press("Enter")
+        except Exception:
+            pass
+    w.settle(500)
+
+
+def act_back(w, a):
+    try:
+        w.page.go_back(timeout=10000, wait_until="domcontentloaded")
+    except Exception:
+        pass
+    w.settle(300)
+
+
+def act_reload(w, a):
+    try:
+        w.page.reload(timeout=15000, wait_until="domcontentloaded")
+    except Exception:
+        pass
+    w.settle(400)
+
+
+def act_frame(w, a):
+    pass
+
+
+ACTIONS = {
+    "open": act_open, "tap": act_tap, "scroll": act_scroll, "type": act_type,
+    "back": act_back, "reload": act_reload, "frame": act_frame,
+}
+
+_worker = None
+_worker_lock = threading.Lock()
+
+
+def _get_worker():
+    global _worker
+    with _worker_lock:
+        if _worker is None:
+            _worker = _Worker()
+            _worker.start()
+        return _worker
+
+
+def _do(w, fn, a):
+    w.ensure()
+    fn(w, a)
+    jpg = w.shot()
+    url = w.page.url
+    try:
+        edit = bool(w.page.evaluate(EDIT_JS))
+    except Exception:
+        edit = False
+    return jpg, url, edit
+
+
+def _handler(action):
+    if not BR_TOKEN:
+        return Response("BR_TOKEN chua duoc dat tren server", 403)
+    if not hmac.compare_digest(request.args.get("k", ""), BR_TOKEN):
+        return Response("forbidden", 403)
+    if action == "close":
+        w = _get_worker()
+        w.submit(lambda ww: ww._reset(), timeout=15)
+        return Response("closed", 200)
+    fn = ACTIONS.get(action)
+    if fn is None:
+        return Response("unknown action", 404)
+    a = request.args.to_dict()
+    try:
+        jpg, url, edit = _get_worker().submit(lambda w: _do(w, fn, a))
+    except ImportError:
+        return Response("playwright chua duoc cai tren server", 503)
+    except TimeoutError:
+        return Response("timeout", 504)
+    except Exception as e:  # noqa
+        return Response("loi: %s" % str(e)[:200], 500)
+    return Response(jpg, mimetype="image/jpeg", headers={
+        "X-Url": urllib.parse.quote(url, safe=":/?&=%#")[:300],
+        "X-Edit": "1" if edit else "0",
+        "Cache-Control": "no-store",
+    })
+
+
+_br_last_activity = 0.0
+
+
+def _br_busy():
+    """True neu co nguoi dang dung trinh duyet (de khong restart server giua chung)."""
+    return _worker is not None and (time.time() - _br_last_activity < 120)
+
+
+def _br_stop():
+    try:
+        if _worker is not None:
+            _worker.submit(lambda ww: ww._reset(), timeout=10)
+    except Exception:
+        pass
+
+
+@app.route("/br/<action>")
+def br_action(action):
+    global _br_last_activity
+    _br_last_activity = time.time()
+    return _handler(action)
 
 
 if __name__ == "__main__":
