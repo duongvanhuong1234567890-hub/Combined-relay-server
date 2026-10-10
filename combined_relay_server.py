@@ -22,6 +22,20 @@ app = Flask(__name__)
 
 RELAY_URL = os.environ.get("RELAY_URL", "https://combined-relay-server-33xi.onrender.com")
 
+# ROLE: all (mac dinh) | video (chi /stream /search /random) | browser (chi /br/*)
+# Dung de chay 2 server rieng cung 1 file: server video khong bat Chrome, server browser khong chay ffmpeg.
+ROLE = os.environ.get("ROLE", "all").strip().lower()
+
+
+@app.before_request
+def _role_gate():
+    p = request.path
+    if ROLE == "video" and p.startswith("/br"):
+        return "disabled on this server (ROLE=video)", 404
+    if ROLE == "browser" and p.startswith(("/stream", "/search", "/random")):
+        return "disabled on this server (ROLE=browser)", 404
+    return None
+
 
 @app.route("/")
 def health_check():
