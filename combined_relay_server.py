@@ -841,6 +841,9 @@ BR_ALLOW_MEDIA = os.environ.get("BR_ALLOW_MEDIA", "0") == "1"
 BR_GOTO_TIMEOUT = int(os.environ.get("BR_GOTO_TIMEOUT", "10")) * 1000   # cho tai trang toi da (ms)
 BR_SHOT_TIMEOUT = int(os.environ.get("BR_SHOT_TIMEOUT", "6")) * 1000    # moi lan chup anh toi da (ms)
 BR_REQ_TIMEOUT = int(os.environ.get("BR_REQ_TIMEOUT", "10"))            # toi da bao lau thi tra anh tam (s) - Chrome van chay tiep o nen, tranh ESP bi -11/504
+BR_JS_HEAP_MB = int(os.environ.get("BR_JS_HEAP_MB", "96"))     # trang nang (TikTok/FB) cham tran heap 96MB -> GC chay lien tuc ton CPU; thu 160 neu con RAM
+BR_NO_ROUTE = os.environ.get("BR_NO_ROUTE", "0") == "1"        # =1: khong loc request qua Python (moi request 1 vong IPC, ton CPU) ma dung co Chrome
+BR_MAX_QUEUE = int(os.environ.get("BR_MAX_QUEUE", "2"))        # toi da so thao tac cho trong hang doi khi Chrome ket
 BR_BLOCK_IMAGES = os.environ.get("BR_BLOCK_IMAGES", "0") == "1"   # =1: duyet chi chu, nhanh gap nhieu lan tren 0.1 CPU
 IDLE_SEC = int(os.environ.get("BR_IDLE_SEC", "300"))   # khoi dong lai Chrome mat 20-40s tren goi free -> khong tat qua som
 PROFILE = os.environ.get("BR_PROFILE", "/tmp/br_profile")
@@ -851,6 +854,17 @@ UA = ("Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
 _BLOCK_URL = ("google-analytics", "googletagmanager", "doubleclick", "googlesyndication", "adservice",
               "scorecardresearch", "hotjar", "sentry.io", "/monitor_browser/", "mon-va.", "mcs-va.", "log-va.",
               "connect.facebook.net")
+
+# Che do BR_NO_ROUTE=1: chan quang cao/theo doi bang host-resolver-rules, font bang --disable-remote-fonts,
+# video tu phat bang autoplay-policy (thay cho Playwright route). Chi dung duoc cho muc theo ten mien (bo muc bat dau bang "/").
+_BR_EXTRA_ARGS = []
+if BR_NO_ROUTE:
+    _hr = ", ".join(f"MAP *{_b}* ~NOTFOUND" for _b in _BLOCK_URL if not _b.startswith("/"))
+    _BR_EXTRA_ARGS = ["--disable-remote-fonts",
+                      "--autoplay-policy=document-user-activation-required",
+                      "--host-resolver-rules=" + _hr]
+    if BR_BLOCK_IMAGES:
+        _BR_EXTRA_ARGS.append("--blink-settings=imagesEnabled=false")
 
 EDIT_JS = """() => {
   const e = document.activeElement; if (!e) return false;
@@ -1022,12 +1036,12 @@ class _Worker(threading.Thread):
                       "--enable-low-end-device-mode",
                       "--disable-smooth-scrolling", "--disable-lcd-text", "--disable-font-subpixel-positioning",
                       "--disable-partial-raster", "--disable-histogram-customizer",
-                      "--js-flags=--max-old-space-size=96",
+                      f"--js-flags=--max-old-space-size={BR_JS_HEAP_MB}",
                       "--disk-cache-size=1", "--media-cache-size=1",
                       "--disable-breakpad", "--disable-crash-reporter",
                       "--disable-features=site-per-process,TranslateUI,BackForwardCache,"
                       "OptimizationHints,MediaRouter,AudioServiceOutOfProcess,IsolateOrigins",
-                      "--disable-component-update", "--disable-sync"],
+                      "--disable-component-update", "--disable-sync"] + _BR_EXTRA_ARGS,
             )
             self.ctx.on("page", self._on_page)
             def _lite(route):            # chan video/font/theo doi/quang cao de nhe CPU (goi free)
@@ -1044,7 +1058,8 @@ class _Worker(threading.Thread):
                 except Exception:
                     pass
             try:
-                self.ctx.route("**/*", _lite)
+                if not BR_NO_ROUTE:
+                    self.ctx.route("**/*", _lite)
             except Exception:
                 pass
         self.page = self.ctx.pages[0] if self.ctx.pages else self.ctx.new_page()
@@ -1225,6 +1240,12 @@ def _handler(action):
     a = request.args.to_dict()
     if action == "frame" and _worker is not None and _worker.busy:
         return _pending_response()          # dang ban -> khong xep hang them, tra anh gan nhat
+    if _worker is not None:
+        # Viec qua han van nam trong hang doi (keep=True) va chay SAU khi ban da sang trang khac -> thao tac tre vai chuc giay.
+        # Chrome dang ket thi bo cuon (scroll) moi va khong don qua BR_MAX_QUEUE viec.
+        _qn = _worker.q.qsize()
+        if (action == "scroll" and (_worker.busy or _qn)) or _qn >= BR_MAX_QUEUE:
+            return _pending_response()
     try:
         jpg, url, edit = _get_worker().submit(lambda w: _do(w, fn, a), timeout=BR_REQ_TIMEOUT, keep=True)
     except ImportError:
@@ -1286,6 +1307,21 @@ def br_action(action):
     return _handler(action)
 
 
+def _warmup_once():
+    """Sau khi khoi dong, tu lay link 1 video luc chua ai dung de nap cache giai ma chu ky YouTube (deno + player JS).
+    Neu khong, lan bam video DAU TIEN sau moi lan deploy mat ~20s o buoc nay. Tat bang YT_WARMUP=0."""
+    time.sleep(float(os.environ.get("YT_WARMUP_DELAY", "25")))
+    if _active_streams > 0 or _br_busy():
+        return
+    vid = os.environ.get("YT_WARMUP_VIDEO", "dQw4w9WgXcQ")
+    t0 = time.monotonic()
+    try:
+        resolve_stream_urls(f"https://www.youtube.com/watch?v={vid}", os.environ.get("MIN_HEIGHT", "240"))
+        print(f"[warmup] xong sau {time.monotonic() - t0:.0f}s", flush=True)
+    except Exception as e:
+        print(f"[warmup] loi: {str(e)[:120]}", flush=True)
+
+
 def _keepalive_loop():
     """Render Free ngu sau 15 phut khong co request; lan sau danh thuc mat 30-60s (phan lon ~40s truoc khung hinh dau).
     Tu goi /healthz qua URL cong khai moi KEEPALIVE_SEC giay de giu server thuc.
@@ -1304,6 +1340,8 @@ def _keepalive_loop():
 if __name__ == "__main__":
     if os.environ.get("KEEPALIVE", "") == "1":
         threading.Thread(target=_keepalive_loop, daemon=True).start()
+    if os.environ.get("YT_WARMUP", "1") == "1" and ROLE != "browser":
+        threading.Thread(target=_warmup_once, daemon=True).start()
     print(f"[update] yt-dlp hien tai: {_ytdlp_version()} | auto_update={AUTO_UPDATE} moi {UPDATE_HOURS}h", flush=True)
     if AUTO_UPDATE:
         threading.Thread(target=_update_loop, daemon=True).start()
