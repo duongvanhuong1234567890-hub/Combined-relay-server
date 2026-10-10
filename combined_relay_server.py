@@ -20,7 +20,7 @@ from werkzeug.serving import WSGIRequestHandler
 
 app = Flask(__name__)
 
-RELAY_URL = os.environ.get("RELAY_URL", "https://combined-relay-server-33xi.onrender.com")
+RELAY_URL = os.environ.get("RELAY_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "https://combined-relay-server-33xi.onrender.com"
 
 # ROLE: all (mac dinh) | video (chi /stream /search /random) | browser (chi /br/*)
 # Dung de chay 2 server rieng cung 1 file: server video khong bat Chrome, server browser khong chay ffmpeg.
@@ -34,6 +34,9 @@ def _role_gate():
         return "disabled on this server (ROLE=video)", 404
     if ROLE == "browser" and p.startswith(("/stream", "/search", "/random")):
         return "disabled on this server (ROLE=browser)", 404
+    # /diag va /myip chay yt-dlp / goi mang -> khong de nguoi la bam vao lam ton CPU va "dot" uy tin IP
+    if p in ("/diag", "/myip") and BR_TOKEN and not hmac.compare_digest(request.args.get("k", ""), BR_TOKEN):
+        return "forbidden - them ?k=BR_TOKEN vao URL", 403
     return None
 
 
@@ -43,7 +46,12 @@ def health_check():
     return (f"OK | {RELAY_URL} | AUDIO_RATE={AUDIO_RATE} MJPEG_Q={MJPEG_Q} FFMPEG_THREADS={FFMPEG_THREADS} "
             f"cookies={'yes' if os.path.exists(COOKIES_FILE) else 'NO'} | browser={'token-ok' if os.environ.get('BR_TOKEN') else 'NO-TOKEN'} | build=def3 | mem={_mem_str()}"), 200
 
-PORT = 8000
+PORT = int(os.environ.get("PORT", "8000"))   # Render cap cong qua bien moi truong PORT
+
+
+@app.route("/healthz")
+def healthz():
+    return "ok", 200
 
 
 def _mem_str():
@@ -198,7 +206,7 @@ def search():
         ydl_opts["cookiefile"] = COOKIES_FILE
     results = []
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with _resolve_gate, yt_dlp.YoutubeDL(ydl_opts) as ydl:     # chung cong voi resolve: 1 yt-dlp / luc, khong tranh ghi cookies.txt
             info = ydl.extract_info(f"ytsearch{n}:{query}", download=False)
             for entry in info.get("entries", []):
                 if not entry:
@@ -258,6 +266,11 @@ _YT_ATTEMPTS_LITE = [
 ]
 _YT_ATTEMPTS = _YT_ATTEMPTS_FULL if os.environ.get("YT_ATTEMPTS_FULL", "") == "1" else _YT_ATTEMPTS_LITE
 _yt_preferred = None     # ten cach da thanh cong gan nhat
+# Khi YouTube chan IP, thu lai lien tuc chi ton CPU (0.1 CPU) va lam IP bi chan nang hon.
+# Sau khi MOI cach deu that bai vi bi chan -> nghi YT_BLOCK_BACKOFF giay, tra loi loi ngay (khong cho 45s).
+YT_BLOCK_BACKOFF = float(os.environ.get("YT_BLOCK_BACKOFF", "60"))
+_yt_block_until = 0.0
+_BLOCK_HINTS = ("Sign in", "player response", "not a bot", "HTTP Error 429", "HTTP Error 403")
 
 # Cac cach KHONG cookies hay that bai lien tuc tren IP datacenter va moi lan ton ~15s tren goi Free,
 # an het ngan sach thoi gian truoc khi toi cach co cookies. Neu chung that bai YT_NOCOOKIE_MAX_FAILS lan
@@ -287,9 +300,16 @@ def _build_ydl_opts(fmt, client=None, use_cookies=True, runtimes=False, proxy=""
         "skip_download": True,
         "geo_bypass": True,
         "socket_timeout": 10,
+        "noplaylist": True,
+        "retries": 1,
+        "extractor_retries": 1,
     }
     if client:
         opts["extractor_args"] = {"youtube": {"player_client": list(client)}}
+    # Tuy chon: PO token tu dich vu bgutil-ytdlp-pot-provider (plugin yt-dlp), vd YT_POT_URL=http://127.0.0.1:4416
+    _pot = os.environ.get("YT_POT_URL", "").strip()
+    if _pot:
+        opts.setdefault("extractor_args", {})["youtubepot-bgutilhttp"] = {"base_url": [_pot]}
     if runtimes:
         # Can deno/node de giai chu ky YouTube (xem Dockerfile); runtime nao khong co thi yt-dlp bo qua
         opts["js_runtimes"] = {"deno": {}, "node": {}}
@@ -338,7 +358,7 @@ def _resolve_stream_urls_inner(video_url, height_cap):
     """Dung yt-dlp lay URL luong truc tiep (YouTube, TikTok, Facebook... yt-dlp tu nhan dien domain).
     Doi "bestvideo+bestaudio" (2 luong tach biet) roi de ffmpeg ghep khi mux.
     Voi YouTube: thu lan luot nhieu cach (_YT_ATTEMPTS), cach nao ra truoc thi dung."""
-    global _yt_preferred, _nocookie_fails, _nocookie_skip_until
+    global _yt_preferred, _nocookie_fails, _nocookie_skip_until, _yt_block_until
     fmt = (
         f"bestvideo[height<={height_cap}][vcodec^=avc1]+bestaudio"
         f"/bestvideo[height<={height_cap}]+bestaudio"
@@ -348,6 +368,9 @@ def _resolve_stream_urls_inner(video_url, height_cap):
     is_yt = _is_youtube(video_url)
     if not is_yt:
         return _extract_with(video_url, _build_ydl_opts(fmt, use_cookies=True))
+    _left = _yt_block_until - time.monotonic()
+    if _left > 0:
+        raise RuntimeError(f"YouTube dang chan IP - tam nghi them {_left:.0f}s (YT_BLOCK_BACKOFF) de khong bi chan nang hon")
 
     attempts = list(_YT_ATTEMPTS)
     # Muon ep client thi dat YT_PLAYER_CLIENTS="tv,web_safari" - se duoc thu dau tien
@@ -388,6 +411,8 @@ def _resolve_stream_urls_inner(video_url, height_cap):
             if any(h in msg for h in _NO_RETRY_HINTS):
                 break
     _yt_preferred = None
+    if errors and any(h in e for e in errors for h in _BLOCK_HINTS):
+        _yt_block_until = time.monotonic() + YT_BLOCK_BACKOFF
     raise RuntimeError(" | ".join(errors)[:700])
 
 
@@ -434,7 +459,8 @@ def _update_ytdlp(min_gap=600):
         try:
             r = subprocess.run(
                 [sys.executable, "-m", "pip", "install", "-U", "--no-cache-dir", "--quiet", "yt-dlp[default]"],
-                capture_output=True, text=True, timeout=240)
+                capture_output=True, text=True, timeout=240,
+                preexec_fn=lambda: os.nice(19))   # pip chay do uu tien thap, khong tranh CPU voi ffmpeg
             if r.returncode != 0:
                 print(f"[update] pip loi: {r.stderr[-300:]}", flush=True)
                 return False
@@ -507,6 +533,8 @@ def resolve_stream_urls(video_url, height_cap):
             if len(_resolve_cache) > 60:    # don bot ban cu
                 for k in sorted(_resolve_cache, key=lambda k: _resolve_cache[k][0])[:20]:
                     _resolve_cache.pop(k, None)
+            for k in [k for k, l in _resolve_locks.items() if not l.locked() and k not in _resolve_cache]:
+                _resolve_locks.pop(k, None)     # truoc day _resolve_locks chi tang, khong bao gio giam
         return res
 
 
@@ -515,7 +543,7 @@ def _warm_worker(video_ids, height_cap):
         if _active_streams > 0:
             print("[warm] dang co luong phat, bo qua lam nong", flush=True)
             return
-        if _br_busy() or _resolve_gate.locked():
+        if _br_busy() or _resolve_gate.locked() or time.monotonic() < _yt_block_until:
             print("[warm] may dang ban (trinh duyet/resolve khac), bo qua lam nong", flush=True)
             return
         try:
@@ -590,6 +618,10 @@ def _stream_impl(video_url):
     if not video_url:
         return Response(status=400)
 
+    # Chrome (~170MB+) va yt-dlp+deno/node (~100-150MB) khong duoc cung song tren goi 512MB -> dong Chrome TRUOC khi resolve
+    if _worker is not None and _worker.ctx is not None:
+        print("[stream] dong Chrome truoc khi resolve de nhuong RAM cho yt-dlp", flush=True)
+        _br_stop()
     try:
         video_direct_url, audio_direct_url, video_headers, audio_headers = resolve_stream_urls(video_url, height_cap)
     except Exception as e:
@@ -604,7 +636,7 @@ def _stream_impl(video_url):
 
     RECONNECT_ARGS = (
         "-reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 "
-        "-reconnect_delay_max 5 "
+        "-reconnect_delay_max 5 -rw_timeout 20000000 "
     )
     if YT_PROXY and _is_youtube(video_url):
         RECONNECT_ARGS += f"-http_proxy {shlex.quote(YT_PROXY)} "
@@ -613,6 +645,8 @@ def _stream_impl(video_url):
 
 
     THREADS_ARG = f"-threads {FFMPEG_THREADS} "
+    # Mac dinh ffmpeg mo so luong thread loc = so nhan MAY CHU (nhieu) du container chi co 0.1-0.5 CPU -> bi throttle. Ep ve FFMPEG_THREADS.
+    FILTER_ARG = f"-filter_threads {FFMPEG_THREADS} "
     # Khoi dong ffmpeg nhanh hon: bot thoi gian do thong tin dau vao (mac dinh ~5s moi luong)
     PROBE_ARG = "-probesize 500000 -analyzeduration 500000 -fflags +nobuffer "
 
@@ -622,7 +656,7 @@ def _stream_impl(video_url):
             f"{RECONNECT_ARGS}{video_headers_arg}{PROBE_ARG}{THREADS_ARG}-i {shlex.quote(video_direct_url)} "
             f"{RECONNECT_ARGS}{audio_headers_arg}{PROBE_ARG}{THREADS_ARG}-i {shlex.quote(audio_direct_url)} "
             f"-map 0:v:0 -map 1:a:0 "
-            f"{THREADS_ARG}"
+            f"{THREADS_ARG}{FILTER_ARG}"
             f"-vf fps={fps},scale={w}:{h}:flags=fast_bilinear "
 
 
@@ -635,7 +669,7 @@ def _stream_impl(video_url):
     else:
         cmd = (
             f"ffmpeg -nostdin -v error {RECONNECT_ARGS}{video_headers_arg}{PROBE_ARG}{THREADS_ARG}-i {shlex.quote(video_direct_url)} "
-            f"{THREADS_ARG}"
+            f"{THREADS_ARG}{FILTER_ARG}"
             f"-vf fps={fps},scale={w}:{h}:flags=fast_bilinear "
             f"-c:v mjpeg -q:v {q} "
             f"-c:a pcm_s16le -ar {ar} -ac 1 "
@@ -682,7 +716,7 @@ def _stream_impl(video_url):
         first = True
         try:
             while True:
-                chunk = proc.stdout.read(32768)
+                chunk = proc.stdout.read1(32768)     # read1: tra ngay phan co san, khong cho du 32KB (giam tre khung dau)
                 if not chunk:
                     break
                 if first:
@@ -710,7 +744,18 @@ def _stream_impl(video_url):
                 except Exception:
                     pass
 
-    return Response(generate(), mimetype="video/avi")
+    def _reap():
+        # Neu client ngat truoc khi generator kip chay thi khoi finally cua generate() khong bao gio chay -> ffmpeg mo coi an CPU/RAM
+        try:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=3)
+        except Exception:
+            pass
+
+    resp = Response(generate(), mimetype="video/avi")
+    resp.call_on_close(_reap)
+    return resp
 
 
 
@@ -1241,7 +1286,24 @@ def br_action(action):
     return _handler(action)
 
 
+def _keepalive_loop():
+    """Render Free ngu sau 15 phut khong co request; lan sau danh thuc mat 30-60s (phan lon ~40s truoc khung hinh dau).
+    Tu goi /healthz qua URL cong khai moi KEEPALIVE_SEC giay de giu server thuc.
+    Luu y: Free chi co 750 gio/thang CHUNG cho ca workspace -> chi bat o 1 service."""
+    url = RELAY_URL.rstrip("/") + "/healthz"
+    gap = max(60.0, float(os.environ.get("KEEPALIVE_SEC", "540")))
+    time.sleep(60)
+    while True:
+        try:
+            urllib.request.urlopen(url, timeout=15).read(16)
+        except Exception as e:
+            print(f"[keepalive] loi: {str(e)[:80]}", flush=True)
+        time.sleep(gap)
+
+
 if __name__ == "__main__":
+    if os.environ.get("KEEPALIVE", "") == "1":
+        threading.Thread(target=_keepalive_loop, daemon=True).start()
     print(f"[update] yt-dlp hien tai: {_ytdlp_version()} | auto_update={AUTO_UPDATE} moi {UPDATE_HOURS}h", flush=True)
     if AUTO_UPDATE:
         threading.Thread(target=_update_loop, daemon=True).start()
