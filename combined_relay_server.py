@@ -582,6 +582,7 @@ _NO_RETRY_STRONG = ("Private video", "has been removed", "not available in your 
 _NO_RETRY_WEAK = ("Video unavailable", "This video is not available")
 
 
+
 _resolve_gate = threading.Lock()
 YT_GATE_WAIT = float(os.environ.get("YT_GATE_WAIT", "90"))
 YT_WARM_BUDGET = float(os.environ.get("YT_WARM_BUDGET", "20"))
@@ -606,9 +607,71 @@ def _canon_url(url):
     return f"https://www.youtube.com/watch?v={m.group(1)}" if m else url
 
 
+RAPID_KEY = os.environ.get("RAPIDAPI_KEY", "").strip()
+# URL day du cua endpoint "Get Video Details" (YouTube Media Downloader). Lay chinh xac tu tab Code snippet tren RapidAPI.
+RAPID_URL = os.environ.get("RAPID_URL", "https://youtube-media-downloader.p.rapidapi.com/v2/video/details").strip()
+RAPID_HOST = urllib.parse.urlparse(RAPID_URL).netloc
+RAPID_ONLY = os.environ.get("RAPID_ONLY", "0") == "1"   # =1: RapidAPI loi thi bao loi luon, KHONG roi ve yt-dlp
+
+
+def _rapid_streams(video_id, height_cap):
+    """Lay URL luong tu RapidAPI (YouTube Media Downloader) -> (video_url, audio_url, video_hdr, audio_hdr)."""
+    if not RAPID_KEY:
+        raise ResolveError("chua dat RAPIDAPI_KEY")
+    url = RAPID_URL + "?" + urllib.parse.urlencode({"videoId": video_id, "urlAccess": "normal"})
+    req = urllib.request.Request(url, headers={
+        "x-rapidapi-host": RAPID_HOST,
+        "x-rapidapi-key": RAPID_KEY,
+        "User-Agent": UA,
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = json.loads(r.read(5_000_000).decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        body = e.read(200).decode("utf-8", "replace")
+        raise ResolveError(f"RapidAPI HTTP {e.code}: {body}") from None
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        raise ResolveError(f"RapidAPI loi mang: {str(e)[:100]}") from None
+
+    vitems = [v for v in ((data.get("videos") or {}).get("items") or [])
+              if isinstance(v, dict) and v.get("url")]
+    aitems = [a for a in ((data.get("audios") or {}).get("items") or [])
+              if isinstance(a, dict) and a.get("url")]
+    cap = int(height_cap)
+    hdr = f"User-Agent: {UA}\r\n"
+
+    # 1) Luong gop co ca hinh lan tieng (vd itag 18, 360p): don gian nhat cho ffmpeg
+    combined = [v for v in vitems if v.get("hasAudio") and (v.get("height") or 0) <= cap]
+    if combined:
+        best = max(combined, key=lambda v: (v.get("height") or 0, "avc1" in str(v.get("mimeType", ""))))
+        return best["url"], None, hdr, ""
+
+    # 2) Tach rieng: video khong tieng (uu tien avc1/mp4 de ffmpeg giai ma nhe) + audio nho nhat
+    vids = [v for v in vitems if str(v.get("mimeType", "")).startswith("video/")
+            and (v.get("height") or 0) <= cap]
+    if not vids:
+        raise ResolveError("RapidAPI khong co luong video phu hop")
+    v = max(vids, key=lambda v: ("avc1" in str(v.get("mimeType", "")), v.get("height") or 0))
+    if not aitems:
+        return v["url"], None, hdr, ""
+    a = min(aitems, key=lambda x: x.get("size") or x.get("bitrate") or 0)
+    return v["url"], a["url"], hdr, hdr
+
+
 def _resolve_stream_urls_uncached(video_url, height_cap, background=False):
-    # Nguoi dung that: cho toi da YT_GATE_WAIT giay roi bao busy (khong treo vo han).
-    # Lam nong nen: khong bao gio xep hang -> khong bao gio chan nguoi dung that.
+    m = _YT_ID_RE.search(video_url or "")
+    use_rapid = bool(RAPID_KEY and m and _is_youtube(video_url))
+
+    if use_rapid:
+        # Nguon CHINH: RapidAPI (khong can giu gate yt-dlp)
+        try:
+            return _rapid_streams(m.group(1), height_cap)
+        except ResolveError as e:
+            print(f"[resolve] RapidAPI that bai: {str(e)[:200]}", flush=True)
+            if background or RAPID_ONLY:
+                raise   # warmup / che do chi RapidAPI: khong dung yt-dlp
+
+    # Du phong: yt-dlp
     if background:
         if not _resolve_gate.acquire(blocking=False):
             raise ResolveError("busy (dang co resolve khac)")
