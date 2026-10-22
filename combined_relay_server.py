@@ -615,12 +615,12 @@ def _resolve_stream_urls_uncached(video_url, height_cap, background=False):
     elif not _resolve_gate.acquire(timeout=YT_GATE_WAIT):
         raise ResolveError(f"server dang ban, cho qua {YT_GATE_WAIT:.0f}s")
     try:
-        return _resolve_stream_urls_inner(video_url, height_cap, YT_WARM_BUDGET if background else None)
+        return _resolve_stream_urls_inner(video_url, height_cap, YT_WARM_BUDGET if background else None, background)
     finally:
         _resolve_gate.release()
 
 
-def _resolve_stream_urls_inner(video_url, height_cap, budget=None):
+def _resolve_stream_urls_inner(video_url, height_cap, budget=None, background=False):
     """Dung yt-dlp lay URL luong truc tiep (YouTube, TikTok, Facebook... yt-dlp tu nhan dien domain).
     Doi "bestvideo+bestaudio" (2 luong tach biet) roi de ffmpeg ghep khi mux.
     Voi YouTube: thu lan luot nhieu cach (_YT_ATTEMPTS), cach nao ra truoc thi dung."""
@@ -681,7 +681,8 @@ def _resolve_stream_urls_inner(video_url, height_cap, budget=None):
             msg = str(e)
             print(f"[resolve] cach '{name}' that bai: {msg[:140]}", flush=True)
             errors.append(f"{name}: {msg[:110]}")
-            if not use_cookies and "player response" in msg:
+            # Lam nong nen that bai KHONG duoc ghi vao trang thai chung (chan IP / bo cach khong cookies)
+            if not background and not use_cookies and "player response" in msg:
                 _nocookie_fails += 1
                 if _nocookie_fails >= YT_NOCOOKIE_MAX_FAILS:
                     _nocookie_skip_until = time.monotonic() + YT_NOCOOKIE_COOLDOWN
@@ -693,8 +694,9 @@ def _resolve_stream_urls_inner(video_url, height_cap, budget=None):
                 if weak_hits >= 2:
                     permanent = True
                     break
-    if not permanent:
+    if not permanent and not background:
         # video hong rieng le KHONG duoc xoa cach dang chay tot / khong duoc coi la IP bi chan
+        # background (warmup): that bai luc khoi dong khong duoc khoa request that 60s
         _yt_preferred = None
         _joined = " | ".join(errors)
         if any(h in _joined for h in _BLOCK_HINTS) and not any(h in _joined for h in _AGE_HINTS):
