@@ -653,7 +653,8 @@ def _resolve_stream_urls_inner(video_url, height_cap, budget=None, background=Fa
         # het thoi gian nghi -> dem lai tu dau (truoc day 1 loi le la nghi tiep ngay)
         _nocookie_skip_until = 0.0
         _nocookie_fails = 0
-    if os.path.exists(COOKIES_FILE) and time.monotonic() < _nocookie_skip_until:
+    # Lam nong nen + co cookies: bo qua cach khong cookies (android_vr an het ngan sach 20s roi moi toi cach co cookies)
+    if os.path.exists(COOKIES_FILE) and (time.monotonic() < _nocookie_skip_until or background):
         with_cookies = [a for a in attempts if a[2]]
         if with_cookies:
             attempts = with_cookies
