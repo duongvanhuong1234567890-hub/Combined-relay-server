@@ -658,6 +658,55 @@ def _rapid_streams(video_id, height_cap):
     return v["url"], a["url"], hdr, hdr
 
 
+RAPID_FAST_HOST = os.environ.get("RAPID_FAST_HOST", "youtube-video-fast-downloader-24-7.p.rapidapi.com").strip()
+RAPID_FAST_QUALITY = os.environ.get("RAPID_FAST_QUALITY", "18").strip()   # 18 = MP4 360p co san tieng
+RAPID_FILE_WAIT = float(os.environ.get("RAPID_FILE_WAIT", "300"))
+
+
+def _rapid_fast_file(video_id):
+    """RapidAPI (youtube-video-fast-downloader) tra URL file mp4 da co tieng.
+    File co the chua san sang (404) trong 20-300s, nen cho den khi tai duoc. -> (video_url, None, "", "")"""
+    if not RAPID_KEY:
+        raise ResolveError("chua dat RAPIDAPI_KEY")
+    api = (f"https://{RAPID_FAST_HOST}/download_video/{video_id}?"
+           + urllib.parse.urlencode({"quality": RAPID_FAST_QUALITY}))
+    req = urllib.request.Request(api, headers={
+        "x-rapidapi-host": RAPID_FAST_HOST,
+        "x-rapidapi-key": RAPID_KEY,
+        "User-Agent": UA,
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=150) as r:
+            data = json.loads(r.read(200_000).decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        body = e.read(200).decode("utf-8", "replace")
+        raise ResolveError(f"RapidAPI HTTP {e.code}: {body}") from None
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        raise ResolveError(f"RapidAPI loi mang: {str(e)[:100]}") from None
+
+    file_url = data.get("file") if isinstance(data, dict) else None
+    if not file_url or not _url_is_public(file_url):
+        raise ResolveError("RapidAPI khong tra file hop le: " + str(data)[:200])
+
+    deadline = time.monotonic() + RAPID_FILE_WAIT
+    while True:
+        try:
+            rq = urllib.request.Request(file_url, headers={"User-Agent": UA, "Range": "bytes=0-0"})
+            with urllib.request.urlopen(rq, timeout=15) as r:
+                if r.status in (200, 206):
+                    break
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                raise ResolveError(f"file tu RapidAPI loi HTTP {e.code}") from None
+        except (urllib.error.URLError, OSError):
+            pass   # mang chap chon: thu lai
+        if time.monotonic() > deadline:
+            raise ResolveError(f"file chua san sang sau {RAPID_FILE_WAIT:.0f}s")
+        time.sleep(5)
+    print("[rapid] file san sang, bat dau phat", flush=True)
+    return file_url, None, "", ""
+
+
 def _resolve_stream_urls_uncached(video_url, height_cap, background=False):
     m = _YT_ID_RE.search(video_url or "")
     use_rapid = bool(RAPID_KEY and m and _is_youtube(video_url))
@@ -665,7 +714,7 @@ def _resolve_stream_urls_uncached(video_url, height_cap, background=False):
     if use_rapid:
         # Nguon CHINH: RapidAPI (khong can giu gate yt-dlp)
         try:
-            return _rapid_streams(m.group(1), height_cap)
+            return _rapid_fast_file(m.group(1))
         except ResolveError as e:
             print(f"[resolve] RapidAPI that bai: {str(e)[:200]}", flush=True)
             if background or RAPID_ONLY:
@@ -995,6 +1044,8 @@ def resolve_stream_urls(video_url, height_cap, background=False, force=False):
             exp = _res_expiry(res)
             if exp is not None:
                 until = min(until, exp)  # khong giu URL da het han (TTL cung 30 phut truoc day co the dai hon han that)
+            elif res[0] and "googlevideo.com" not in res[0]:
+                until = min(until, ts + 480)  # file RapidAPI chi ton tai ~10 phut
             if until > ts + 30:
                 _resolve_cache[key] = (ts, res, until)
             for k in [k for k, v in _resolve_cache.items() if ts >= v[2]]:
