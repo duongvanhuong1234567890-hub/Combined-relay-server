@@ -3,3 +3,4 @@ yt-dlp[default]
 pillow>=10.0
 requests>=2.31
 playwright>=1.49
+bgutil-ytdlp-pot-provider
