@@ -2473,6 +2473,8 @@ BR_CR_IDLE = float(os.environ.get("BR_CR_IDLE", "120"))                         
 BR_CR_MIN_MB = float(os.environ.get("BR_CR_MIN_MB", "900"))                       # auto: RAM container toi thieu de bat Chromium
 BR_CR_MEM_MAX = float(os.environ.get("BR_CR_MEM_MAX", "0.90"))                    # RAM dung/gioi han vuot muc nay -> khong mo / tat Chromium
 BR_CR_RETRY = float(os.environ.get("BR_CR_RETRY", "120"))
+BR_CR_SOFT = float(os.environ.get("BR_CR_SOFT", "0.80"))                          # RAM vuot muc nay -> khoi dong lai Chromium (mo lai dung trang dang xem)
+BR_CR_RECYCLE = int(os.environ.get("BR_CR_RECYCLE", "30"))                        # sau chung nay luot chuyen trang -> khoi dong lai (Chromium chay lau bi phinh)
 BR_CR_JS_MB = int(os.environ.get("BR_CR_JS_MB", "128"))                           # tran heap V8
 BR_CR_SINGLE = os.environ.get("BR_CR_SINGLE", "0") == "1"                         # --single-process: tiet kiem RAM nhat nhung de crash
 _CR_BLOCK_HOSTS = ("doubleclick.net", "googlesyndication.com", "googleadservices.com", "google-analytics.com",
@@ -2530,7 +2532,8 @@ class _Chromium:
         self.focus = None
         self.home = False
         self.err_url = ""
-        self.last_used = time.monotonic()
+        self.navs = 0
+        self.born = self.last_used = time.monotonic()
 
     # ---- khoi dong / tat ----
     def start(self):
@@ -2656,6 +2659,7 @@ class _Chromium:
             return
         self.home = False
         self.err_url = url
+        self.navs += 1
         try:
             self.page.goto(url, wait_until="domcontentloaded", timeout=BR_CR_TIMEOUT * 1000)
         except Exception as e:
@@ -2699,8 +2703,10 @@ class _Chromium:
             q -= 10
 
     # ---- 1 thao tac -> (jpg, edit, play, url) ----
-    def act(self, action, a, portrait):
+    def act(self, action, a, portrait, resume=""):
         self.last_used = time.monotonic()
+        if resume and action != "open" and self.page.url == "about:blank":
+            self.go(resume)   # vua khoi dong lai de nha RAM / het nhan roi -> mo lai dung trang dang xem
         self.ensure(portrait, home=action not in ("open",))
         z = BR_CR_ZOOM
         pg = self.page
@@ -2715,6 +2721,7 @@ class _Chromium:
             pg.wait_for_timeout(250)
             if pg.url != old:
                 self.home = False
+                self.navs += 1
                 self.settle()
             self.focus = self.get_focus()
         elif action == "scroll":
@@ -2785,9 +2792,14 @@ def _cr_enabled():
     return True
 
 
-def _cr_close_async():
-    """Tat Chromium (khi roi trang web sang YouTube / het nhan roi) de nhuong RAM cho ffmpeg. Chay xong luot dang do roi moi dong."""
-    global _cr
+_cr_resume = ""
+
+
+def _cr_close_async(resume=False):
+    """Tat Chromium de nhuong RAM (chay xong luot dang do roi moi dong). resume=True: lan sau mo lai dung trang dang xem
+    (het nhan roi / don RAM); False: da roi trang web (sang YouTube, dong, loi) -> khong nho."""
+    global _cr, _cr_resume
+    _cr_resume = _cr_last_url if (resume and _cr_last_url not in ("", "about:home")) else ""
     c, _cr = _cr, None
     if c is not None:
         try:
@@ -2801,12 +2813,12 @@ def _cr_reaper():
         time.sleep(15)
         c = _cr
         if c is not None and time.monotonic() - c.last_used > BR_CR_IDLE:
-            _log("chromium nhan roi -> tat")
-            _cr_close_async()
+            _log("chromium nhan roi -> tat (nho trang dang xem)")
+            _cr_close_async(resume=True)
 
 
 def _cr_act(action, a, portrait):
-    global _cr, _cr_last_url, _cr_reaper_on
+    global _cr, _cr_last_url, _cr_reaper_on, _cr_resume
     frac = _mem_frac()
     if frac > BR_CR_MEM_MAX:
         raise _CrUnavailable("RAM %.0f%% > %.0f%%" % (frac * 100, BR_CR_MEM_MAX * 100))
@@ -2819,8 +2831,13 @@ def _cr_act(action, a, portrait):
     if not _cr_reaper_on:
         _cr_reaper_on = True
         threading.Thread(target=_cr_reaper, daemon=True).start()
-    jpg, edit, play, url = _cr_run(c.act, action, a, portrait)
+    res, _cr_resume = _cr_resume, ""
+    jpg, edit, play, url = _cr_run(c.act, action, a, portrait, res)
     _cr_last_url = url
+    frac = _mem_frac()
+    if (frac > BR_CR_SOFT or c.navs >= BR_CR_RECYCLE) and time.monotonic() - c.born > 15:
+        _log("don RAM: %.0f%%, %d luot -> khoi dong lai Chromium" % (frac * 100, c.navs))
+        _cr_close_async(resume=True)   # khung hinh nay van tra binh thuong; lan sau mo lai dung trang nay
     _S.url = url   # de X-Url tra dung (khi lui ve HTML se reset _S)
     return jpg, edit, play
 
