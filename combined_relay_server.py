@@ -148,6 +148,7 @@ def _role_gate():
         _br_last_activity = 0.0  # da chuyen sang YouTube -> browser khong con \"ban\" (cho phep lam nong ngay)
         if KILL_ON_LEAVE and p.startswith("/search"):
             _kill_stream()  # tim kiem moi = da roi video cu, nha CPU/RAM cua ffmpeg dang treo
+        _cr_close_async()       # sang YouTube: tra RAM cua Chromium cho ffmpeg/yt-dlp
     return None
 
 
@@ -155,7 +156,7 @@ def _role_gate():
 def health_check():
 
     return (f"OK | role={ROLE} | {RELAY_URL} | AUDIO_RATE={AUDIO_RATE} MJPEG_Q={MJPEG_Q} FFMPEG_THREADS={FFMPEG_THREADS} "
-            f"cookies={'yes' if os.path.exists(COOKIES_FILE) else 'NO'} | browser={'token-ok' if os.environ.get('BR_TOKEN') else 'NO-TOKEN'} | build=gg1 | mem={_mem_str()}"), 200
+            f"cookies={'yes' if os.path.exists(COOKIES_FILE) else 'NO'} | browser={'token-ok' if os.environ.get('BR_TOKEN') else 'NO-TOKEN'} | engine={BR_ENGINE}{'(chromium dang chay)' if _cr is not None else ''} | build=gg1 | mem={_mem_str()}"), 200
 
 PORT = int(os.environ.get("PORT", "8000"))
 
@@ -2460,7 +2461,393 @@ def _submit(fi, bname=None, bval=None):
     return _S.goto(urllib.parse.urlunparse(p._replace(query=urllib.parse.urlencode(q), fragment="")))
 
 
+# ======================= ENGINE CHROMIUM THAT (Playwright) =======================
+# BR_ENGINE=auto (mac dinh): dung Chromium neu co Playwright VA RAM container >= BR_CR_MIN_MB, nguoc lai dung bo HTML tho o tren.
+# BR_ENGINE=chromium: ep dung (Free 512MB co the bi OOM). BR_ENGINE=html: tat han.
+# Moi loi cua Chromium (thieu binary, het RAM, treo...) -> tu lui ve bo HTML, thu lai sau BR_CR_RETRY giay.
+# Playwright sync API gan voi luong tao ra no, ma Flask chay moi request 1 luong -> moi thao tac Chromium di qua 1 luong rieng.
+BR_ENGINE = os.environ.get("BR_ENGINE", "auto").strip().lower()
+BR_CR_ZOOM = max(1.0, min(3.0, float(os.environ.get("BR_CR_ZOOM", "1.25"))))     # viewport CSS = khung hinh * zoom, roi thu nho ve khung hinh
+BR_CR_TIMEOUT = float(os.environ.get("BR_CR_TIMEOUT", "15"))                      # giay cho tai trang
+BR_CR_IDLE = float(os.environ.get("BR_CR_IDLE", "120"))                           # nhan roi bay nhieu giay -> tat Chromium tra RAM
+BR_CR_MIN_MB = float(os.environ.get("BR_CR_MIN_MB", "900"))                       # auto: RAM container toi thieu de bat Chromium
+BR_CR_MEM_MAX = float(os.environ.get("BR_CR_MEM_MAX", "0.90"))                    # RAM dung/gioi han vuot muc nay -> khong mo / tat Chromium
+BR_CR_RETRY = float(os.environ.get("BR_CR_RETRY", "120"))
+BR_CR_JS_MB = int(os.environ.get("BR_CR_JS_MB", "128"))                           # tran heap V8
+BR_CR_SINGLE = os.environ.get("BR_CR_SINGLE", "0") == "1"                         # --single-process: tiet kiem RAM nhat nhung de crash
+_CR_BLOCK_HOSTS = ("doubleclick.net", "googlesyndication.com", "googleadservices.com", "google-analytics.com",
+                   "googletagmanager.com", "adservice.google.", "adnxs.com", "taboola.com", "outbrain.com",
+                   "scorecardresearch.com", "hotjar.com", "connect.facebook.net")
+
+_CR_INIT_JS = """(()=>{
+window.open=function(u){if(u){try{location.href=u}catch(e){}}return null;};
+document.addEventListener('click',function(e){var a=e.target&&e.target.closest&&e.target.closest('a[target]');
+if(a&&a.target!=='_self')a.target='_self';},true);
+})();"""
+
+# o dang focus la gi: "line" (go xong Enter de gui), "multi" (nhieu dong, khong Enter), null (khong phai o nhap)
+_CR_FOCUS_JS = """()=>{const e=document.activeElement;if(!e)return null;const t=e.tagName;
+if(t==='INPUT'){const ty=(e.type||'text').toLowerCase();
+if(['button','submit','checkbox','radio','image','reset','file','range','color'].includes(ty))return null;return 'line';}
+if(t==='TEXTAREA'){const f=e.form,nm=(e.name||'').toLowerCase();
+if(f&&(e.rows<=1||['q','query','search','s'].includes(nm)||f.getAttribute('role')==='search'))return 'line';return 'multi';}
+if(e.isContentEditable)return 'multi';return null;}"""
+
+_CR_PAGE_CSS = "body{font-family:sans-serif;margin:10px;font-size:15px}input{width:70%;font-size:15px;padding:4px}button{font-size:15px;padding:4px 8px}li{margin:6px 0}"
+
+
+def _cr_home_html():
+    act = html.escape(BR_SEARCH_URL.split("?")[0], quote=True)
+    return ("<!doctype html><meta charset=utf-8><title>Trình duyệt</title><style>%s</style><h2>Trình duyệt</h2>"
+            "<form action=\"%s\" method=\"get\"><input name=\"q\" placeholder=\"Tìm kiếm hoặc gõ link\"> <button>Tìm</button></form>"
+            "<p>Dán link video (YouTube, TikTok, Facebook...) để phát.</p><ul>"
+            "<li><a href=\"https://vi.wikipedia.org\">Wikipedia</a></li><li><a href=\"https://vnexpress.net\">VnExpress</a></li>"
+            "<li><a href=\"https://tuoitre.vn\">Tuổi Trẻ</a></li><li><a href=\"https://thanhnien.vn\">Thanh Niên</a></li>"
+            "<li><a href=\"https://news.ycombinator.com\">Hacker News</a></li></ul>") % (_CR_PAGE_CSS, act)
+
+
+def _cr_error_html(msg, url):
+    return ("<!doctype html><meta charset=utf-8><title>Loi</title><style>%s</style><h3>Không tải được trang</h3><p>%s</p><p>%s</p>"
+            % (_CR_PAGE_CSS, html.escape(str(msg)[:160]), html.escape(str(url)[:200])))
+
+
+def _cr_video_html(url):
+    return ("<!doctype html><meta charset=utf-8><title>Video</title><style>%s</style><h3>Video</h3><p>%s</p><p>Đang chuyển sang trình phát...</p>"
+            % (_CR_PAGE_CSS, html.escape(urllib.parse.urlparse(url).netloc + urllib.parse.urlparse(url).path[:60])))
+
+
+class _CrUnavailable(RuntimeError):
+    pass
+
+
+class _Chromium:
+    """Moi phuong thuc (tru __init__) CHI duoc goi tren luong _cr_pool."""
+
+    def __init__(self):
+        self.pw = self.browser = self.ctx = self.page = None
+        self.vp = None
+        self.play = None          # link video bi chan o lop mang -> firmware se phat bang ffmpeg
+        self.focus = None
+        self.home = False
+        self.err_url = ""
+        self.last_used = time.monotonic()
+
+    # ---- khoi dong / tat ----
+    def start(self):
+        try:
+            from playwright.sync_api import sync_playwright
+        except Exception as e:
+            raise _CrUnavailable("chua cai playwright: %s" % e)
+        args = ["--disable-gpu", "--disable-software-rasterizer", "--disable-dev-shm-usage", "--disable-extensions",
+                "--disable-background-networking", "--disable-sync", "--disable-default-apps", "--disable-translate",
+                "--disable-component-update", "--disable-breakpad", "--disable-notifications", "--mute-audio",
+                "--no-first-run", "--no-default-browser-check", "--metrics-recording-only", "--force-color-profile=srgb",
+                "--disable-features=TranslateUI,MediaRouter,AudioServiceOutOfProcess,OptimizationHints,Prerender2",
+                "--renderer-process-limit=1", "--disk-cache-size=1", "--media-cache-size=1",
+                "--js-flags=--max-old-space-size=%d" % BR_CR_JS_MB]
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            args += ["--no-sandbox", "--no-zygote"]   # container chay root: Chromium khong khoi dong duoc neu con sandbox
+        if BR_CR_SINGLE:
+            args.append("--single-process")
+        self.pw = sync_playwright().start()
+        try:
+            self.browser = self.pw.chromium.launch(headless=True, args=args)
+        except Exception as e:
+            raise _CrUnavailable("khong mo duoc Chromium (da chay 'playwright install chromium'?): %s" % str(e)[:200])
+        self.ctx = self.browser.new_context(
+            user_agent=UA, viewport={"width": 400, "height": 212}, device_scale_factor=1, accept_downloads=False,
+            locale=os.environ.get("BR_CR_LOCALE", "vi-VN"), service_workers="block")
+        self.ctx.set_default_timeout(BR_CR_TIMEOUT * 1000)
+        self.ctx.add_init_script(_CR_INIT_JS)
+        self.ctx.route("**/*", self._route)
+        self.ctx.on("page", self._on_page)
+        self.page = self.ctx.new_page()
+        self.page.on("dialog", lambda d: d.dismiss())
+
+    def close(self):
+        for o in (self.ctx, self.browser):
+            try:
+                if o:
+                    o.close()
+            except Exception:
+                pass
+        try:
+            if self.pw:
+                self.pw.stop()
+        except Exception:
+            pass
+        self.pw = self.browser = self.ctx = self.page = None
+        gc.collect()
+
+    # ---- an toan / tiet kiem ----
+    def _on_page(self, p):
+        if self.page is not None and p is not self.page:   # popup / tab moi: dong ngay (window.open da bi doi thanh dieu huong cung tab)
+            try:
+                p.close()
+            except Exception:
+                pass
+
+    def _route(self, route):
+        try:
+            req = route.request
+            url = req.url
+            if url.startswith(("data:", "blob:", "about:")):
+                return route.continue_()
+            if not _url_is_public(url):   # chan SSRF: khong cho trinh duyet cham mang noi bo (ke ca qua redirect / subresource)
+                return route.abort("blockedbyclient")
+            rt = req.resource_type
+            if rt in ("media", "font") or (rt == "image" and not BR_IMAGES):
+                return route.abort()
+            host = (urllib.parse.urlparse(url).hostname or "").lower()
+            if any(h in host for h in _CR_BLOCK_HOSTS):
+                return route.abort()
+            if rt == "document" and req.is_navigation_request() and req.frame.parent_frame is None and _is_video_url(url):
+                self.play = url   # link video: khong tai trang xem nang, giao cho /br/play (tra trang "Video" nho thay vi loi mang)
+                return route.fulfill(status=200, content_type="text/html; charset=utf-8", body=_cr_video_html(url))
+            route.continue_()
+        except Exception:
+            try:
+                route.abort()
+            except Exception:
+                pass
+
+    # ---- dieu huong ----
+    def ensure(self, portrait, home=True):
+        w, h = (OUT_H, OUT_W) if portrait else (OUT_W, OUT_H)
+        vp = (int(w * BR_CR_ZOOM), int(h * BR_CR_ZOOM))
+        if vp != self.vp:
+            self.page.set_viewport_size({"width": vp[0], "height": vp[1]})
+            self.vp = vp
+        if home and self.page.url == "about:blank" and not self.home:
+            self.go("about:home")
+
+    def cur_url(self):
+        u = self.page.url
+        if u.startswith("chrome-error:"):   # trang loi mang cua Chromium -> bao dung link nguoi dung da mo
+            return self.err_url or u
+        return "about:home" if (self.home and u == "about:blank") else u
+
+    def set_html(self, body):
+        try:
+            self.page.set_content(body, wait_until="domcontentloaded")
+        except Exception:   # "Execution context was destroyed": dang co 1 lan dieu huong dang do -> cho xong roi thu lai
+            try:
+                self.page.wait_for_load_state("domcontentloaded", timeout=2000)
+            except Exception:
+                pass
+            self.page.set_content(body, wait_until="domcontentloaded")
+
+    def settle(self):
+        try:
+            self.page.wait_for_load_state("load", timeout=3000)
+        except Exception:
+            pass
+        try:
+            self.page.wait_for_load_state("networkidle", timeout=800)
+        except Exception:
+            pass
+        self.page.wait_for_timeout(120)
+
+    def go(self, url):
+        self.play, self.focus = None, None
+        if url == "about:home":
+            self.set_html(_cr_home_html())
+            self.home = True
+            return
+        self.home = False
+        self.err_url = url
+        try:
+            self.page.goto(url, wait_until="domcontentloaded", timeout=BR_CR_TIMEOUT * 1000)
+        except Exception as e:
+            msg = str(e)
+            if self.play:
+                return
+            if not ("ERR_ABORTED" in msg or "Timeout" in msg):   # het gio / bi huy: cu hien phan da tai duoc
+                self.set_html(_cr_error_html(msg.splitlines()[0] if msg else "loi", url))
+                return
+        self.settle()
+
+    def get_focus(self):
+        try:
+            return self.page.evaluate(_CR_FOCUS_JS)
+        except Exception:
+            return None
+
+    # ---- khung hinh ----
+    def shot(self, portrait):
+        W, VH = (OUT_H, OUT_W) if portrait else (OUT_W, OUT_H)
+        raw = self.page.screenshot(type="jpeg", quality=80, caret="hide", animations="disabled")
+        im = Image.open(io.BytesIO(raw)).convert("RGB")
+        if im.size != (W, VH):
+            im = im.resize((W, VH), Image.LANCZOS)   # thu nho (zoom) co loc -> chu ro hon la ve thang o co nho
+        try:
+            sy, total, ih = self.page.evaluate(
+                "()=>[window.scrollY,document.documentElement.scrollHeight,window.innerHeight]")
+        except Exception:
+            sy, total, ih = 0, 0, 1
+        if total > ih + 4:
+            d = ImageDraw.Draw(im)
+            bh = max(10, int(VH * ih / total))
+            by = int(min(1.0, sy / max(1.0, total - ih)) * (VH - bh))
+            d.rectangle((W - 2, by, W - 1, by + bh), fill=(110, 110, 110))
+        q = BR_JPEG_Q
+        while True:
+            buf = io.BytesIO()
+            im.save(buf, "JPEG", quality=q)
+            if buf.tell() <= MAX_JPEG or q <= 25:
+                return buf.getvalue()
+            q -= 10
+
+    # ---- 1 thao tac -> (jpg, edit, play, url) ----
+    def act(self, action, a, portrait):
+        self.last_used = time.monotonic()
+        self.ensure(portrait, home=action not in ("open",))
+        z = BR_CR_ZOOM
+        pg = self.page
+        if action == "open":
+            self.go(_to_url(a.get("u", "")))
+        elif action == "tap":
+            sx, sy = _f(a, "x"), _f(a, "y")
+            px, py = ((OUT_H - 1 - sy), sx) if portrait else (sx, sy)
+            self.play = None
+            old = pg.url
+            pg.mouse.click(px * z, py * z)
+            pg.wait_for_timeout(250)
+            if pg.url != old:
+                self.home = False
+                self.settle()
+            self.focus = self.get_focus()
+        elif action == "scroll":
+            dy = _f(a, "dy") * z
+            if dy:
+                before = pg.evaluate("window.scrollY")
+                pg.evaluate("d=>window.scrollBy({top:d,behavior:'instant'})", dy)
+                if pg.evaluate("window.scrollY") == before:   # trang cuon trong 1 khung con (SPA) -> thu lan chuot
+                    pg.mouse.move(self.vp[0] / 2, self.vp[1] / 2)
+                    pg.mouse.wheel(0, dy)
+                pg.wait_for_timeout(80)
+        elif action == "type":
+            t = (a.get("t") or "")[:300]
+            if t and self.focus:
+                kind = self.focus
+                pg.keyboard.press("Control+A")
+                pg.keyboard.insert_text(t)
+                if kind == "line":
+                    old = pg.url
+                    pg.keyboard.press("Enter")
+                    pg.wait_for_timeout(300)
+                    self.home = False
+                    if pg.url != old:
+                        self.settle()
+                    self.focus = None
+                else:
+                    self.focus = self.get_focus()
+            elif t:
+                self.go(_to_url(t))
+        elif action == "back":
+            self.play, self.focus = None, None
+            try:
+                pg.go_back(wait_until="domcontentloaded", timeout=BR_CR_TIMEOUT * 1000)
+                self.settle()
+            except Exception:
+                pass
+            if pg.url in ("about:blank", ""):
+                self.go("about:home")
+        elif action == "reload":
+            if self.cur_url() == "about:home":
+                self.go("about:home")
+            else:
+                self.play = None
+                try:
+                    pg.reload(wait_until="domcontentloaded", timeout=BR_CR_TIMEOUT * 1000)
+                except Exception:
+                    pass
+                self.settle()
+        jpg = self.shot(portrait)
+        play, self.play = self.play, None
+        return jpg, self.focus is not None and action in ("tap", "type"), play, self.cur_url()
+
+
+_cr = None
+_cr_fail_until = 0.0
+_cr_last_url = ""
+_cr_reaper_on = False
+_cr_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="chromium")
+
+
+def _cr_enabled():
+    if BR_ENGINE == "html" or not _PIL_OK or time.monotonic() < _cr_fail_until:
+        return False
+    if BR_ENGINE == "auto":
+        mi = _mem_info()
+        if mi and mi[1] < BR_CR_MIN_MB:
+            return False
+    return True
+
+
+def _cr_close_async():
+    """Tat Chromium (khi roi trang web sang YouTube / het nhan roi) de nhuong RAM cho ffmpeg. Chay xong luot dang do roi moi dong."""
+    global _cr
+    c, _cr = _cr, None
+    if c is not None:
+        try:
+            _cr_pool.submit(c.close)
+        except Exception:
+            pass
+
+
+def _cr_reaper():
+    while True:
+        time.sleep(15)
+        c = _cr
+        if c is not None and time.monotonic() - c.last_used > BR_CR_IDLE:
+            _log("chromium nhan roi -> tat")
+            _cr_close_async()
+
+
+def _cr_act(action, a, portrait):
+    global _cr, _cr_last_url, _cr_reaper_on
+    frac = _mem_frac()
+    if frac > BR_CR_MEM_MAX:
+        raise _CrUnavailable("RAM %.0f%% > %.0f%%" % (frac * 100, BR_CR_MEM_MAX * 100))
+    if _cr is None:
+        _trim_caches()   # nha cache cua bo HTML truoc khi nap Chromium
+        _cr = _Chromium()
+    c = _cr
+    if c.page is None:
+        _cr_run(c.start)
+    if not _cr_reaper_on:
+        _cr_reaper_on = True
+        threading.Thread(target=_cr_reaper, daemon=True).start()
+    jpg, edit, play, url = _cr_run(c.act, action, a, portrait)
+    _cr_last_url = url
+    _S.url = url   # de X-Url tra dung (khi lui ve HTML se reset _S)
+    return jpg, edit, play
+
+
+def _cr_run(fn, *args):
+    return _cr_pool.submit(fn, *args).result(timeout=BR_CR_TIMEOUT + 40)
+
+
 def _act(action, a, portrait):
+    """-> (jpg, edit, play_url). Chromium that neu bat duoc, loi gi cung tu lui ve bo HTML."""
+    global _cr_fail_until
+    if _cr_enabled():
+        try:
+            return _cr_act(action, a, portrait)
+        except Exception as e:
+            why = (type(e).__name__ + ": " + str(e)).splitlines()[0][:220]
+            _log("chromium loi -> dung bo HTML (thu lai sau %ds):" % BR_CR_RETRY, why)
+            _cr_fail_until = time.monotonic() + BR_CR_RETRY
+            _cr_close_async()
+            u = _cr_last_url
+            _S.reset()
+            if u and u != "about:home" and action != "open":
+                _S.goto(u, push=False)   # tiep tuc dung trang dang xem bang bo HTML
+    return _act_html(action, a, portrait)
+
+
+def _act_html(action, a, portrait):
     """-> (jpg, edit, play_url)"""
     edit, play = False, None
     if not _S.url:
@@ -2558,6 +2945,7 @@ def br_play():
     if "://" not in url:
         url = "https://" + url
     print(f"[br] play {url}", flush=True)
+    _cr_close_async()
     return _stream_impl(url)
 
 
@@ -2571,6 +2959,7 @@ def br_action(action):
     if action == "close":
         with _lk:
             _S.reset()
+        _cr_close_async()
         return Response("closed", 200)
     if action not in ("open", "tap", "scroll", "type", "back", "reload", "frame"):
         return Response("unknown action", 404)
