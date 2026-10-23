@@ -253,6 +253,8 @@ FFMPEG_THREADS = os.environ.get("FFMPEG_THREADS", "1")   # do: 2 luong khong gia
 STREAM_FAST_DECODE = os.environ.get("STREAM_FAST_DECODE", "1") == "1"   # bo loc deblock khi giai ma: -7% CPU, PSNR 41.9dB (gan nhu khong khac)
 STREAM_SRC_AUTO = os.environ.get("STREAM_SRC_AUTO", "1") == "1"        # chi lay nguon vua du cho khung ra (240p thay vi 360p: -34% CPU)
 STREAM_NICE = int(os.environ.get("STREAM_NICE", "5"))
+STREAM_SKIP_NOREF = os.environ.get("STREAM_SKIP_NOREF", "1") == "1"   # fps ra thap: bo qua khung B khong tham chieu ngay luc giai ma (-15% CPU, hinh khong doi)
+STREAM_FPS_MAX = int(os.environ.get("STREAM_FPS_MAX", "12"))   # tran fps phia server (bo qua fps firmware gui len neu cao hon)
 AUDIO_RATE = os.environ.get("AUDIO_RATE", "16000")
 print(f"[config] AUDIO_RATE={AUDIO_RATE} MJPEG_Q={MJPEG_Q} FFMPEG_THREADS={FFMPEG_THREADS}", flush=True)
 
@@ -1188,6 +1190,8 @@ def _ffmpeg_cmd(v_url, a_url, v_hdr, a_hdr, is_yt, w, h, fps, q, ar):
               "-threads", str(FFMPEG_THREADS)]
         if vid and STREAM_FAST_DECODE:
             a += ["-skip_loop_filter", "all"]   # CHI gan cho input co video (input chi co audio se bi ffmpeg bao "option khong dung")
+        if vid and STREAM_SKIP_NOREF and fps <= 12:
+            a += ["-skip_frame", "noref"]
         a += ["-i", url]
         return a
 
@@ -1258,6 +1262,7 @@ def _stream_impl(video_url):
     _fmin = _env_int("STREAM_FPS_MIN", 0)
     if _fmin:
         fps = min(30, max(fps, _fmin))
+    fps = max(1, min(fps, STREAM_FPS_MAX))
     q = min(31, max(_int_arg("q", _env_int("MJPEG_Q", 6), 2, 31), _env_int("STREAM_Q_MIN", 2)))
     ar = _int_arg("ar", _env_int("AUDIO_RATE", 16000), 4000, 22050)
     bps_cap = _env_int("STREAM_MAX_BPS_CAP", 3000000)
@@ -1358,6 +1363,10 @@ def _stream_impl(video_url):
         t0 = time.monotonic()
         sent = 0
         chunk = first
+        # chan doan: ffmpeg_wait = thoi gian cho ffmpeg ra du lieu (CPU/nguon cham), client_wait = thoi gian cho thiet bi nhan (WiFi/ESP cham)
+        w_ff = w_cl = 0.0
+        last_log = t0
+        last_sent = 0
         try:
             while chunk:
                 sent += len(chunk)
@@ -1365,8 +1374,18 @@ def _stream_impl(video_url):
                 actual_elapsed = time.monotonic() - t0
                 if expected_elapsed > actual_elapsed:
                     time.sleep(expected_elapsed - actual_elapsed)
+                t1 = time.monotonic()
                 yield chunk
+                t2 = time.monotonic()
                 chunk = proc.stdout.read1(65536)
+                t3 = time.monotonic()
+                w_cl += t2 - t1
+                w_ff += t3 - t2
+                if t3 - last_log >= 10:
+                    span = t3 - last_log
+                    print(f"[stream-diag] {span:.0f}s: ffmpeg_wait={w_ff:.1f}s client_wait={w_cl:.1f}s "
+                          f"rate={(sent - last_sent) / span / 1000:.0f}KB/s fps={fps} q={q}", flush=True)
+                    last_log, last_sent, w_ff, w_cl = t3, sent, 0.0, 0.0
         finally:
             _release()
             _terminate(proc)
