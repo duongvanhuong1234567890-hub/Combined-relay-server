@@ -253,6 +253,27 @@ FFMPEG_THREADS = os.environ.get("FFMPEG_THREADS", "1")   # do: 2 luong khong gia
 STREAM_FAST_DECODE = os.environ.get("STREAM_FAST_DECODE", "1") == "1"   # bo loc deblock khi giai ma: -7% CPU, PSNR 41.9dB (gan nhu khong khac)
 STREAM_SRC_AUTO = os.environ.get("STREAM_SRC_AUTO", "1") == "1"        # chi lay nguon vua du cho khung ra (240p thay vi 360p: -34% CPU)
 STREAM_NICE = int(os.environ.get("STREAM_NICE", "5"))
+# Giu nhip THOI GIAN THUC cho ffmpeg. Log cho thay 30s dau ffmpeg chay ~10x toc do that (600-850KB/s trong khi video chi can ~70-100KB/s)
+# roi dot ngot ve ~100-250KB/s (client_wait tang vot): thiet bi bi "dap" du lieu luc dau -> giat, sau khi bo dem day moi muot.
+# STREAM_READRATE: toc do doc nguon toi da so voi thoi gian that (1.15 = nhanh hon 15% de luon day buffer). 0 = tat.
+# STREAM_READ_BURST: so giay du lieu duoc doc nhanh luc dau de thiet bi co buffer khoi dau (chi dung duoc neu ffmpeg co -readrate_initial_burst).
+STREAM_READRATE = float(os.environ.get("STREAM_READRATE", "1.15"))
+STREAM_READ_BURST = float(os.environ.get("STREAM_READ_BURST", "4"))
+_ff_caps = None
+
+
+def _ffmpeg_caps():
+    """Do mot lan xem ffmpeg tren may co -readrate / -readrate_initial_burst khong (ban cu hon thi lui ve -re)."""
+    global _ff_caps
+    if _ff_caps is None:
+        txt = ""
+        try:
+            txt = subprocess.run(["ffmpeg", "-hide_banner", "-h", "full"], capture_output=True, text=True, timeout=20).stdout
+        except Exception:
+            pass
+        _ff_caps = ("-readrate " in txt or "-readrate\t" in txt, "readrate_initial_burst" in txt)
+        print(f"[config] ffmpeg readrate={_ff_caps[0]} initial_burst={_ff_caps[1]} (STREAM_READRATE={STREAM_READRATE})", flush=True)
+    return _ff_caps
 STREAM_SKIP_NOREF = os.environ.get("STREAM_SKIP_NOREF", "1") == "1"   # fps ra thap: bo qua khung B khong tham chieu ngay luc giai ma (-15% CPU, hinh khong doi)
 STREAM_FPS_MAX = int(os.environ.get("STREAM_FPS_MAX", "12"))   # tran fps phia server (bo qua fps firmware gui len neu cao hon)
 AUDIO_RATE = os.environ.get("AUDIO_RATE", "16000")
@@ -1192,6 +1213,15 @@ def _ffmpeg_cmd(v_url, a_url, v_hdr, a_hdr, is_yt, w, h, fps, q, ar):
             a += ["-skip_loop_filter", "all"]   # CHI gan cho input co video (input chi co audio se bi ffmpeg bao "option khong dung")
         if vid and STREAM_SKIP_NOREF and fps <= 12:
             a += ["-skip_frame", "noref"]
+        if STREAM_READRATE > 0:
+            # Giu nhip THOI GIAN THUC: khong de ffmpeg doc/giai ma nhanh gap 10 lan o 30s dau roi dot ngot tut toc do
+            rr, burst = _ffmpeg_caps()
+            if rr:
+                a += ["-readrate", str(STREAM_READRATE)]
+                if burst and STREAM_READ_BURST > 0:
+                    a += ["-readrate_initial_burst", str(STREAM_READ_BURST)]
+            else:
+                a += ["-re"]
         a += ["-i", url]
         return a
 
