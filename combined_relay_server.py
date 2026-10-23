@@ -147,7 +147,7 @@ def _role_gate():
     if p.startswith(("/stream", "/search", "/random")):
         _br_last_activity = 0.0  # da chuyen sang YouTube -> browser khong con \"ban\" (cho phep lam nong ngay)
         if KILL_ON_LEAVE and p.startswith("/search"):
-            _kill_stream()  # tim kiem moi = da roi video cu, nha CPU/RAM cua ffmpeg dang treo
+            _kill_stream(_who())  # tim kiem moi = da roi video cu, nha CPU/RAM cua ffmpeg dang treo
         _cr_close_async()       # sang YouTube: tra RAM cua Chromium cho ffmpeg/yt-dlp
     return None
 
@@ -860,14 +860,23 @@ def _streams_add(d):
 _cur_lock = threading.Lock()
 
 
-def _kill_stream():
+def _who():
+    """Ai goi? (path + IP that sau proxy Render) - de log chi ra chinh xac yeu cau nao cat luong dang xem."""
+    try:
+        ip = (request.headers.get("X-Forwarded-For", "") or request.remote_addr or "").split(",")[0].strip()
+        return f"{request.path} tu {ip}"
+    except Exception:
+        return "?"
+
+
+def _kill_stream(why=""):
     """Tat ffmpeg dang phat va BO tham chieu: yeu cau /stream dang cho byte dau tien nhin thay _cur_proc doi
     -> hieu la minh bi thay the va dung han (truoc day no tuong ffmpeg loi, resolve lai roi sinh ffmpeg moi de len nguoi dung vua chuyen)."""
     global _cur_proc
     with _cur_lock:
         p, _cur_proc = _cur_proc, None
     if p is not None and p.poll() is None:
-        print("[stream] roi video -> tat ffmpeg cu", flush=True)
+        print(f"[stream] roi video -> tat ffmpeg cu (boi {why or '?'})", flush=True)
         try:
             p.kill()
         except Exception:
@@ -1306,7 +1315,7 @@ def _stream_impl(video_url):
 
     if KILL_ON_LEAVE:
         # yeu cau moi = client da bo video cu: nha CPU/RAM NGAY (truoc day ffmpeg cu van chay suot luc resolve ~vai chuc giay)
-        _kill_stream()
+        _kill_stream(_who())
 
     # URL lay tu cache co the da chet (het han / IP doi) -> ffmpeg thoat ngay khong ra byte nao,
     # truoc day client nhan 200 rong va cache hong duoc giu den het TTL. Gio: neu byte dau tien khong den,
@@ -1338,7 +1347,7 @@ def _stream_impl(video_url):
         with _cur_lock:
             _old = _cur_proc
             if _old is not None and _old.poll() is None:
-                print("[stream] co yeu cau moi -> tat ffmpeg cu de nhuong CPU", flush=True)
+                print(f"[stream] co yeu cau moi -> tat ffmpeg cu de nhuong CPU (boi {_who()})", flush=True)
                 try:
                     _old.kill()
                 except Exception:
@@ -1397,6 +1406,7 @@ def _stream_impl(video_url):
         w_ff = w_cl = 0.0
         last_log = t0
         last_sent = 0
+        reason = "ffmpeg het du lieu (EOF)"
         try:
             while chunk:
                 sent += len(chunk)
@@ -1416,7 +1426,20 @@ def _stream_impl(video_url):
                     print(f"[stream-diag] {span:.0f}s: ffmpeg_wait={w_ff:.1f}s client_wait={w_cl:.1f}s "
                           f"rate={(sent - last_sent) / span / 1000:.0f}KB/s fps={fps} q={q}", flush=True)
                     last_log, last_sent, w_ff, w_cl = t3, sent, 0.0, 0.0
+        except GeneratorExit:
+            reason = "THIET BI DONG KET NOI (client thoat/ngat WiFi/timeout phia ESP)"
+            raise
+        except BaseException as e:
+            reason = f"LOI {type(e).__name__}: {str(e)[:120]}"
+            raise
         finally:
+            # ffmpeg rc: 0 = het video binh thuong; -9 = bi kill (server tu giet HOAC Render OOM); -15 = terminate; >0 = ffmpeg tu loi
+            try:
+                rc = proc.wait(timeout=1.5) if reason.startswith("ffmpeg") else proc.poll()
+            except Exception:
+                rc = proc.poll()
+            print(f"[stream] KET THUC sau {time.monotonic() - t0:.0f}s, gui {sent // 1024}KB | ly do: {reason} | "
+                  f"ffmpeg rc={rc} | RAM {_mem_str()}", flush=True)
             _release()
             _terminate(proc)
 
@@ -3032,7 +3055,7 @@ def br_action(action):
     if not _PIL_OK:
         return Response("thieu Pillow: them Pillow vao requirements.txt roi deploy lai", 503)
     if KILL_ON_LEAVE and action in ("open", "tap", "type", "back", "reload"):
-        _kill_stream()  # vua chuyen tu YouTube sang Google: tat ffmpeg cu de nhuong CPU
+        _kill_stream(_who())  # vua chuyen tu YouTube sang Google: tat ffmpeg cu de nhuong CPU
     a = request.args.to_dict()
     portrait = a.get("o") == "1"
     t0 = time.monotonic()
