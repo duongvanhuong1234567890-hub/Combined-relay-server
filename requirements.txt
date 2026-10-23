@@ -1,3 +1,4 @@
-flask
-yt-dlp
-playwright
+flask>=3.0
+yt-dlp[default]
+pillow>=10.0
+requests>=2.31

@@ -1469,8 +1469,9 @@ try:
     from PIL import Image, ImageDraw, ImageFont
     Image.MAX_IMAGE_PIXELS = max(_IMG_PIXEL_CAP, _IMG_JPEG_PIXEL_CAP) * 2   # PIL chi canh bao/tu choi sau muc nay; kiem tra chinh nam trong _decode_image
     _PIL_OK = True
-except Exception:
+except Exception as _pil_e:
     _PIL_OK = False
+    print(f"[br] KHONG NAP DUOC Pillow ({_pil_e}) - /br/* se tra 503", flush=True)
 
 OUT_W = 320
 OUT_H = 170
@@ -2574,7 +2575,7 @@ def br_action(action):
     if action not in ("open", "tap", "scroll", "type", "back", "reload", "frame"):
         return Response("unknown action", 404)
     if not _PIL_OK:
-        return Response("thieu Pillow: chay  pkg install python-pillow", 503)
+        return Response("thieu Pillow: them Pillow vao requirements.txt roi deploy lai", 503)
     if KILL_ON_LEAVE and action in ("open", "tap", "type", "back", "reload"):
         _kill_stream()  # vua chuyen tu YouTube sang Google: tat ffmpeg cu de nhuong CPU
     a = request.args.to_dict()
@@ -2663,7 +2664,8 @@ def _prewarm_browser():
             _sess.head(f"{u.scheme}://{u.netloc}/", timeout=6)
         print("[br] prewarm xong", flush=True)
     except Exception as e:
-        print(f"[br] prewarm loi: {str(e)[:80]}", flush=True)
+        _cause = repr(getattr(e, "__cause__", None) or getattr(e, "__context__", None) or "")
+        print(f"[br] prewarm loi: {type(e).__name__}: {str(e)[:200]} | goc: {_cause[:300]}", flush=True)
 
 
 def _warmup_once():
