@@ -25,7 +25,7 @@ import logging
 import builtins
 
 LOG_VERBOSE = os.environ.get("LOG_VERBOSE", "0") == "1"
-_LOG_KEEP = ("[dl-slow]", "loi", "error", "canh bao", "khong tim thay", "[proof]", "blocked", "traceback", "exception")
+_LOG_KEEP = ("[pot]", "[dl-slow]", "loi", "error", "canh bao", "khong tim thay", "[proof]", "blocked", "traceback", "exception")
 _real_print = builtins.print
 
 
@@ -816,7 +816,7 @@ YT_DIRECT_TIMEOUT = float(os.environ.get("YT_DIRECT_TIMEOUT", "8"))
 YT_DIRECT_MAX_FAILS = int(os.environ.get("YT_DIRECT_MAX_FAILS", "3"))
 YT_DIRECT_COOLDOWN = float(os.environ.get("YT_DIRECT_COOLDOWN", "600"))
 YT_AUDIO_MAX_BPS = int(os.environ.get("YT_AUDIO_MAX_BPS", "72000"))
-_direct_vids = _RecentFails(120.0)
+_direct_vids = _RecentFails(float(os.environ.get("YT_DIRECT_FAIL_WINDOW", "900")))
 _direct_off_until = 0.0
 
 
@@ -3632,14 +3632,60 @@ def _keepalive_loop():
         time.sleep(gap)
 
 
-if __name__ == "__main__":
+def _pot_selfcheck():
+    home = os.environ.get("HOME") or os.path.expanduser("~")
+    server = os.path.join(home, "bgutil-ytdlp-pot-provider", "server")
+    script = os.path.join(server, "src", "generate_once.ts")
+    try:
+        from importlib.metadata import version as _v
+        print(f"[pot] plugin pip: bgutil-ytdlp-pot-provider {_v('bgutil-ytdlp-pot-provider')}", flush=True)
+    except Exception as e:
+        print(f"[pot] LOI: plugin pip KHONG co ({e})", flush=True)
+        return
+    if not os.path.isfile(script):
+        print(f"[pot] LOI: khong thay script server: {script}", flush=True)
+        return
+    nm = os.path.join(server, "node_modules")
+    cache = os.path.join(home, ".cache", "bgutil-ytdlp-pot-provider")
+    cmd = ["deno", "run", "--allow-env", "--allow-net", f"--allow-ffi={nm}",
+           f"--allow-write={cache}", f"--allow-read={cache},{nm}", script, "--version"]
+    try:
+        env = dict(os.environ, DENO_NO_PROMPT="1", DENO_NO_UPDATE_CHECK="1", FORCE_COLOR="false")
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=90, env=env, stdin=subprocess.DEVNULL)
+        out = (r.stdout or "").strip()[:120]
+        err = (r.stderr or "").strip()[-300:]
+        if r.returncode == 0:
+            print(f"[pot] script-deno CHAY DUOC, version={out}", flush=True)
+        else:
+            print(f"[pot] LOI: script-deno that bai rc={r.returncode} stdout={out} stderr={err}", flush=True)
+    except Exception as e:
+        print(f"[pot] LOI: khong chay duoc deno: {type(e).__name__}: {str(e)[:200]}", flush=True)
+
+
+_bg_started = False
+_bg_lock = threading.Lock()
+
+
+def _start_background_tasks():
+    global _bg_started
+    with _bg_lock:
+        if _bg_started:
+            return
+        _bg_started = True
     if os.environ.get("KEEPALIVE", "") == "1":
         threading.Thread(target=_keepalive_loop, daemon=True).start()
-    if ROLE != "video":
+    if ROLE != "video" and os.environ.get("BR_PREWARM", "1" if __name__ == "__main__" else "0") == "1":
         threading.Thread(target=_prewarm_browser, daemon=True).start()
     if os.environ.get("YT_WARMUP", "1") == "1" and ROLE != "browser":
         threading.Thread(target=_warmup_once, daemon=True).start()
+    threading.Thread(target=_pot_selfcheck, daemon=True).start()
     print(f"[update] yt-dlp hien tai: {_ytdlp_version()} | auto_update={AUTO_UPDATE} moi {UPDATE_HOURS}h", flush=True)
     if AUTO_UPDATE and ROLE != "browser":
         threading.Thread(target=_update_loop, daemon=True).start()
+
+
+if __name__ == "__main__":
+    _start_background_tasks()
     app.run(host="0.0.0.0", port=PORT, threaded=True, request_handler=HTTP10RequestHandler)
+elif os.environ.get("BG_ON_IMPORT", "1") == "1":
+    _start_background_tasks()
