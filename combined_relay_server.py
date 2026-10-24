@@ -168,6 +168,9 @@ def _role_gate():
         if KILL_ON_LEAVE and p.startswith("/search"):
             _kill_stream(_who())
         _cr_release_for_stream()
+    elif p.startswith("/tt"):
+        _br_last_activity = 0.0
+        _cr_release_for_stream()
     return None
 
 
@@ -4101,8 +4104,19 @@ _tt_inflight = {}
 _tt_comments = {}
 _tt_thumbs = {}
 _tt_lock = threading.Lock()
-_tt_gate = threading.BoundedSemaphore(2)
+_TT_LOW = bool((_mi0 := _mem_info()) and _mi0[1] < 1024)
+TT_PAR = max(1, _env_int("TT_YDL_PAR", 1 if _TT_LOW else 2))
+TT_FEED_BUDGET = float(os.environ.get("TT_FEED_BUDGET", "12"))
+TT_MEM_STOP = float(os.environ.get("TT_MEM_STOP", "0.85"))
+TT_COMMENTS = os.environ.get("TT_COMMENTS", "0" if _TT_LOW else "1") == "1"
+_tt_gate = threading.BoundedSemaphore(TT_PAR)
+_tt_img_gate = threading.BoundedSemaphore(2)
 _tt_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="tt")
+
+
+def _tt_yield():
+    """Nhuong CPU/RAM cho luong video dang phat va khi RAM sat tran (Render free: 512MB, CPU rat yeu)."""
+    return _active_streams > 0 or _mem_frac() > TT_MEM_STOP
 
 
 def _tt_n(v):
@@ -4165,6 +4179,10 @@ def _tt_store(key, item, ttl_left=None):
 
 
 def _tt_fetch_meta(url, key):
+    if _tt_yield():
+        item = _tt_stub(url)
+        _tt_store(key, item, ttl_left=15)
+        return item
     try:
         with _tt_gate:
             with yt_dlp.YoutubeDL(_tt_ydl()) as ydl:
@@ -4209,6 +4227,8 @@ def _tt_expand(src):
         hit = _tt_pages.get(src)
     if hit and now - hit[0] < TT_PAGE_TTL:
         return hit[1]
+    if _tt_yield():
+        return hit[1] if hit else []
     urls = []
     try:
         with _tt_gate:
@@ -4234,10 +4254,12 @@ def _tt_explore():
     with _tt_lock:
         if now - _tt_explore_cache[0] < TT_EXPLORE_TTL:
             return list(_tt_explore_cache[1])
+    if _tt_yield():
+        return []
     found, dup = [], set()
     for page in _TT_EXPLORE_PAGES:
         try:
-            _, _, _, raw = _http(page, limit=1500000, timeout=6)
+            _, _, _, raw = _http(page, limit=600000, timeout=5)
         except Exception as e:
             _tt_last_err[0] = "explore: " + str(e)[:100]
             print(f"[tt] loi explore {page}: {str(e)[:100]}", flush=True)
@@ -4247,6 +4269,7 @@ def _tt_explore():
             if m.group(2) not in dup:
                 dup.add(m.group(2))
                 found.append(f"https://www.tiktok.com/@{m.group(1)}/video/{m.group(2)}")
+        del raw, txt
     with _tt_lock:
         _tt_explore_cache[0] = now if found else now - TT_EXPLORE_TTL + 60
         _tt_explore_cache[1] = found
@@ -4294,7 +4317,8 @@ def tt_feed():
     tw = _tt_arg("tw", 54, 16, 320)
     th = _tt_arg("th", 96, 16, 320)
     seen = {x for x in request.args.get("seen", "").split(",") if x}
-    extra = []
+    t_end = time.monotonic() + TT_FEED_BUDGET
+    extra, ex_f = [], None
     user = request.args.get("user", "").strip().lstrip("@")
     if user:
         if not _TT_NAME.match(user):
@@ -4303,12 +4327,20 @@ def tt_feed():
     else:
         sources = load_playlist()
         if not sources:
-            extra = _tt_explore()
+            ex_f = _tt_pool.submit(_tt_explore)
             sources = _tt_auto_sources()
         random.shuffle(sources)
-    sources = [x for x in sources if _TT_HOST.match(x) or "tiktok" in x][:4] or sources[:4]
+    sources = [x for x in sources if _TT_HOST.match(x) or "tiktok" in x][:TT_PAR + 2] or sources[:TT_PAR + 2]
+    if _tt_yield():
+        sources = []
     exps = [_tt_pool.submit(_tt_expand, x) for x in sources]
-    concurrent.futures.wait(exps, timeout=TT_FEED_WAIT + 3)
+    concurrent.futures.wait(exps + ([ex_f] if ex_f else []),
+                            timeout=max(1.0, min(TT_FEED_WAIT + 3, t_end - time.monotonic() - 3)))
+    if ex_f is not None and ex_f.done():
+        try:
+            extra = list(ex_f.result(timeout=0))
+        except Exception:
+            extra = []
     cands, dup = [], set()
     random.shuffle(extra)
     for f in [None] + exps:
@@ -4342,7 +4374,7 @@ def tt_feed():
     cands = cands[:n]
     print(f"[tt] feed: nguon={len(sources)} explore={len(extra)} ung_vien={n_cands} tra_ve={len(cands)}", flush=True)
     futs = [_tt_meta_future(u) for u in cands]
-    concurrent.futures.wait(futs, timeout=TT_FEED_WAIT)
+    concurrent.futures.wait(futs, timeout=max(0.5, min(TT_FEED_WAIT, t_end - time.monotonic())))
     items = []
     for u, f in zip(cands, futs):
         try:
@@ -4381,15 +4413,17 @@ def tt_thumb():
         jpg = _tt_thumbs.get(ck)
     if jpg is None:
         try:
-            item = _tt_meta_future(url).result(timeout=25)
+            item = _tt_meta_future(url).result(timeout=12)
             src = item.get("thumb_src")
             if not src:
                 return Response("khong co anh bia", 404)
-            _, _, _, raw = _http(src, limit=800000, timeout=6)
-            im = _decode_image(raw)
-            if im is None:
-                return Response("khong doc duoc anh", 502)
-            im = _tt_cover(im, w, h)
+            with _tt_img_gate:
+                _, _, _, raw = _http(src, limit=800000, timeout=6)
+                im = _decode_image(raw)
+                del raw
+                if im is None:
+                    return Response("khong doc duoc anh", 502)
+                im = _tt_cover(im, w, h)
         except Exception as e:
             print(f"[tt] loi anh bia: {str(e)[:100]}", flush=True)
             return Response("loi anh bia", 502)
@@ -4417,6 +4451,8 @@ def tt_comments():
     key = _tt_key(url)
     with _tt_lock:
         hit = _tt_comments.get(key)
+    if not hit and (not TT_COMMENTS or _tt_yield()):
+        return jsonify({"items": [], "supported": False})
     if hit and time.monotonic() - hit[0] < 1800:
         return jsonify({"items": hit[1][:n], "supported": hit[2]})
     items, supported = [], True
