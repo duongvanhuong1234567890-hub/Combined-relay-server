@@ -268,7 +268,10 @@ else:
     print(f"[cookies] KHONG TIM THAY {COOKIES_FILE} - Secret File chua duoc tao dung, hoac sai ten file")
 
 
-PLAYLIST_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tiktok_links.txt")
+_SECRET_PLAYLIST = "/etc/secrets/tiktok_links.txt"
+PLAYLIST_FILE = (os.environ.get("TIKTOK_LINKS_FILE")
+                 or (_SECRET_PLAYLIST if os.path.exists(_SECRET_PLAYLIST)
+                     else os.path.join(os.path.dirname(os.path.abspath(__file__)), "tiktok_links.txt")))
 
 
 class HTTP10RequestHandler(WSGIRequestHandler):
@@ -1679,11 +1682,23 @@ def warm_results(results):
 
 
 def load_playlist():
-    if not os.path.exists(PLAYLIST_FILE):
-        return []
-    with open(PLAYLIST_FILE, "r", encoding="utf-8") as f:
-        lines = [ln.strip() for ln in f]
-    return [ln for ln in lines if ln and not ln.startswith("#")]
+    lines = []
+    if os.path.exists(PLAYLIST_FILE):
+        with open(PLAYLIST_FILE, "r", encoding="utf-8") as f:
+            lines += [ln.strip() for ln in f]
+    env = os.environ.get("TIKTOK_LINKS", "")
+    if env:
+        lines += [x.strip() for x in re.split(r"[\s,]+", env)]
+    out, seen = [], set()
+    for ln in lines:
+        if ln and not ln.startswith("#") and ln not in seen:
+            seen.add(ln)
+            out.append(ln)
+    return out
+
+
+print(f"[tiktok] playlist: {PLAYLIST_FILE} ({'co' if os.path.exists(PLAYLIST_FILE) else 'KHONG TIM THAY'}), "
+      f"env TIKTOK_LINKS: {'co' if os.environ.get('TIKTOK_LINKS') else 'khong'}, tong {len(load_playlist())} link")
 
 
 @app.route("/random")
@@ -4067,7 +4082,8 @@ TT_PAGE_MAX = int(os.environ.get("TT_PAGE_MAX", "20"))
 TT_MAX_META = int(os.environ.get("TT_MAX_META", "400"))
 _TT_ID = re.compile(r"/video/(\d{6,25})")
 _TT_HOST = re.compile(r"^https?://([a-z0-9-]+\.)*tiktok\.com(/|$)", re.I)
-_TT_USER_PAGE = re.compile(r"^https?://([a-z0-9-]+\.)*tiktok\.com/@[^/?#]+/?(\?.*)?$", re.I)
+_TT_USER_PAGE = re.compile(r"^https?://([a-z0-9-]+\.)*tiktok\.com/(@[^/?#]+|tag/[^/?#]+)/?(\?.*)?$", re.I)
+TT_AUTO_TAGS = [x.strip().lstrip("#") for x in os.environ.get("TT_AUTO_TAGS", "fyp,viral,xuhuong,trending").split(",") if x.strip()]
 _TT_NAME = re.compile(r"^[A-Za-z0-9._]{1,40}$")
 _tt_meta = {}
 _tt_pages = {}
@@ -4238,8 +4254,11 @@ def tt_feed():
         sources = [f"https://www.tiktok.com/@{user}"]
     else:
         sources = load_playlist()
+        if not sources and TT_AUTO_TAGS:
+            tags = random.sample(TT_AUTO_TAGS, min(2, len(TT_AUTO_TAGS)))
+            sources = [f"https://www.tiktok.com/tag/{urllib.parse.quote(t)}" for t in tags]
         if not sources:
-            return jsonify({"error": f"chua co file {os.path.basename(PLAYLIST_FILE)} (moi dong 1 link TikTok hoac trang @nguoidung)"}), 404
+            return jsonify({"error": "chua co link TikTok: tao Secret File tiktok_links.txt (moi dong 1 link video hoac trang @nguoidung) hoac dat bien moi truong TIKTOK_LINKS"}), 404
         random.shuffle(sources)
     sources = [x for x in sources if _TT_HOST.match(x) or "tiktok" in x][:4] or sources[:4]
     exps = [_tt_pool.submit(_tt_expand, x) for x in sources]
