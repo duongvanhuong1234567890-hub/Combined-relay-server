@@ -25,7 +25,7 @@ import logging
 import builtins
 
 LOG_VERBOSE = os.environ.get("LOG_VERBOSE", "0") == "1"
-_LOG_KEEP = ("[pot]", "[dl-slow]", "loi", "error", "canh bao", "khong tim thay", "[proof]", "blocked", "traceback", "exception")
+_LOG_KEEP = ("[tt]", "[pot]", "[dl-slow]", "loi", "error", "canh bao", "khong tim thay", "[proof]", "blocked", "traceback", "exception")
 _real_print = builtins.print
 
 
@@ -4092,7 +4092,9 @@ _TT_DEFAULT_USERS = ["khaby.lame", "mrbeast", "zachking", "gordonramsayofficial"
 TT_EXPLORE_TTL = float(os.environ.get("TT_EXPLORE_TTL", "600"))
 _TT_EXPLORE_PAGES = ("https://www.tiktok.com/explore", "https://www.tiktok.com/foryou")
 _TT_VIDEO_LINK = re.compile(r"/@([\w.\-]{1,40})/video/(\d{6,25})")
-_tt_explore_cache = [0.0, []]
+_tt_explore_cache = [float("-inf"), []]
+_tt_last_err = [""]
+_tt_keep = []
 _tt_meta = {}
 _tt_pages = {}
 _tt_inflight = {}
@@ -4175,6 +4177,7 @@ def _tt_fetch_meta(url, key):
         _tt_store(key, item)
         return item
     except Exception as e:
+        _tt_last_err[0] = "meta: " + str(e)[:100]
         print(f"[tt] loi meta {key}: {str(e)[:120]}", flush=True)
         item = _tt_stub(url)
         _tt_store(key, item, ttl_left=120)
@@ -4216,6 +4219,7 @@ def _tt_expand(src):
             if _TT_HOST.match(u) and _TT_ID.search(u):
                 urls.append(u)
     except Exception as e:
+        _tt_last_err[0] = "trang: " + str(e)[:100]
         print(f"[tt] loi trang nguoi dung {src}: {str(e)[:120]}", flush=True)
     with _tt_lock:
         _tt_pages[src] = (now if urls else now - TT_PAGE_TTL + 60, urls)
@@ -4235,6 +4239,7 @@ def _tt_explore():
         try:
             _, _, _, raw = _http(page, limit=1500000, timeout=6)
         except Exception as e:
+            _tt_last_err[0] = "explore: " + str(e)[:100]
             print(f"[tt] loi explore {page}: {str(e)[:100]}", flush=True)
             continue
         txt = raw.decode("utf-8", "replace").replace("\\u002F", "/").replace("\\/", "/")
@@ -4323,7 +4328,19 @@ def tt_feed():
             dup.add(k)
             cands.append(u)
     random.shuffle(cands)
+    n_cands = len(cands)
+    with _tt_lock:
+        if cands:
+            for u in cands:
+                if u not in _tt_keep:
+                    _tt_keep.append(u)
+            del _tt_keep[:-200]
+        elif _tt_keep:
+            pool = [u for u in _tt_keep if _tt_key(u) not in seen] or list(_tt_keep)
+            random.shuffle(pool)
+            cands = pool[:n]
     cands = cands[:n]
+    print(f"[tt] feed: nguon={len(sources)} explore={len(extra)} ung_vien={n_cands} tra_ve={len(cands)}", flush=True)
     futs = [_tt_meta_future(u) for u in cands]
     concurrent.futures.wait(futs, timeout=TT_FEED_WAIT)
     items = []
@@ -4333,7 +4350,13 @@ def tt_feed():
         except Exception:
             it = _tt_stub(u)
         items.append(_tt_public(it, w, h, fps, tw, th))
-    return jsonify({"items": items})
+    out = {"items": items}
+    if not items:
+        out["reason"] = _tt_last_err[0] or "khong lay duoc video nao (TikTok chan hoac nguon rong)"
+    if request.args.get("debug"):
+        out["debug"] = {"sources": sources, "explore": len(extra), "candidates": n_cands,
+                        "ready": sum(1 for x in items if x["ready"]), "yt_dlp": _ytdlp_version()}
+    return jsonify(out)
 
 
 def _tt_cover(im, w, h):
