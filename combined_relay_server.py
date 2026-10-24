@@ -4085,6 +4085,14 @@ _TT_HOST = re.compile(r"^https?://([a-z0-9-]+\.)*tiktok\.com(/|$)", re.I)
 _TT_USER_PAGE = re.compile(r"^https?://([a-z0-9-]+\.)*tiktok\.com/(@[^/?#]+|tag/[^/?#]+)/?(\?.*)?$", re.I)
 TT_AUTO_TAGS = [x.strip().lstrip("#") for x in os.environ.get("TT_AUTO_TAGS", "fyp,viral,xuhuong,trending").split(",") if x.strip()]
 _TT_NAME = re.compile(r"^[A-Za-z0-9._]{1,40}$")
+TT_AUTO_USERS = [x.strip().lstrip("@") for x in os.environ.get("TT_AUTO_USERS", "").split(",") if x.strip()]
+# Nhom tai khoan cong khai co san (dung khi khong co playlist) - co the ghi de bang bien TT_AUTO_USERS
+_TT_DEFAULT_USERS = ["khaby.lame", "mrbeast", "zachking", "gordonramsayofficial", "nasa", "willsmith",
+                     "charlidamelio", "bellapoarch", "therock", "spencerx", "tiktok", "chefreactions"]
+TT_EXPLORE_TTL = float(os.environ.get("TT_EXPLORE_TTL", "600"))
+_TT_EXPLORE_PAGES = ("https://www.tiktok.com/explore", "https://www.tiktok.com/foryou")
+_TT_VIDEO_LINK = re.compile(r"/@([\w.\-]{1,40})/video/(\d{6,25})")
+_tt_explore_cache = [0.0, []]
 _tt_meta = {}
 _tt_pages = {}
 _tt_inflight = {}
@@ -4216,6 +4224,40 @@ def _tt_expand(src):
     return urls
 
 
+def _tt_explore():
+    """Thu lay link video de xuat truc tiep tu trang explore/foryou cong khai cua TikTok (khong can dang nhap)."""
+    now = time.monotonic()
+    with _tt_lock:
+        if now - _tt_explore_cache[0] < TT_EXPLORE_TTL:
+            return list(_tt_explore_cache[1])
+    found, dup = [], set()
+    for page in _TT_EXPLORE_PAGES:
+        try:
+            _, _, _, raw = _http(page, limit=1500000, timeout=6)
+        except Exception as e:
+            print(f"[tt] loi explore {page}: {str(e)[:100]}", flush=True)
+            continue
+        txt = raw.decode("utf-8", "replace").replace("\\u002F", "/").replace("\\/", "/")
+        for m in _TT_VIDEO_LINK.finditer(txt):
+            if m.group(2) not in dup:
+                dup.add(m.group(2))
+                found.append(f"https://www.tiktok.com/@{m.group(1)}/video/{m.group(2)}")
+    with _tt_lock:
+        _tt_explore_cache[0] = now if found else now - TT_EXPLORE_TTL + 60
+        _tt_explore_cache[1] = found
+    print(f"[tt] explore: {len(found)} video", flush=True)
+    return list(found)
+
+
+def _tt_auto_sources():
+    """Tu de xuat khi khong co playlist: trang tai khoan ngau nhien + 1 trang tag."""
+    pool = TT_AUTO_USERS or _TT_DEFAULT_USERS
+    src = [f"https://www.tiktok.com/@{u}" for u in random.sample(pool, min(3, len(pool)))]
+    if TT_AUTO_TAGS:
+        src.append(f"https://www.tiktok.com/tag/{urllib.parse.quote(random.choice(TT_AUTO_TAGS))}")
+    return src
+
+
 def _tt_arg(name, default, lo, hi):
     try:
         return max(lo, min(hi, int(request.args.get(name, default))))
@@ -4247,6 +4289,7 @@ def tt_feed():
     tw = _tt_arg("tw", 54, 16, 320)
     th = _tt_arg("th", 96, 16, 320)
     seen = {x for x in request.args.get("seen", "").split(",") if x}
+    extra = []
     user = request.args.get("user", "").strip().lstrip("@")
     if user:
         if not _TT_NAME.match(user):
@@ -4254,23 +4297,25 @@ def tt_feed():
         sources = [f"https://www.tiktok.com/@{user}"]
     else:
         sources = load_playlist()
-        if not sources and TT_AUTO_TAGS:
-            tags = random.sample(TT_AUTO_TAGS, min(2, len(TT_AUTO_TAGS)))
-            sources = [f"https://www.tiktok.com/tag/{urllib.parse.quote(t)}" for t in tags]
         if not sources:
-            return jsonify({"error": "chua co link TikTok: tao Secret File tiktok_links.txt (moi dong 1 link video hoac trang @nguoidung) hoac dat bien moi truong TIKTOK_LINKS"}), 404
+            extra = _tt_explore()
+            sources = _tt_auto_sources()
         random.shuffle(sources)
     sources = [x for x in sources if _TT_HOST.match(x) or "tiktok" in x][:4] or sources[:4]
     exps = [_tt_pool.submit(_tt_expand, x) for x in sources]
     concurrent.futures.wait(exps, timeout=TT_FEED_WAIT + 3)
     cands, dup = [], set()
-    for f in exps:
-        try:
-            urls = f.result(timeout=0) if f.done() else []
-        except Exception:
-            urls = []
-        urls = list(urls)
-        random.shuffle(urls)
+    random.shuffle(extra)
+    for f in [None] + exps:
+        if f is None:
+            urls = list(extra)
+        else:
+            try:
+                urls = f.result(timeout=0) if f.done() else []
+            except Exception:
+                urls = []
+            urls = list(urls)
+            random.shuffle(urls)
         for u in urls:
             k = _tt_key(u)
             if k in seen or k in dup or not _url_is_public(u):
