@@ -1,0 +1,24 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "pip_requirements": {
+    "fileMatch": ["(^|/)requirements\\.txt$"]
+  },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "fileMatch": ["(^|/)Dockerfile$"],
+      "matchStrings": ["ARG BGUTIL_TAG=(?<currentValue>[0-9][^\\s]*)"],
+      "depNameTemplate": "Brainicism/bgutil-ytdlp-pot-provider",
+      "datasourceTemplate": "github-tags"
+    }
+  ],
+  "packageRules": [
+    {
+      "matchPackageNames": ["bgutil-ytdlp-pot-provider", "Brainicism/bgutil-ytdlp-pot-provider"],
+      "groupName": "bgutil (plugin + server, must move together)",
+      "automerge": false,
+      "labels": ["bgutil"]
+    }
+  ]
+}

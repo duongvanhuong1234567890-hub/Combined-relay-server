@@ -1,6 +1,6 @@
 flask>=3.0
+gunicorn>=22.0
 yt-dlp[default]
-pillow>=10.0
-requests>=2.31
-playwright>=1.49
-bgutil-ytdlp-pot-provider
+bgutil-ytdlp-pot-provider==2.0.2
+playwright>=1.45
+Pillow>=10.0

@@ -21,30 +21,44 @@ from flask import Flask, request, Response, jsonify
 from werkzeug.exceptions import HTTPException
 from werkzeug.serving import WSGIRequestHandler
 
-# glibc tao nhieu "arena" bo nho (mot cai cho moi luong) -> RSS phinh len va khong tra ve. Do voi 4 luong giai ma anh:
-# dinh RSS ~86MB -> ~52MB, sau khi giai phong ~45MB -> ~29MB khi gioi han con 2 arena. (malloc_trim thi KHONG co tac dung - da do.)
+import logging
+import builtins
+
+LOG_VERBOSE = os.environ.get("LOG_VERBOSE", "0") == "1"
+_LOG_KEEP = ("[dl-slow]", "loi", "error", "canh bao", "khong tim thay", "[proof]", "blocked", "traceback", "exception")
+_real_print = builtins.print
+
+
+def print(*args, **kwargs):
+    if not LOG_VERBOSE:
+        txt = " ".join(str(a) for a in args).lower()
+        if not any(k in txt for k in _LOG_KEEP):
+            return
+    _real_print(*args, **kwargs)
+
+
+if not LOG_VERBOSE:
+    logging.getLogger("werkzeug").setLevel(logging.ERROR)
+
 if not os.environ.get("MALLOC_ARENA_MAX"):
     try:
         import ctypes
-        ctypes.CDLL("libc.so.6").mallopt(-8, 2)   # M_ARENA_MAX = -8
+        ctypes.CDLL("libc.so.6").mallopt(-8, 2)
     except Exception:
         pass
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 1_000_000  # chan POST /cookies (va moi body) khong lo
+app.config["MAX_CONTENT_LENGTH"] = 1_000_000
 
 
 @app.errorhandler(Exception)
 def _on_error(e):
-    """Loi khong luong truoc -> ghi log day du, tra 500 ngan gon (truoc day Flask tra trang HTML dai cho firmware)."""
     if isinstance(e, HTTPException):
         return e
     print("[error]", traceback.format_exc(), flush=True)
     return "loi may chu", 500
 
 
-# ---- Chan SSRF: server la may chu trung gian, khong duoc phep bi lay lam cong truy cap mang noi bo ----
-# ALLOW_PRIVATE_HOSTS=1 de tat (vd test voi may trong LAN).
 ALLOW_PRIVATE_HOSTS = os.environ.get("ALLOW_PRIVATE_HOSTS", "") == "1"
 _SAFE_HOST_SUFFIX = (".googlevideo.com", ".youtube.com", ".ytimg.com", ".googleusercontent.com")
 _host_cache = {}
@@ -52,7 +66,6 @@ _host_lock = threading.Lock()
 
 
 def _host_public(host):
-    """True neu moi dia chi IP cua host deu la dia chi cong cong (khong loopback/private/link-local/CGNAT...)."""
     host = (host or "").strip("[]").lower().rstrip(".")
     if not host:
         return False
@@ -78,7 +91,7 @@ def _host_public(host):
     with _host_lock:
         if len(_host_cache) > 500:
             _host_cache.clear()
-        _host_cache[host] = (now + (300 if ok else 10), ok)  # loi DNS chi nho 10s de khong "an" nham lau
+        _host_cache[host] = (now + (300 if ok else 10), ok)
     return ok
 
 
@@ -91,7 +104,6 @@ def _url_is_public(url):
 
 
 def _clip_pct(s, n):
-    """Cat chuoi da percent-encode toi da n ky tu ma khong cat dut giua mot ma %XX."""
     s = s[:n]
     i = s.rfind("%")
     return s[:i] if i != -1 and i > len(s) - 3 else s
@@ -101,7 +113,6 @@ RELAY_URL = os.environ.get("RELAY_URL") or os.environ.get("RENDER_EXTERNAL_URL")
 ROLE = os.environ.get("ROLE", "all").strip().lower()
 ROLE = {"youtube": "video", "yt": "video", "google": "browser", "gg": "browser"}.get(ROLE, ROLE)
 
-# yt-dlp nap ~hang nghin lop extractor (ton RAM + CPU luc khoi dong). ROLE=browser khong bao gio dung -> chi nap khi can.
 if ROLE == "browser":
     class _LazyYT:
         def __getattr__(self, name):
@@ -111,17 +122,26 @@ if ROLE == "browser":
     yt_dlp = _LazyYT()
 else:
     import yt_dlp
-# Tuy chon: dat STREAM_TOKEN de /stream /search /random chi nhan request co &tk=STREAM_TOKEN (chong ke la xai ke quota/CPU).
-# De trong = mo nhu cu (khong lam hong firmware hien tai).
 STREAM_TOKEN = os.environ.get("STREAM_TOKEN", "").strip()
 
 
 def _tok_ok(given, expected):
-    """So sanh token an toan, khong no 500 khi chuoi co ky tu khong phai ASCII."""
     try:
         return bool(expected) and hmac.compare_digest((given or "").encode("utf-8"), expected.encode("utf-8"))
     except Exception:
         return False
+
+
+RELAY_PURPOSE = "chi tai ve va giai ma (ffmpeg -> MJPEG/AVI) cho thiet bi LilyGo T-Display S3 cua chu server"
+_stat = {"since": time.time(), "streams": 0, "last": 0.0}
+_stat_lock = threading.Lock()
+
+
+@app.after_request
+def _purpose_headers(resp):
+    resp.headers["X-Relay-Purpose"] = "transcode-only-for-LilyGo-T-Display-S3"
+    resp.headers["X-Relay-Media-Storage"] = "none"
+    return resp
 
 
 _last_req = time.monotonic()
@@ -132,23 +152,22 @@ KILL_ON_LEAVE = os.environ.get("KILL_ON_LEAVE", "1") == "1"
 def _role_gate():
     global _br_last_activity, _last_req
     p = request.path
-    if p not in ("/", "/healthz"):
+    if p not in ("/", "/healthz", "/about") and not p.startswith("/_src/"):
         _last_req = time.monotonic()
     if ROLE == "video" and p.startswith("/br"):
         return "disabled on this server (ROLE=video)", 404
     if ROLE == "browser" and p.startswith(("/stream", "/search", "/random")):
         return "disabled on this server (ROLE=browser)", 404
-    # /diag va /myip lo thong tin noi bo + chay yt-dlp: BAT BUOC co token (truoc day de trong BR_TOKEN la mo toang)
     if p in ("/diag", "/myip") and not _tok_ok(request.args.get("k", ""), BR_TOKEN):
         return "forbidden - can dat BR_TOKEN tren server va them ?k=BR_TOKEN vao URL", 403
     if STREAM_TOKEN and p.startswith(("/stream", "/search", "/random", "/tr")) \
             and not _tok_ok(request.args.get("tk", ""), STREAM_TOKEN):
         return "forbidden - them &tk=STREAM_TOKEN vao URL", 403
     if p.startswith(("/stream", "/search", "/random")):
-        _br_last_activity = 0.0  # da chuyen sang YouTube -> browser khong con \"ban\" (cho phep lam nong ngay)
+        _br_last_activity = 0.0
         if KILL_ON_LEAVE and p.startswith("/search"):
-            _kill_stream(_who())  # tim kiem moi = da roi video cu, nha CPU/RAM cua ffmpeg dang treo
-        _cr_close_async()       # sang YouTube: tra RAM cua Chromium cho ffmpeg/yt-dlp
+            _kill_stream(_who())
+        _cr_close_async()
     return None
 
 
@@ -163,8 +182,6 @@ PORT = int(os.environ.get("PORT", "8000"))
 
 @app.route("/cookies", methods=["GET", "POST"])
 def cookies_update():
-    """Thay cookies.txt ngay khong can deploy lai. POST noi dung cookies (Netscape) len /cookies?k=BR_TOKEN.
-    Vi du: curl -X POST --data-binary @cookies.txt "https://server/cookies?k=TOKEN". GET xem trang thai."""
     global COOKIES_FILE, _yt_block_until, _yt_preferred, _nocookie_fails, _nocookie_skip_until
     if not _tok_ok(request.args.get("k", ""), BR_TOKEN):
         return "forbidden - them ?k=BR_TOKEN vao URL", 403
@@ -179,8 +196,6 @@ def cookies_update():
         return "noi dung khong giong cookies.txt (Netscape) cua youtube.com", 400
     target = COOKIES_FILE if COOKIES_FILE.startswith("/tmp/") or not os.path.exists(_SECRET_COOKIES) else "/tmp/cookies.txt"
     tmp = target + ".new"
-    # yt-dlp ghi nguoc cookie jar vao file khi dong -> neu thay file giua luc dang chay, ban cu se de len ban moi.
-    # Giu _resolve_gate (moi lan chay yt-dlp deu nam trong gate) de viec thay file khong bi chen ngang.
     if not _resolve_gate.acquire(timeout=30):
         return "server dang ban (yt-dlp dang chay), thu lai sau it giay", 503
     try:
@@ -188,7 +203,6 @@ def cookies_update():
             fh.write(txt if txt.endswith("\n") else txt + "\n")
         os.replace(tmp, target)
         COOKIES_FILE = target
-        # cookies moi -> xoa trang thai "dang bi chan"/"tam bo cach khong cookies" cu de thu lai ngay
         _yt_block_until = 0.0
         _yt_preferred = None
         _nocookie_fails = 0
@@ -200,6 +214,31 @@ def cookies_update():
     finally:
         _resolve_gate.release()
     return f"da cap nhat cookies: {len(txt)} bytes", 200
+
+
+@app.route("/about")
+def about():
+    up = int(time.time() - _stat["since"])
+    last = int(time.time() - _stat["last"]) if _stat["last"] else None
+    body = {
+        "purpose": RELAY_PURPOSE,
+        "what_it_does": [
+            "nhan link/ID video do thiet bi LilyGo gui len",
+            "tai luong video tam thoi bang yt-dlp/ffmpeg",
+            "giai ma va ha kich thuoc/chat luong (MJPEG + audio) de ESP32-S3 phat duoc",
+            "truyen thang ve thiet bi, khong luu lai",
+        ],
+        "what_it_does_not": [
+            "khong luu video/audio ra o dia (ffmpeg pipe truc tiep, bo dem trong RAM, Cache-Control: no-store); chi cookies.txt cua chu server nam tren dia",
+            "khong dang lai, khong chia se, khong cong khai kho video nao",
+            "khong co tai khoan nguoi dung / khong thu thap du lieu ca nhan",
+        ],
+        "access_control": "can token" if STREAM_TOKEN else "khong dat STREAM_TOKEN",
+        "uptime_s": up,
+        "streams_since_start": _stat["streams"],
+        "last_stream_s_ago": last,
+    }
+    return jsonify(body), 200
 
 
 @app.route("/healthz")
@@ -252,21 +291,16 @@ YT_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
 
 
 MJPEG_Q = os.environ.get("MJPEG_Q", "6")
-FFMPEG_THREADS = os.environ.get("FFMPEG_THREADS", "1")   # do: 2 luong khong giam CPU-giay (1.17 vs 1.12s/25s video), chi them RAM va tranh gianh quota 0.1 CPU
-STREAM_FAST_DECODE = os.environ.get("STREAM_FAST_DECODE", "1") == "1"   # bo loc deblock khi giai ma: -7% CPU, PSNR 41.9dB (gan nhu khong khac)
-STREAM_SRC_AUTO = os.environ.get("STREAM_SRC_AUTO", "1") == "1"        # chi lay nguon vua du cho khung ra (240p thay vi 360p: -34% CPU)
+FFMPEG_THREADS = os.environ.get("FFMPEG_THREADS", "1")
+STREAM_FAST_DECODE = os.environ.get("STREAM_FAST_DECODE", "1") == "1"
+STREAM_SRC_AUTO = os.environ.get("STREAM_SRC_AUTO", "1") == "1"
 STREAM_NICE = int(os.environ.get("STREAM_NICE", "5"))
-# Giu nhip THOI GIAN THUC cho ffmpeg. Log cho thay 30s dau ffmpeg chay ~10x toc do that (600-850KB/s trong khi video chi can ~70-100KB/s)
-# roi dot ngot ve ~100-250KB/s (client_wait tang vot): thiet bi bi "dap" du lieu luc dau -> giat, sau khi bo dem day moi muot.
-# STREAM_READRATE: toc do doc nguon toi da so voi thoi gian that (1.15 = nhanh hon 15% de luon day buffer). 0 = tat.
-# STREAM_READ_BURST: so giay du lieu duoc doc nhanh luc dau de thiet bi co buffer khoi dau (chi dung duoc neu ffmpeg co -readrate_initial_burst).
-STREAM_READRATE = float(os.environ.get("STREAM_READRATE", "1.15"))
+STREAM_READRATE = float(os.environ.get("STREAM_READRATE", "1.4"))
 STREAM_READ_BURST = float(os.environ.get("STREAM_READ_BURST", "4"))
 _ff_caps = None
 
 
 def _ffmpeg_caps():
-    """Do mot lan xem ffmpeg tren may co -readrate / -readrate_initial_burst khong (ban cu hon thi lui ve -re)."""
     global _ff_caps
     if _ff_caps is None:
         txt = ""
@@ -277,8 +311,8 @@ def _ffmpeg_caps():
         _ff_caps = ("-readrate " in txt or "-readrate\t" in txt, "readrate_initial_burst" in txt)
         print(f"[config] ffmpeg readrate={_ff_caps[0]} initial_burst={_ff_caps[1]} (STREAM_READRATE={STREAM_READRATE})", flush=True)
     return _ff_caps
-STREAM_SKIP_NOREF = os.environ.get("STREAM_SKIP_NOREF", "1") == "1"   # fps ra thap: bo qua khung B khong tham chieu ngay luc giai ma (-15% CPU, hinh khong doi)
-STREAM_FPS_MAX = int(os.environ.get("STREAM_FPS_MAX", "12"))   # tran fps phia server (bo qua fps firmware gui len neu cao hon)
+STREAM_SKIP_NOREF = os.environ.get("STREAM_SKIP_NOREF", "1") == "1"
+STREAM_FPS_MAX = int(os.environ.get("STREAM_FPS_MAX", "12"))
 AUDIO_RATE = os.environ.get("AUDIO_RATE", "16000")
 print(f"[config] AUDIO_RATE={AUDIO_RATE} MJPEG_Q={MJPEG_Q} FFMPEG_THREADS={FFMPEG_THREADS}", flush=True)
 
@@ -311,14 +345,13 @@ def _api_get(endpoint, params):
             reason = (err.get("errors") or [{}])[0].get("reason", "")
         except Exception:
             pass
-        if reason == "rateLimitExceeded":  # nghen tuc thoi, khong phai het quota ngay -> nghi ngan thoi
+        if reason == "rateLimitExceeded":
             _api_block_until = time.monotonic() + min(60, YT_API_COOLDOWN)
         elif reason in ("quotaExceeded", "dailyLimitExceeded", "keyInvalid", "keyExpired",
                         "accessNotConfigured", "forbidden", "ipRefererBlocked"):
             _api_block_until = time.monotonic() + YT_API_COOLDOWN
         raise YTApiError(e.code, reason, msg) from None
     except (urllib.error.URLError, OSError, ValueError) as e:
-        # mang chap chon / timeout / JSON hong: truoc day KHONG nghi -> moi lan tim kiem deu cho them 10s truoc khi roi ve yt-dlp
         _api_block_until = time.monotonic() + min(30, YT_API_COOLDOWN)
         raise YTApiError(0, "network", str(e)[:100]) from None
 
@@ -344,7 +377,6 @@ def search_via_api(query, n):
     ids = [it["id"]["videoId"] for it in items if it.get("id", {}).get("videoId")]
     durations = {}
     if ids:
-        # loi o buoc lay thoi luong KHONG duoc vut bo ca danh sach da tim thanh cong (da ton 100 don vi quota)
         try:
             vids = _api_get("videos", {"part": "contentDetails", "id": ",".join(ids),
                                        "fields": "items(id,contentDetails/duration)"})
@@ -368,7 +400,6 @@ def search_via_api(query, n):
 
 @app.route("/myip")
 def myip():
-    """Xem IP dau ra cua server (truc tiep va qua YT_PROXY neu co) - mo tren trinh duyet de kiem tra nhanh."""
     def _get(proxy=""):
         try:
             handlers = [urllib.request.ProxyHandler({"http": proxy, "https": proxy})] if proxy else []
@@ -436,7 +467,6 @@ def search():
             extra = f" - nghi API {_rest:.0f}s" if _rest > 0 else ""
             print(f"[search] YouTube API loi ({e}){extra} - roi ve yt-dlp", flush=True)
 
-    # IP dang bi YouTube chan: dung goi them (se chi lam chan nang hon) - tra rong ngay cho firmware
     if time.monotonic() < _yt_block_until:
         print("[search] YouTube dang chan IP, bo qua tim kiem yt-dlp", flush=True)
         return jsonify([])
@@ -453,7 +483,6 @@ def search():
     if os.path.exists(COOKIES_FILE):
         ydl_opts["cookiefile"] = COOKIES_FILE
     results = []
-    # Khong cho vo han: truoc day moi request tim kiem xep hang cho khoa va dong thread khi resolve ket lau
     if not _resolve_gate.acquire(timeout=20):
         print("[search] yt-dlp dang ban (resolve khac), bo qua tim kiem du phong", flush=True)
         return jsonify([])
@@ -466,7 +495,7 @@ def search():
                 results.append({
                     "id": entry["id"],
                     "title": entry.get("title") or "",
-                    "channel": entry.get("channel") or entry.get("uploader") or "",  # dong bo voi nhanh API
+                    "channel": entry.get("channel") or entry.get("uploader") or "",
                     "duration": ("LIVE" if entry.get("live_status") == "is_live"
                                  else format_duration(entry.get("duration"))),
                 })
@@ -483,28 +512,12 @@ def search():
 
 
 def format_ffmpeg_headers(fmt):
-    """Chuyển dict http_headers mà yt-dlp gắn theo từng format thành chuỗi
-    header ffmpeg hiểu (mỗi dòng 'Key: Value', kết bằng \\r\\n) - dùng với
-    cờ -headers trước mỗi -i. Không có bước này, ffmpeg tải trực tiếp URL
-    CDN mà KHÔNG có User-Agent/header khớp với phiên đã resolve - nguồn
-    thường vẫn cho phép mở kết nối (200 OK) nhưng cắt giữa chừng sau vài
-    giây vì thấy request "không giống" trình phát hợp lệ."""
     headers = fmt.get("http_headers") or {}
     if not headers:
         return ""
     return "".join(f"{k}: {v}\r\n" for k, v in headers.items())
 
 
-_YT_ATTEMPTS_FULL = [
-    ("android_vr",   ["android_vr"],     False, False),
-    ("ios",          ["ios"],            False, False),
-    ("web_embedded", ["web_embedded"],   False, True),
-    ("tv",           ["tv"],             True,  True),
-    ("tv_simply",    ["tv_simply"],      False, False),
-    ("mweb",         ["mweb"],           True,  True),
-    ("mac-dinh",     None,               True,  False),
-    ("runtime+ejs",  None,               True,  True),
-]
 _YT_ATTEMPTS_LITE = [
     ("android_vr",   ["android_vr"],     False, False),
     ("tv",           ["tv"],             True,  True),
@@ -512,27 +525,35 @@ _YT_ATTEMPTS_LITE = [
     ("mweb",         ["mweb"],           True,  True),
     ("runtime+ejs",  None,               True,  True),
 ]
-_YT_ATTEMPTS = _YT_ATTEMPTS_FULL if os.environ.get("YT_ATTEMPTS_FULL", "") == "1" else _YT_ATTEMPTS_LITE
+_YT_ATTEMPTS = _YT_ATTEMPTS_LITE
 _yt_preferred = None
 YT_BLOCK_BACKOFF = float(os.environ.get("YT_BLOCK_BACKOFF", "30"))
+YT_BLOCK_MAX = float(os.environ.get("YT_BLOCK_MAX", "900"))
+YT_MIN_GAP = float(os.environ.get("YT_MIN_GAP", "2.5"))
+_block_level = 0
+_yt_last_call = 0.0
+_yt_pace_lock = threading.Lock()
+
+
+def _yt_pace():
+    global _yt_last_call
+    with _yt_pace_lock:
+        wait = _yt_last_call + YT_MIN_GAP * random.uniform(1.0, 1.6) - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        _yt_last_call = time.monotonic()
 _yt_block_until = 0.0
-# Dau hieu IP bi chan (anh huong MOI video). Bo "Sign in" tran: "Sign in to confirm your age" la loi RIENG cua 1 video
-# (gioi han tuoi) - truoc day mot video 18+ lam ca server nghi 60s voi tat ca nguoi dung.
 _BLOCK_HINTS = ("not a bot", "player response", "HTTP Error 429", "Too Many Requests", "HTTP Error 403")
 _AGE_HINTS = ("confirm your age", "age-restricted", "inappropriate for some users")
 _OUTDATED_HINTS = ("player response", "Unable to extract", "nsig", "Signature extraction")
-# "Failed to extract any player response" CHI LA loi cua 1 video khi cac video khac van phat duoc (log that: video A that bai,
-# video B ngay sau do phat tot). Truoc day 1 video loi la khoa CA SERVER 60s (moi video khac nhan 502 tuc thi = thiet bi "van" ra)
-# va bo cach khong-cookie 30 phut. Gio chi coi la IP bi chan khi nhieu video KHAC NHAU that bai lien tiep.
-_HARD_BLOCK_HINTS = ("not a bot", "HTTP Error 429", "Too Many Requests")   # YouTube noi thang la chan/gioi han -> du 2 video
+_HARD_BLOCK_HINTS = ("not a bot", "HTTP Error 429", "Too Many Requests")
 YT_BLOCK_VIDEOS_HARD = int(os.environ.get("YT_BLOCK_VIDEOS_HARD", "2"))
-YT_BLOCK_VIDEOS_SOFT = int(os.environ.get("YT_BLOCK_VIDEOS_SOFT", "3"))   # "player response" / 403: can 3 video khac nhau
+YT_BLOCK_VIDEOS_SOFT = int(os.environ.get("YT_BLOCK_VIDEOS_SOFT", "3"))
 YT_BLOCK_WINDOW = float(os.environ.get("YT_BLOCK_WINDOW", "180"))
-YT_FAIL_TTL = float(os.environ.get("YT_FAIL_TTL", "20"))   # thiet bi bam lai cung video ngay sau khi loi -> tra loi tuc thi, khong chay lai 60s
+YT_FAIL_TTL = float(os.environ.get("YT_FAIL_TTL", "20"))
 
 
 class _RecentFails:
-    """Nho cac khoa (ID video) da that bai trong `window` giay; dem so khoa KHAC NHAU."""
     def __init__(self, window):
         self.window = window
         self.d = {}
@@ -561,8 +582,8 @@ class _RecentFails:
 
 _yt_fails = _RecentFails(YT_BLOCK_WINDOW)
 
-YT_NOCOOKIE_MAX_FAILS = int(os.environ.get("YT_NOCOOKIE_MAX_FAILS", "2"))   # so video KHAC NHAU that bai khong-cookie
-YT_NOCOOKIE_COOLDOWN = float(os.environ.get("YT_NOCOOKIE_COOLDOWN", "300"))   # truoc day 1800s: android_vr (cach nhanh nhat) bi bo 30 phut
+YT_NOCOOKIE_MAX_FAILS = int(os.environ.get("YT_NOCOOKIE_MAX_FAILS", "2"))
+YT_NOCOOKIE_COOLDOWN = float(os.environ.get("YT_NOCOOKIE_COOLDOWN", "300"))
 _nocookie_fails = 0
 _nocookie_skip_until = 0.0
 _nocookie_vids = _RecentFails(YT_BLOCK_WINDOW)
@@ -576,7 +597,6 @@ _YT_HOSTS = ("youtube.com", "youtu.be", "youtube-nocookie.com")
 
 
 def _is_youtube(url):
-    """Xet theo hostname that su (truoc day 'evil.com/?r=youtube.com' cung bi coi la YouTube)."""
     try:
         host = (urllib.parse.urlparse(url or "").hostname or "").lower()
     except ValueError:
@@ -585,11 +605,9 @@ def _is_youtube(url):
 
 
 def _build_ydl_opts(fmt, client=None, use_cookies=True, runtimes=False, proxy=""):
-    _dbg = os.environ.get("YT_DEBUG", "") == "1"
     opts = {
-        "quiet": not _dbg,
-        "no_warnings": not _dbg,
-        "verbose": _dbg,
+        "quiet": True,
+        "no_warnings": True,
         "format": fmt,
         "skip_download": True,
         "geo_bypass": True,
@@ -602,8 +620,6 @@ def _build_ydl_opts(fmt, client=None, use_cookies=True, runtimes=False, proxy=""
     if client:
         yt_args["player_client"] = list(client)
     if YT_LIGHT:
-        # Ta chi can URL luong truc tiep trong streamingData: khong tai/phan tich manifest DASH (nang CPU, them request) va phu de dich.
-        # KHONG bo HLS (video phat truc tiep chi co HLS). Neu YouTube doi lam mat dinh dang thi dat YT_LIGHT=0.
         yt_args["skip"] = ["dash", "translated_subs"]
     if yt_args:
         opts["extractor_args"] = {"youtube": yt_args}
@@ -612,7 +628,6 @@ def _build_ydl_opts(fmt, client=None, use_cookies=True, runtimes=False, proxy=""
         opts.setdefault("extractor_args", {})["youtubepot-bgutilhttp"] = {"base_url": [_pot]}
     if runtimes:
         opts["js_runtimes"] = {"deno": {}, "node": {}}
-        # YT_REMOTE_EJS=0: khong tai script giai ma tu GitHub luc chay (dung ban dong goi san trong yt-dlp-ejs)
         opts["remote_components"] = ["ejs:github"] if os.environ.get("YT_REMOTE_EJS", "1") == "1" else []
     if proxy:
         opts["proxy"] = proxy
@@ -622,8 +637,6 @@ def _build_ydl_opts(fmt, client=None, use_cookies=True, runtimes=False, proxy=""
 
 
 def _extract_with(video_url, ydl_opts):
-    """Chay yt-dlp mot lan voi ydl_opts, tra ve (video_url, audio_url, video_headers, audio_headers).
-    audio_url co the None neu video do van co format gop san."""
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(video_url, download=False)
         if "entries" in info:
@@ -648,14 +661,10 @@ def _extract_with(video_url, ydl_opts):
         return info["url"], None, format_ffmpeg_headers(info), ""
 
 
-# Loi CHAC CHAN rieng cua video -> dung ngay, khong thu cach khac.
 _NO_RETRY_STRONG = ("Private video", "has been removed", "not available in your country", "This video is private",
                     "members-only", "Join this channel", "live event will begin", "Premieres in",
                     "account associated with this video has been terminated")
-# Loi MO HO: mot so client (android_vr...) bao "unavailable" cho video van xem duoc bang client khac (vd can dang nhap)
-# -> phai that bai >= 2 cach moi ket luan la hong han (truoc day 1 cach bao la bo cuoc, nho 90s).
 _NO_RETRY_WEAK = ("Video unavailable", "This video is not available")
-
 
 
 _resolve_gate = threading.Lock()
@@ -665,7 +674,6 @@ YT_NEG_TTL = float(os.environ.get("YT_NEG_TTL", "90"))
 
 
 class ResolveError(RuntimeError):
-    """permanent=True: video hong han (rieng tu/da go/chan vung...) -> khong thu lai, nho tam thoi."""
     def __init__(self, msg, permanent=False):
         super().__init__(msg)
         self.permanent = permanent
@@ -676,21 +684,17 @@ _YT_ID_RE = re.compile(
 
 
 def _canon_url(url):
-    """youtu.be/ID, m.youtube.com/watch?v=ID&list=..., /shorts/ID -> https://www.youtube.com/watch?v=ID.
-    Cache/warm/khoa dung chung 1 khoa cho cung 1 video (truoc day moi dang URL la 1 khoa rieng -> lam nong khong bao gio trung)."""
     m = _YT_ID_RE.search(url or "")
     return f"https://www.youtube.com/watch?v={m.group(1)}" if m else url
 
 
 RAPID_KEY = os.environ.get("RAPIDAPI_KEY", "").strip()
-# URL day du cua endpoint "Get Video Details" (YouTube Media Downloader). Lay chinh xac tu tab Code snippet tren RapidAPI.
 RAPID_URL = os.environ.get("RAPID_URL", "https://youtube-media-downloader.p.rapidapi.com/v2/video/details").strip()
 RAPID_HOST = urllib.parse.urlparse(RAPID_URL).netloc
-RAPID_ONLY = os.environ.get("RAPID_ONLY", "0") == "1"   # =1: RapidAPI loi thi bao loi luon, KHONG roi ve yt-dlp
+RAPID_ONLY = os.environ.get("RAPID_ONLY", "0") == "1"
 
 
 def _rapid_streams(video_id, height_cap):
-    """Lay URL luong tu RapidAPI (YouTube Media Downloader) -> (video_url, audio_url, video_hdr, audio_hdr)."""
     if not RAPID_KEY:
         raise ResolveError("chua dat RAPIDAPI_KEY")
     url = RAPID_URL + "?" + urllib.parse.urlencode({"videoId": video_id, "urlAccess": "normal"})
@@ -715,13 +719,11 @@ def _rapid_streams(video_id, height_cap):
     cap = int(height_cap)
     hdr = f"User-Agent: {UA}\r\n"
 
-    # 1) Luong gop co ca hinh lan tieng (vd itag 18, 360p): don gian nhat cho ffmpeg
     combined = [v for v in vitems if v.get("hasAudio") and (v.get("height") or 0) <= cap]
     if combined:
         best = max(combined, key=lambda v: (v.get("height") or 0, "avc1" in str(v.get("mimeType", ""))))
         return best["url"], None, hdr, ""
 
-    # 2) Tach rieng: video khong tieng (uu tien avc1/mp4 de ffmpeg giai ma nhe) + audio nho nhat
     vids = [v for v in vitems if str(v.get("mimeType", "")).startswith("video/")
             and (v.get("height") or 0) <= cap]
     if not vids:
@@ -734,13 +736,13 @@ def _rapid_streams(video_id, height_cap):
 
 
 RAPID_FAST_HOST = os.environ.get("RAPID_FAST_HOST", "youtube-video-fast-downloader-24-7.p.rapidapi.com").strip()
-RAPID_FAST_QUALITY = os.environ.get("RAPID_FAST_QUALITY", "18").strip()   # 18 = MP4 360p co san tieng
-RAPID_FILE_WAIT = float(os.environ.get("RAPID_FILE_WAIT", "45"))      # truoc day 300s: thiet bi bo cuoc truoc, yt-dlp du phong khong bao gio duoc chay
-RAPID_API_TIMEOUT = float(os.environ.get("RAPID_API_TIMEOUT", "40"))  # truoc day 150s
-RAPID_SKIP_413 = float(os.environ.get("RAPID_SKIP_413", "1800"))      # "Video is too big for your plan": ket qua co dinh theo video, dung goi lai
+RAPID_FAST_QUALITY = os.environ.get("RAPID_FAST_QUALITY", "18").strip()
+RAPID_FILE_WAIT = float(os.environ.get("RAPID_FILE_WAIT", "45"))
+RAPID_API_TIMEOUT = float(os.environ.get("RAPID_API_TIMEOUT", "40"))
+RAPID_SKIP_413 = float(os.environ.get("RAPID_SKIP_413", "1800"))
 RAPID_SKIP_OTHER = float(os.environ.get("RAPID_SKIP_OTHER", "90"))
-RAPID_SKIP_QUOTA = float(os.environ.get("RAPID_SKIP_QUOTA", "600"))   # 401/402/403/429: het quota / sai key -> moi video deu loi
-_rapid_skip = {}          # video_id -> het_han (monotonic)
+RAPID_SKIP_QUOTA = float(os.environ.get("RAPID_SKIP_QUOTA", "600"))
+_rapid_skip = {}
 _rapid_skip_all = 0.0
 _rapid_skip_lock = threading.Lock()
 
@@ -752,7 +754,6 @@ def _rapid_should_skip(video_id):
 
 
 def _rapid_note_failure(video_id, msg):
-    """Phan loai loi RapidAPI de lan sau khong ton them vai chuc giay + 1 luot quota cho cung ket qua."""
     global _rapid_skip_all
     now = time.monotonic()
     with _rapid_skip_lock:
@@ -768,8 +769,6 @@ def _rapid_note_failure(video_id, msg):
 
 
 def _rapid_fast_file(video_id):
-    """RapidAPI (youtube-video-fast-downloader) tra URL file mp4 da co tieng.
-    File co the chua san sang (404) trong 20-300s, nen cho den khi tai duoc. -> (video_url, None, "", "")"""
     if not RAPID_KEY:
         raise ResolveError("chua dat RAPIDAPI_KEY")
     api = (f"https://{RAPID_FAST_HOST}/download_video/{video_id}?"
@@ -803,7 +802,7 @@ def _rapid_fast_file(video_id):
             if e.code != 404:
                 raise ResolveError(f"file tu RapidAPI loi HTTP {e.code}") from None
         except (urllib.error.URLError, OSError):
-            pass   # mang chap chon: thu lai
+            pass
         if time.monotonic() > deadline:
             raise ResolveError(f"file chua san sang sau {RAPID_FILE_WAIT:.0f}s")
         time.sleep(5)
@@ -811,23 +810,18 @@ def _rapid_fast_file(video_id):
     return file_url, None, "", ""
 
 
-# ---------- Duong LAY LINK TRUC TIEP (InnerTube, client android_vr) ----------
-# yt-dlp tren 0.15 CPU mat 10-20s/video (nap extractor + JS runtime + tai trang watch) va goi nhieu request -> de bi YouTube chan hon.
-# Day chi la 1 request JSON toi dung API ma chinh yt-dlp dung cho client android_vr (khong can JS player / cookies / PO token).
-# CHUA DUOC KIEM CHUNG tren YouTube that tu moi truong phat trien -> moi loi deu tu lui ve duong cu (RapidAPI / yt-dlp),
-# va tu tat tam khi that bai lien tiep tren nhieu video (YT_DIRECT_MAX_FAILS). Tat han: YT_DIRECT=0.
 YT_DIRECT = os.environ.get("YT_DIRECT", "1") == "1"
-YT_DIRECT_VERSION = os.environ.get("YT_DIRECT_VERSION", "1.65.10")   # phien ban app Oculus; YouTube doi thi dat lai bang env, khong can sua code
+YT_DIRECT_VERSION = os.environ.get("YT_DIRECT_VERSION", "1.65.10")
 YT_DIRECT_TIMEOUT = float(os.environ.get("YT_DIRECT_TIMEOUT", "8"))
 YT_DIRECT_MAX_FAILS = int(os.environ.get("YT_DIRECT_MAX_FAILS", "3"))
 YT_DIRECT_COOLDOWN = float(os.environ.get("YT_DIRECT_COOLDOWN", "600"))
-YT_AUDIO_MAX_BPS = int(os.environ.get("YT_AUDIO_MAX_BPS", "72000"))   # dong bo voi bestaudio[abr<=72] cua yt-dlp (audio bi ha xuong 16-22kHz mono)
+YT_AUDIO_MAX_BPS = int(os.environ.get("YT_AUDIO_MAX_BPS", "72000"))
 _direct_vids = _RecentFails(120.0)
 _direct_off_until = 0.0
 
 
 class _DirectFail(Exception):
-    """Duong truc tiep that bai (mang / YouTube tu choi / khong co luong dung duoc) -> thu duong khac."""
+    pass
 
 
 def _direct_ua():
@@ -836,8 +830,6 @@ def _direct_ua():
 
 
 def _pick_direct_formats(data, height_cap):
-    """Chon luong tu phan hoi InnerTube giong tieu chi cua chuoi format yt-dlp: video avc1 <=30fps cao nhat khong qua height_cap,
-    audio tot nhat <=72kbps (uu tien AAC). Tra ve (video_url, audio_url|None) hoac None neu khong co luong dung duoc."""
     sd = (data or {}).get("streamingData") or {}
     cap = int(height_cap)
 
@@ -860,7 +852,7 @@ def _pick_direct_formats(data, height_cap):
     if pool:
         v = max(pool, key=lambda f: (f.get("height") or 0, "avc1" in mime(f), -(f.get("bitrate") or 0)))
     elif vids:
-        v = min(vids, key=lambda f: (f.get("height") or 99999, f.get("bitrate") or 0))   # moi luong deu cao hon tran -> lay thap nhat
+        v = min(vids, key=lambda f: (f.get("height") or 99999, f.get("bitrate") or 0))
     else:
         v = None
 
@@ -874,7 +866,6 @@ def _pick_direct_formats(data, height_cap):
                  else min(auds, key=abr))
         return v["url"], (a["url"] if a else None)
 
-    # khong co luong tach rieng: dung luong gop co san (itag 18...) neu co
     comb = [f for f in usable(sd.get("formats")) if mime(f).startswith("video/")]
     comb = [f for f in comb if (f.get("height") or 0) <= cap] or comb
     if comb:
@@ -914,7 +905,7 @@ def _direct_streams(video_id, height_cap):
     if ps.get("status") != "OK":
         why = f"{ps.get('status', '?')}: {str(ps.get('reason') or '')[:100]}"
         if any(h in why for h in _NO_RETRY_STRONG):
-            raise ResolveError(why, permanent=True)   # rieng tu / da go / chan vung: khong ton them 45s thu cac cach khac
+            raise ResolveError(why, permanent=True)
         raise _DirectFail(why)
     pick = _pick_direct_formats(data, height_cap)
     if not pick:
@@ -924,8 +915,7 @@ def _direct_streams(video_id, height_cap):
 
 
 def _try_direct(video_id, height_cap):
-    """-> (video_url, audio_url, v_hdr, a_hdr) hoac None (de caller thu duong khac). Khong bao gio lam ket qua xau di."""
-    global _direct_off_until, _yt_block_until
+    global _direct_off_until, _yt_block_until, _block_level
     if not YT_DIRECT or time.monotonic() < _direct_off_until:
         return None
     t0 = time.monotonic()
@@ -940,45 +930,43 @@ def _try_direct(video_id, height_cap):
         return None
     except ResolveError:
         raise
-    except Exception as e:   # bug bat ngo cung khong duoc lam hong viec phat
+    except Exception as e:
         print(f"[direct] loi khong du kien: {type(e).__name__}: {str(e)[:100]}", flush=True)
         return None
     _direct_vids.clear()
     _yt_fails.clear()
-    _yt_block_until = 0.0   # lay duoc link tu IP nay -> IP khong bi chan
+    _yt_block_until = 0.0
+    _block_level = 0
     print(f"[direct] {video_id} OK sau {time.monotonic() - t0:.1f}s", flush=True)
     return res
 
 
-WARM_RAPID = os.environ.get("WARM_RAPID", "0") == "1"   # lam nong bang RapidAPI = moi ket qua tim kiem ton 1 luot quota + file song ~10 phut -> mac dinh tat
+WARM_RAPID = os.environ.get("WARM_RAPID", "0") == "1"
 
 
 def _resolve_stream_urls_uncached(video_url, height_cap, background=False):
     m = _YT_ID_RE.search(video_url or "")
     if m and _is_youtube(video_url):
-        _d = _try_direct(m.group(1), height_cap)   # nhanh nhat (~1s); that bai thi di tiep nhu cu
+        _d = _try_direct(m.group(1), height_cap)
         if _d:
             return _d
     use_rapid = bool(RAPID_KEY and m and _is_youtube(video_url)) and (WARM_RAPID or not background)
 
     if use_rapid and _rapid_should_skip(m.group(1)):
-        # vua that bai (vd 413 "qua lon cho goi cuoc") -> khong ton them thoi gian + quota, di thang yt-dlp
         print(f"[resolve] bo qua RapidAPI cho {m.group(1)} (vua that bai)", flush=True)
         if RAPID_ONLY:
             raise ResolveError("RapidAPI vua that bai cho video nay (RAPID_ONLY=1)")
         use_rapid = False
 
     if use_rapid:
-        # Nguon CHINH: RapidAPI (khong can giu gate yt-dlp)
         try:
             return _rapid_fast_file(m.group(1))
         except ResolveError as e:
             print(f"[resolve] RapidAPI that bai: {str(e)[:200]}", flush=True)
             _rapid_note_failure(m.group(1), str(e))
             if background or RAPID_ONLY:
-                raise   # warmup / che do chi RapidAPI: khong dung yt-dlp
+                raise
 
-    # Du phong: yt-dlp
     if background:
         if not _resolve_gate.acquire(blocking=False):
             raise ResolveError("busy (dang co resolve khac)")
@@ -991,10 +979,7 @@ def _resolve_stream_urls_uncached(video_url, height_cap, background=False):
 
 
 def _resolve_stream_urls_inner(video_url, height_cap, budget=None, background=False):
-    """Dung yt-dlp lay URL luong truc tiep (YouTube, TikTok, Facebook... yt-dlp tu nhan dien domain).
-    Doi "bestvideo+bestaudio" (2 luong tach biet) roi de ffmpeg ghep khi mux.
-    Voi YouTube: thu lan luot nhieu cach (_YT_ATTEMPTS), cach nao ra truoc thi dung."""
-    global _yt_preferred, _nocookie_fails, _nocookie_skip_until, _yt_block_until
+    global _yt_preferred, _nocookie_fails, _nocookie_skip_until, _yt_block_until, _block_level
     fmt = (
         f"bestvideo[height<={height_cap}][vcodec^=avc1]+bestaudio"
         f"/bestvideo[height<={height_cap}]+bestaudio"
@@ -1002,8 +987,6 @@ def _resolve_stream_urls_inner(video_url, height_cap, budget=None, background=Fa
         f"/best"
     )
     if YT_FMT_LEAN:
-        # Uu tien avc1 <=30fps (giai ma re hon nhieu so voi 60fps/VP9/AV1) + audio <=72kbps (ta ha xuong 16kHz mono nen
-        # khong can audio nang). Khong khop thi tu roi ve chuoi goc phia sau -> khong the lam hong viec phat.
         fmt = (f"bestvideo[height<={height_cap}][vcodec^=avc1][fps<=30]+bestaudio[abr<=72]"
                f"/bestvideo[height<={height_cap}][vcodec^=avc1][fps<=30]+bestaudio/") + fmt
     is_yt = _is_youtube(video_url)
@@ -1022,11 +1005,9 @@ def _resolve_stream_urls_inner(video_url, height_cap, budget=None, background=Fa
     _vm = _YT_ID_RE.search(video_url or "")
     vkey = _vm.group(1) if _vm else video_url
     if _nocookie_skip_until and time.monotonic() >= _nocookie_skip_until:
-        # het thoi gian nghi -> dem lai tu dau (truoc day 1 loi le la nghi tiep ngay)
         _nocookie_skip_until = 0.0
         _nocookie_fails = 0
         _nocookie_vids.clear()
-    # Lam nong nen + co cookies: bo qua cach khong cookies (android_vr an het ngan sach 20s roi moi toi cach co cookies)
     if os.path.exists(COOKIES_FILE) and (time.monotonic() < _nocookie_skip_until or background):
         with_cookies = [a for a in attempts if a[2]]
         if with_cookies:
@@ -1043,11 +1024,13 @@ def _resolve_stream_urls_inner(video_url, height_cap, budget=None, background=Fa
         if errors and time.monotonic() - t_start > budget:
             break
         try:
+            _yt_pace()
             res = _extract_with(video_url, _build_ydl_opts(fmt, client, use_cookies, runtimes, YT_PROXY))
             if _yt_preferred != name:
                 print(f"[resolve] cach '{name}' thanh cong", flush=True)
             _yt_preferred = name
-            _yt_fails.clear()   # co video ra duoc -> IP khong bi chan, xoa het "dau hieu chan" tich luy
+            _yt_fails.clear()
+            _block_level = 0
             if not use_cookies:
                 _nocookie_fails = 0
                 _nocookie_skip_until = 0.0
@@ -1057,9 +1040,7 @@ def _resolve_stream_urls_inner(video_url, height_cap, budget=None, background=Fa
             msg = str(e)
             print(f"[resolve] cach '{name}' that bai: {msg[:140]}", flush=True)
             errors.append(f"{name}: {msg[:110]}")
-            # Lam nong nen that bai KHONG duoc ghi vao trang thai chung (chan IP / bo cach khong cookies)
             if not background and not use_cookies and "player response" in msg:
-                # dem theo so video KHAC NHAU (truoc day 2 lan that bai cua CUNG 1 video da bo android_vr 30 phut)
                 _nocookie_fails = _nocookie_vids.add(vkey)
                 if _nocookie_fails >= YT_NOCOOKIE_MAX_FAILS:
                     _nocookie_skip_until = time.monotonic() + YT_NOCOOKIE_COOLDOWN
@@ -1072,27 +1053,26 @@ def _resolve_stream_urls_inner(video_url, height_cap, budget=None, background=Fa
                     permanent = True
                     break
     if not permanent and not background:
-        # video hong rieng le KHONG duoc xoa cach dang chay tot / khong duoc coi la IP bi chan
-        # background (warmup): that bai luc khoi dong khong duoc khoa request that 60s
         _yt_preferred = None
         _joined = " | ".join(errors)
         if any(h in _joined for h in _BLOCK_HINTS) and not any(h in _joined for h in _AGE_HINTS):
             n_vids = _yt_fails.add(vkey)
             need = YT_BLOCK_VIDEOS_HARD if any(h in _joined for h in _HARD_BLOCK_HINTS) else YT_BLOCK_VIDEOS_SOFT
             if n_vids >= need:
-                _yt_block_until = time.monotonic() + YT_BLOCK_BACKOFF
-                print(f"[resolve] {n_vids} video khac nhau that bai lien tiep -> nghi {YT_BLOCK_BACKOFF:.0f}s (IP co the bi chan)", flush=True)
+                _wait = min(YT_BLOCK_MAX, YT_BLOCK_BACKOFF * 2 ** min(_block_level, 5)) * random.uniform(0.9, 1.3)
+                _block_level += 1
+                _yt_block_until = time.monotonic() + _wait
+                print(f"[resolve] {n_vids} video khac nhau that bai lien tiep -> nghi {_wait:.0f}s (IP co the bi chan, lan {_block_level})", flush=True)
             else:
                 print(f"[resolve] video {vkey} that bai ({n_vids}/{need} video khac nhau) - coi la loi RIENG cua video, khong khoa server", flush=True)
     raise ResolveError(" | ".join(errors)[:700] or "khong cach nao chay", permanent=permanent)
 
 
-RESOLVE_TTL = int(os.environ.get("RESOLVE_TTL", "1800"))
-# Duong truc tiep chi ton ~1s va khong giu _resolve_gate -> lam nong 3 ket qua dau tim kiem la re (yt-dlp: 1 ket qua ~10-20s CPU nen chi 1)
+RESOLVE_TTL = int(os.environ.get("RESOLVE_TTL", "5400"))
 WARM_TOP_N = int(os.environ.get("WARM_TOP_N", "3" if YT_DIRECT else "1"))
-_resolve_cache = {}   # key -> (ts, res, hieu_luc_den)
-_neg_cache = {}       # video_url -> (het_han, thong_bao)  (video hong han, tranh dap lai 5 cach x 45s)
-_fail_cache = {}      # video_url -> (het_han, thong_bao, luc_loi)  (loi tam thoi: chi nho YT_FAIL_TTL giay de khong chay lai ngay)
+_resolve_cache = {}
+_neg_cache = {}
+_fail_cache = {}
 _resolve_locks = {}
 _resolve_guard = threading.Lock()
 _active_streams = 0
@@ -1109,7 +1089,6 @@ _cur_lock = threading.Lock()
 
 
 def _who():
-    """Ai goi? (path + IP that sau proxy Render) - de log chi ra chinh xac yeu cau nao cat luong dang xem."""
     try:
         ip = (request.headers.get("X-Forwarded-For", "") or request.remote_addr or "").split(",")[0].strip()
         return f"{request.path} tu {ip}"
@@ -1118,8 +1097,6 @@ def _who():
 
 
 def _kill_stream(why=""):
-    """Tat ffmpeg dang phat va BO tham chieu: yeu cau /stream dang cho byte dau tien nhin thay _cur_proc doi
-    -> hieu la minh bi thay the va dung han (truoc day no tuong ffmpeg loi, resolve lai roi sinh ffmpeg moi de len nguoi dung vua chuyen)."""
     global _cur_proc
     with _cur_lock:
         p, _cur_proc = _cur_proc, None
@@ -1157,7 +1134,6 @@ def _ver_tuple(v):
 
 
 def _ytdlp_latest():
-    """Ban yt-dlp moi nhat tren GitHub (1 request JSON nho) hoac None neu khong hoi duoc."""
     try:
         req = urllib.request.Request("https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest",
                                      headers={"User-Agent": "relay-server", "Accept": "application/vnd.github+json"})
@@ -1168,14 +1144,12 @@ def _ytdlp_latest():
 
 
 def _update_ytdlp(min_gap=600):
-    """Chay pip upgrade yt-dlp. Tra ve True neu phien ban thay doi. Khong chay lai trong min_gap giay."""
     global _last_update_try
     with _update_lock:
         if time.monotonic() - _last_update_try < min_gap and _last_update_try:
             return False
         _last_update_try = time.monotonic()
         before = _ytdlp_version()
-        # Khong co ban moi -> khong can pip (pip giai quyet phu thuoc + tai + cai tren 0.1 CPU ton hang phut CPU va >100MB RAM, moi 12 gio)
         latest = _ytdlp_latest()
         if latest and _ver_tuple(before) and _ver_tuple(before) >= _ver_tuple(latest):
             print(f"[update] yt-dlp {before} da la ban moi nhat ({latest}) -> bo qua pip", flush=True)
@@ -1186,9 +1160,8 @@ def _update_ytdlp(min_gap=600):
             return False
         try:
             cmd = [sys.executable, "-m", "pip", "install", "-U", "--no-cache-dir", "--quiet", "yt-dlp[default]"]
-            if shutil.which("nice"):  # preexec_fn khong an toan khi dang co nhieu thread
+            if shutil.which("nice"):
                 cmd = ["nice", "-n", "19"] + cmd
-            # timeout 240s cu: tren 0.1 CPU pip hay chay lau hon -> bi kill GIUA luc go ban cu/cai ban moi -> yt-dlp hong
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=YTDLP_PIP_TIMEOUT)
             if r.returncode != 0:
                 print(f"[update] pip loi: {r.stderr[-300:]}", flush=True)
@@ -1211,11 +1184,10 @@ def _restart_when_idle():
 
 def _update_and_maybe_restart(min_gap=600):
     for _ in range(360):
-        if _idle_for(90):  # pip upgrade ngon CPU: chi chay khi may that su ranh, khong chen vao luc dang dung
+        if _idle_for(90):
             break
         time.sleep(10)
     else:
-        # truoc day het 1 gio van chay pip luc may dang ban -> giat/OOM tren goi Free 512MB
         print("[update] may ban lien tuc >1h, bo qua dot cap nhat nay", flush=True)
         return
     if _update_ytdlp(min_gap):
@@ -1234,8 +1206,6 @@ _update_pending = threading.Event()
 
 
 def trigger_update_async():
-    """Goi khi gap loi extract: cap nhat nen (toi da 1 lan / 30 phut, va CHI 1 thread cho cung luc -
-    truoc day moi request loi sinh them 1 thread cho toi 1 gio)."""
     if AUTO_UPDATE and not _update_pending.is_set():
         _update_pending.set()
 
@@ -1248,8 +1218,6 @@ def trigger_update_async():
 
 
 def _res_expiry(res):
-    """URL googlevideo co tham so expire=<epoch>: tra ve moc monotonic het han tru 120s du phong (None neu khong co).
-    Xet CA URL video lan audio va lay moc som nhat (truoc day chi xet URL video -> audio het han truoc van bi giu trong cache)."""
     best = None
     for u in (res[0], res[1] if len(res) > 1 else None):
         if not u:
@@ -1291,7 +1259,6 @@ def resolve_stream_urls(video_url, height_cap, background=False, force=False):
             raise ResolveError(neg[1], permanent=True)
         fc = _fail_cache.get(video_url)
         if fc and now < fc[0] and not force and not background:
-            # thiet bi tu bam lai cung video vua loi: tra loi ngay thay vi chiem _resolve_gate them ~60s (cac video khac phai xep hang sau)
             raise ResolveError(fc[1] + f" (vua loi {now - fc[2]:.0f}s truoc, thu lai sau it giay)", permanent=False)
         if len(_resolve_locks) > 100:
             for k in [k for k, l in _resolve_locks.items() if not l.locked()]:
@@ -1335,9 +1302,9 @@ def resolve_stream_urls(video_url, height_cap, background=False, force=False):
             until = ts + RESOLVE_TTL
             exp = _res_expiry(res)
             if exp is not None:
-                until = min(until, exp)  # khong giu URL da het han (TTL cung 30 phut truoc day co the dai hon han that)
+                until = min(until, exp)
             elif res[0] and "googlevideo.com" not in res[0]:
-                until = min(until, ts + 480)  # file RapidAPI chi ton tai ~10 phut
+                until = min(until, ts + 480)
             if until > ts + 30:
                 _resolve_cache[key] = (ts, res, until)
             for k in [k for k, v in _resolve_cache.items() if ts >= v[2]]:
@@ -1352,8 +1319,6 @@ _last_height_cap = ""
 
 
 def _warm_height():
-    """Do cao client thuc su dang xin (lan /stream gan nhat) de lan lam nong TRUNG khoa cache.
-    Truoc day warm dung MIN_HEIGHT=240 con stream mac dinh 360 -> khong bao gio trung, lam nong phi cong ma van cham YouTube."""
     try:
         floor = int(os.environ.get("MIN_HEIGHT", "240"))
         return str(max(int(_last_height_cap or os.environ.get("WARM_HEIGHT_CAP", "360")), floor))
@@ -1362,7 +1327,7 @@ def _warm_height():
 
 
 YT_WARM_MAX_COST = float(os.environ.get("YT_WARM_MAX_COST", "25"))
-_resolve_ema = 0.0   # thoi gian resolve yt-dlp trung binh (giay); may yeu -> cao
+_resolve_ema = 0.0
 
 
 def _mem_frac():
@@ -1371,7 +1336,6 @@ def _mem_frac():
 
 
 def _trim_caches():
-    """RAM sat tran: bo cac cache dung lai duoc (khung hinh da ve, dai anh, JPEG, trang da dung) truoc khi chay viec nang (yt-dlp + JS runtime)."""
     _band_cache.clear()
     _jpeg_cache.clear()
     _S.pages.clear()
@@ -1380,7 +1344,6 @@ def _trim_caches():
 
 def _warm_worker(video_ids, height_cap):
     if _resolve_ema > YT_WARM_MAX_COST:
-        # may yeu: 1 lan lam nong ~ _resolve_ema giay CPU day dac trong luc nguoi dung dang chon video khac -> do cho luot that cua ho
         print(f"[warm] resolve trung binh {_resolve_ema:.0f}s > {YT_WARM_MAX_COST:.0f}s, bo qua lam nong", flush=True)
         return
     if _mem_frac() > 0.75:
@@ -1407,7 +1370,6 @@ def warm_results(results):
 
 
 def load_playlist():
-    """Đọc PLAYLIST_FILE, trả về list các link (đã bỏ dòng trống/comment)."""
     if not os.path.exists(PLAYLIST_FILE):
         return []
     with open(PLAYLIST_FILE, "r", encoding="utf-8") as f:
@@ -1450,7 +1412,6 @@ def _int_arg(name, default, lo, hi):
 
 
 def _normalize_input_url(u):
-    """Chi nhan http(s) hoac ID YouTube tran (chan file://, ftp://... va chuoi la)."""
     u = (u or "").strip()
     if not u:
         return ""
@@ -1460,29 +1421,272 @@ def _normalize_input_url(u):
         u = "https://" + u
     if not re.match(r"^https?://", u, re.I):
         return ""
-    return u if _url_is_public(u) else ""   # chan localhost / mang noi bo / metadata cloud (SSRF)
+    return u if _url_is_public(u) else ""
 
 
-def _ffmpeg_cmd(v_url, a_url, v_hdr, a_hdr, is_yt, w, h, fps, q, ar):
-    """Dung LIST thay vi chuoi + shlex.split: w/h/... tu query khong the chen them tham so ffmpeg
-    (truoc day w="320 -y /tmp/x" co the ghi file tuy y)."""
-    def inp(url, hdr, vid=False):
-        # whitelist giao thuc: playlist HLS/DASH do nguon doc hai khong duoc tro sang file:// hay giao thuc la
+import http.client
+import secrets
+import base64
+import bisect
+
+TURBO = os.environ.get("TURBO", "1") == "1"
+TURBO_WORKERS = max(1, _env_int("TURBO_WORKERS", 5))
+TURBO_CHUNK = max(64, _env_int("TURBO_CHUNK_KB", 512)) * 1024
+TURBO_HEAD = 128 * 1024
+TURBO_HEAD_N = 8
+TURBO_AHEAD = max(4, _env_int("TURBO_AHEAD_MB", 20) * 1024 * 1024 // TURBO_CHUNK + TURBO_HEAD_N)
+_LOCAL_IPS = ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+_fetchers = {}
+
+
+def _hdr_dict(s):
+    d = {}
+    for line in (s or "").split("\r\n"):
+        if ": " in line:
+            k, v = line.split(": ", 1)
+            if k.lower() not in ("range", "host", "connection", "accept-encoding"):
+                d[k] = v
+    d["Accept-Encoding"] = "identity"
+    return d
+
+
+def _turbo_size(i):
+    if i < 4:
+        return TURBO_HEAD
+    if i < TURBO_HEAD_N:
+        return 2 * TURBO_HEAD
+    return TURBO_CHUNK
+
+
+class _Fetcher:
+    def __init__(self, url, hdr, proxy=""):
+        self.hdr = hdr
+        self.proxy = proxy
+        self.size, self.url = self._probe(url)
+        self.starts = [0]
+        while self.starts[-1] < self.size:
+            self.starts.append(self.starts[-1] + _turbo_size(len(self.starts) - 1))
+        self.starts[-1] = self.size
+        self.n = len(self.starts) - 1
+        self.buf, self.inflight = {}, set()
+        self.cond = threading.Condition()
+        self.cursor, self.closed, self.err = 0, False, None
+        self.t0, self.dl_bytes, self.wait_s = time.monotonic(), 0, 0.0
+        for _ in range(TURBO_WORKERS):
+            threading.Thread(target=self._work, daemon=True).start()
+
+    def _probe(self, url):
+        h = dict(self.hdr)
+        h["Range"] = "bytes=0-0"
+        px = {"http": self.proxy, "https": self.proxy} if self.proxy else {}
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler(px))
+        with opener.open(urllib.request.Request(url, headers=h), timeout=10) as r:
+            m = re.match(r"bytes 0-0/(\d+)$", r.headers.get("Content-Range", ""))
+            if r.status != 206 or not m:
+                raise RuntimeError("nguon khong ho tro Range")
+            r.read()
+            final = r.geturl()
+        if not _url_is_public(final):
+            raise RuntimeError("nguon tro toi dia chi noi bo")
+        return int(m.group(1)), final
+
+    def _conn(self):
+        u = urllib.parse.urlsplit(self.url)
+        https = u.scheme == "https"
+        port = u.port or (443 if https else 80)
+        if self.proxy.startswith("http"):
+            pp = urllib.parse.urlsplit(self.proxy)
+            if https:
+                c = http.client.HTTPSConnection(pp.hostname, pp.port or 80, timeout=15)
+                th = {}
+                if pp.username:
+                    cred = f"{urllib.parse.unquote(pp.username)}:{urllib.parse.unquote(pp.password or '')}"
+                    th["Proxy-Authorization"] = "Basic " + base64.b64encode(cred.encode()).decode()
+                c.set_tunnel(u.hostname, port, headers=th)
+                return c
+        return (http.client.HTTPSConnection if https else http.client.HTTPConnection)(u.hostname, port, timeout=15)
+
+    def _fetch(self, c, idx):
+        a = self.starts[idx]
+        b = self.starts[idx + 1] - 1
+        u = urllib.parse.urlsplit(self.url)
+        h = dict(self.hdr)
+        h["Range"] = f"bytes={a}-{b}"
+        c.request("GET", u.path + ("?" + u.query if u.query else ""), headers=h)
+        r = c.getresponse()
+        data = r.read()
+        if r.status != 206 or len(data) != b - a + 1:
+            raise RuntimeError(f"HTTP {r.status}, {len(data)}/{b - a + 1}B")
+        return data
+
+    def _next(self):
+        for i in range(self.cursor, min(self.n, self.cursor + TURBO_AHEAD)):
+            if i not in self.buf and i not in self.inflight:
+                return i
+        return None
+
+    def _work(self):
+        c, last = None, None
+        while True:
+            with self.cond:
+                if self.closed:
+                    break
+                idx = self._next()
+                if idx is None:
+                    self.cond.wait(0.5)
+                    continue
+                self.inflight.add(idx)
+            data = None
+            for attempt in range(3):
+                try:
+                    if c is None:
+                        c = self._conn()
+                    data = self._fetch(c, idx)
+                    break
+                except Exception as e:
+                    last = e
+                    try:
+                        c and c.close()
+                    except Exception:
+                        pass
+                    c = None
+                    time.sleep(0.2 * (attempt + 1))
+            with self.cond:
+                self.inflight.discard(idx)
+                if data is not None:
+                    if not self.closed:
+                        self.buf[idx] = data
+                        self.dl_bytes += len(data)
+                        self.err = None
+                else:
+                    self.err = last
+                self.cond.notify_all()
+        try:
+            c and c.close()
+        except Exception:
+            pass
+
+    def get(self, pos, n):
+        idx = bisect.bisect_right(self.starts, pos) - 1
+        deadline = time.monotonic() + 30
+        with self.cond:
+            if idx != self.cursor:
+                self.cursor = idx
+                for k in [k for k in self.buf if k < idx - 2 or k >= idx + TURBO_AHEAD]:
+                    del self.buf[k]
+                self.cond.notify_all()
+            _tw = time.monotonic()
+            while idx not in self.buf:
+                if self.closed or self.err:
+                    raise RuntimeError(f"tai loi: {self.err}")
+                if time.monotonic() > deadline:
+                    raise TimeoutError("het gio cho chunk")
+                self.cond.wait(0.5)
+            self.wait_s += time.monotonic() - _tw
+            d = self.buf[idx]
+        off = pos - self.starts[idx]
+        return d[off: off + n]
+
+    def close(self):
+        with self.cond:
+            self.closed = True
+            self.buf.clear()
+            self.cond.notify_all()
+
+
+def _turbo(url, hdr, proxy):
+    if not (TURBO and url and url.startswith(("http://", "https://"))) or re.search(r"\.m3u8|\.mpd|/manifest|/playlist", url, re.I):
+        return None
+    try:
+        f = _Fetcher(url, _hdr_dict(hdr), proxy)
+    except Exception as e:
+        print(f"[turbo] bo qua ({str(e)[:100]}) -> doc truc tiep", flush=True)
+        return None
+    sid = secrets.token_hex(16)
+    _fetchers[sid] = f
+    return f"http://127.0.0.1:{PORT}/_src/{sid}", sid
+
+
+def _inputs(v_url, a_url, v_hdr, a_hdr, is_yt):
+    proxy = YT_PROXY if (YT_PROXY and is_yt) else ""
+    with concurrent.futures.ThreadPoolExecutor(2) as ex:
+        fv = ex.submit(_turbo, v_url, v_hdr, proxy)
+        fa = ex.submit(_turbo, a_url, a_hdr, proxy) if a_url else None
+        tv, ta = fv.result(), (fa.result() if fa else None)
+    sids = [t[1] for t in (tv, ta) if t]
+    vi = (tv[0], "", True) if tv else (v_url, v_hdr, False)
+    ai = ((ta[0], "", True) if ta else (a_url, a_hdr, False)) if a_url else None
+    return vi, ai, sids
+
+
+def _drop_fetchers(sids):
+    for sid in sids or []:
+        f = _fetchers.pop(sid, None)
+        if f:
+            try:
+                el = max(0.1, time.monotonic() - f.t0)
+                if f.wait_s > 3.0:
+                    print(f"[dl-slow] nguon tai cham: ffmpeg phai cho {f.wait_s:.1f}s/{el:.0f}s | "
+                          f"tai {f.dl_bytes // 1024}KB = {f.dl_bytes / el / 1024:.0f}KB/s | workers={TURBO_WORKERS}", flush=True)
+            except Exception:
+                pass
+            f.close()
+
+
+@app.route("/_src/<sid>", methods=["GET", "HEAD"])
+def turbo_src(sid):
+    if request.remote_addr not in _LOCAL_IPS:
+        return "", 404
+    f = _fetchers.get(sid)
+    if not f:
+        return "", 404
+    size = f.size
+    m = re.match(r"bytes=(\d*)-(\d*)$", request.headers.get("Range", ""))
+    if m and (m.group(1) or m.group(2)):
+        if m.group(1):
+            a, b = int(m.group(1)), (int(m.group(2)) if m.group(2) else size - 1)
+        else:
+            a, b = max(0, size - int(m.group(2))), size - 1
+        b = min(b, size - 1)
+        if a > b or a >= size:
+            return Response(status=416, headers={"Content-Range": f"bytes */{size}"})
+        status = 206
+    else:
+        a, b, status = 0, size - 1, 200
+    hd = {"Accept-Ranges": "bytes", "Content-Length": str(b - a + 1), "Content-Type": "application/octet-stream"}
+    if status == 206:
+        hd["Content-Range"] = f"bytes {a}-{b}/{size}"
+    if request.method == "HEAD":
+        return Response(status=status, headers=hd)
+
+    def gen():
+        pos = a
+        try:
+            while pos <= b:
+                piece = f.get(pos, min(b - pos + 1, 256 * 1024))
+                pos += len(piece)
+                yield piece
+        except Exception:
+            return
+    return Response(gen(), status=status, headers=hd)
+
+
+def _ffmpeg_cmd(v_url, a_url, v_hdr, a_hdr, is_yt, w, h, fps, q, ar, v_local=False, a_local=False):
+    def inp(url, hdr, vid=False, local=False):
         a = ["-protocol_whitelist", "http,https,tcp,tls,crypto,data,httpproxy",
              "-reconnect", "1", "-reconnect_at_eof", "1", "-reconnect_streamed", "1",
              "-reconnect_delay_max", "5", "-rw_timeout", "20000000"]
-        if YT_PROXY and is_yt:
+        if YT_PROXY and is_yt and not local:
             a += ["-http_proxy", YT_PROXY]
         if hdr:
             a += ["-headers", hdr]
         a += ["-probesize", "500000", "-analyzeduration", "500000", "-fflags", "+nobuffer",
               "-threads", str(FFMPEG_THREADS)]
         if vid and STREAM_FAST_DECODE:
-            a += ["-skip_loop_filter", "all"]   # CHI gan cho input co video (input chi co audio se bi ffmpeg bao "option khong dung")
+            a += ["-skip_loop_filter", "all"]
         if vid and STREAM_SKIP_NOREF and fps <= 12:
             a += ["-skip_frame", "noref"]
         if STREAM_READRATE > 0:
-            # Giu nhip THOI GIAN THUC: khong de ffmpeg doc/giai ma nhanh gap 10 lan o 30s dau roi dot ngot tut toc do
             rr, burst = _ffmpeg_caps()
             if rr:
                 a += ["-readrate", str(STREAM_READRATE)]
@@ -1494,14 +1698,13 @@ def _ffmpeg_cmd(v_url, a_url, v_hdr, a_hdr, is_yt, w, h, fps, q, ar):
         return a
 
     if STREAM_FIT:
-        # giu ti le khung hinh (Shorts doc khong bi be ngang), them vien den thay vi keo gian
         vf = (f"fps={fps},scale={w}:{h}:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear,"
               f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2")
     else:
         vf = f"fps={fps},scale={w}:{h}:flags=fast_bilinear"
-    cmd = ["ffmpeg", "-nostdin", "-v", "error"] + inp(v_url, v_hdr, vid=True)
+    cmd = ["ffmpeg", "-nostdin", "-v", "error"] + inp(v_url, v_hdr, vid=True, local=v_local)
     if a_url:
-        cmd += inp(a_url, a_hdr) + ["-map", "0:v:0", "-map", "1:a:0"]
+        cmd += inp(a_url, a_hdr, local=a_local) + ["-map", "0:v:0", "-map", "1:a:0"]
     cmd += ["-threads", str(FFMPEG_THREADS), "-filter_threads", str(FFMPEG_THREADS),
             "-vf", vf, "-pix_fmt", "yuvj420p", "-c:v", "mjpeg", "-q:v", str(q),
             "-c:a", "pcm_s16le", "-ar", str(ar), "-ac", "1",
@@ -1510,21 +1713,16 @@ def _ffmpeg_cmd(v_url, a_url, v_hdr, a_hdr, is_yt, w, h, fps, q, ar):
 
 
 def _nice_prefix():
-    """Ha do uu tien ffmpeg: tren 0.1 CPU, Python (pacing, nhan request) can duoc chay truoc de khung hinh khong bi giat
-    khi quota CPU sap het. 'nice' exec thang vao ffmpeg nen pid giu nguyen (kill/terminate van dung)."""
     if STREAM_NICE > 0 and shutil.which("nice"):
         return ["nice", "-n", str(STREAM_NICE)]
     return []
 
 
 class _AviCounter:
-    """CHI DE CHAN DOAN: dem so khung video (chunk '00dc') trong luong AVI ffmpeg ghi ra pipe.
-    frames / fps = so giay phim da gui -> so voi dong ho that cho biet SERVER dang chay truoc hay tre so voi toc do phat
-    (lead < 0 keo dai = ffmpeg/nguon khong theo kip; lead on dinh duong ma van giat = nghen o WiFi/thiet bi)."""
     def __init__(self):
-        self.buf = b""        # chi dung luc tim 'movi' trong phan header
-        self.hdr = b""        # tieu de chunk 8 byte bi cat giua 2 lan doc
-        self.state = 0        # 0 = tim 'movi', 1 = dang di qua cac chunk
+        self.buf = b""
+        self.hdr = b""
+        self.state = 0
         self.skip = 0
         self.frames = 0
         self.audio = 0
@@ -1561,7 +1759,7 @@ class _AviCounter:
                 elif fcc[2:] == b"wb" and fcc[:2].isdigit():
                     self.audio += size
                 elif not (fcc[:2] == b"ix" or fcc == b"JUNK"):
-                    self.ok = False   # khong phai cau truc quen thuoc: dung dem, KHONG anh huong viec phat
+                    self.ok = False
                     return
                 self.skip = size + (size & 1)
         except Exception:
@@ -1603,7 +1801,6 @@ def _stream_impl(video_url):
     h -= h % 2
     _cap = _int_arg("height_cap", 360, 1, 2160)
     if STREAM_SRC_AUTO:
-        # khung ra w x h voi che do "fit": nguon 16:9 can cao ~ w*9/16, nguon doc can cao ~ h -> lay cao hon trong hai, khong hon.
         _cap = min(_cap, max(h, int(w * 9 / 16)))
     height_cap = str(max(_cap, _env_int("MIN_HEIGHT", 240)))
     _last_height_cap = height_cap
@@ -1616,6 +1813,7 @@ def _stream_impl(video_url):
     ar = _int_arg("ar", _env_int("AUDIO_RATE", 16000), 4000, 22050)
     bps_cap = _env_int("STREAM_MAX_BPS_CAP", 3000000)
     target_bps = _int_arg("bps", _env_int("STREAM_MAX_BPS", 1000000), 25000, max(25000, bps_cap))
+    target_bps = max(target_bps, _env_int("STREAM_MIN_BPS", 160000))
     burst_bytes = _env_int("STREAM_BURST_BYTES", 1536 * 1024)
     is_yt = _is_youtube(video_url)
 
@@ -1624,12 +1822,8 @@ def _stream_impl(video_url):
         _trim_caches()
 
     if KILL_ON_LEAVE:
-        # yeu cau moi = client da bo video cu: nha CPU/RAM NGAY (truoc day ffmpeg cu van chay suot luc resolve ~vai chuc giay)
         _kill_stream(_who())
 
-    # URL lay tu cache co the da chet (het han / IP doi) -> ffmpeg thoat ngay khong ra byte nao,
-    # truoc day client nhan 200 rong va cache hong duoc giu den het TTL. Gio: neu byte dau tien khong den,
-    # bo cache, resolve lai DUNG 1 LAN roi thu tiep.
     can_retry = _cache_has(video_url, height_cap)
     force = False
     proc = None
@@ -1647,13 +1841,13 @@ def _stream_impl(video_url):
             return jsonify({"error": "resolve_failed", "detail": msg[:300],
                             "permanent": bool(getattr(e, "permanent", False))}), 502
 
-        # URL luong cuoi cung (sau redirect cua yt-dlp) cung phai la dia chi cong cong
         if not all(_url_is_public(u) for u in (v_url, a_url) if u):
             print("[stream] URL luong tro vao host noi bo -> chan", flush=True)
             _cache_drop(video_url, height_cap)
             return jsonify({"error": "blocked_host", "detail": "nguon tro toi dia chi noi bo"}), 403
 
-        cmd = _ffmpeg_cmd(v_url, a_url, v_hdr, a_hdr, is_yt, w, h, fps, q, ar)
+        vi, ai, sids = _inputs(v_url, a_url, v_hdr, a_hdr, is_yt)
+        cmd = _ffmpeg_cmd(vi[0], ai[0] if ai else None, vi[1], ai[1] if ai else "", is_yt, w, h, fps, q, ar, vi[2], ai[2] if ai else False)
         with _cur_lock:
             _old = _cur_proc
             if _old is not None and _old.poll() is None:
@@ -1665,8 +1859,8 @@ def _stream_impl(video_url):
             try:
                 proc = subprocess.Popen(_nice_prefix() + cmd, stdout=subprocess.PIPE, bufsize=1 << 20)
             except OSError as e:
-                # truoc day: khong co ffmpeg -> 500 HTML khong ro nguyen nhan
                 print(f"[stream] khong chay duoc ffmpeg: {e}", flush=True)
+                _drop_fetchers(sids)
                 return jsonify({"error": "ffmpeg_missing", "detail": str(e)[:120]}), 500
             _cur_proc = proc
         _streams_add(1)
@@ -1682,12 +1876,12 @@ def _stream_impl(video_url):
             print(f"[stream] byte dau tien sau {time.monotonic() - t_req:.1f}s ke tu luc nhan yeu cau", flush=True)
             break
         with _cur_lock:
-            superseded = _cur_proc is not proc   # co yeu cau khac (hoac /search, /br) da tat va thay the ffmpeg nay
+            superseded = _cur_proc is not proc
         _terminate(proc)
         _streams_add(-1)
+        _drop_fetchers(sids)
         proc = None
         if superseded:
-            # KHONG resolve lai / KHONG sinh ffmpeg moi: se de len luong cua nguoi dung vua chuyen sang video khac
             print("[stream] bi yeu cau moi thay the trong luc cho byte dau tien -> dung", flush=True)
             return jsonify({"error": "superseded", "detail": "co yeu cau moi hon"}), 409
         _cache_drop(video_url, height_cap)
@@ -1707,19 +1901,18 @@ def _stream_impl(video_url):
                 return
             released[0] = True
         _streams_add(-1)
+        _drop_fetchers(sids)
 
     def generate():
         t0 = time.monotonic()
         sent = 0
         chunk = first
-        # chan doan: ffmpeg_wait = thoi gian cho ffmpeg ra du lieu (CPU/nguon cham), client_wait = thoi gian cho thiet bi nhan (WiFi/ESP cham)
         w_ff = w_cl = 0.0
         last_log = t0
         last_sent = 0
         avi = _AviCounter()
 
         def _lead():
-            # giay phim da gui - giay da troi qua: duong = server dang di truoc (thiet bi co du tru), am = server tre
             return f"{avi.frames / fps - (time.monotonic() - t0):+.1f}s frames={avi.frames}" if avi.ok and avi.frames else "n/a"
         reason = "ffmpeg het du lieu (EOF)"
         try:
@@ -1749,7 +1942,6 @@ def _stream_impl(video_url):
             reason = f"LOI {type(e).__name__}: {str(e)[:120]}"
             raise
         finally:
-            # ffmpeg rc: 0 = het video binh thuong; -9 = bi kill (server tu giet HOAC Render OOM); -15 = terminate; >0 = ffmpeg tu loi
             try:
                 rc = proc.wait(timeout=1.5) if reason.startswith("ffmpeg") else proc.poll()
             except Exception:
@@ -1768,13 +1960,17 @@ def _stream_impl(video_url):
             pass
         _release()
 
-    resp = Response(generate(), mimetype="video/avi", headers={"Cache-Control": "no-store"})
+    with _stat_lock:
+        _stat["streams"] += 1
+        _stat["last"] = time.time()
+        _n = _stat["streams"]
+    print(f"[proof] giai ma cho LilyGo #{_n} | {_who()} | {w}x{h}@{fps}fps | khong luu o dia", flush=True)
+    resp = Response(generate(), mimetype="video/avi", headers={"Cache-Control": "no-store", "X-Relay-Purpose": "transcode-only-for-LilyGo-T-Display-S3"})
     resp.call_on_close(_reap)
     return resp
 
 
 class _DiagLogger:
-    """Gom toan bo log cua yt-dlp (ke ca WARNING) de hien tren trinh duyet."""
     def __init__(self):
         self.lines = []
     def debug(self, m):
@@ -1789,11 +1985,6 @@ class _DiagLogger:
 
 @app.route("/diag")
 def diag():
-    """Mo tren trinh duyet: /diag?v=<id video>&mode=cur|def|noremote|deno
-    cur      = giu nguyen cau hinh dang dung cua server (js_runtimes + remote_components)
-    def      = de yt-dlp tu chon JS runtime (khong ep js_runtimes / remote_components)
-    noremote = giong cur nhung bo remote_components
-    deno     = chi bat deno"""
     vid = request.args.get("v", "dQw4w9WgXcQ")
     if not re.fullmatch(r"[A-Za-z0-9_-]{6,20}", vid):
         return Response("v khong hop le (chi nhan ID video YouTube)", 400, mimetype="text/plain; charset=utf-8")
@@ -1829,7 +2020,6 @@ def diag():
         opts["extractor_args"] = {"youtube": {"player_client": [c.strip() for c in _cl.split(",") if c.strip()]}}
     if os.path.exists(COOKIES_FILE) and request.args.get("nocookie") != "1":
         opts["cookiefile"] = COOKIES_FILE
-    # chay trong _resolve_gate nhu moi lan yt-dlp khac: tranh 2 yt-dlp cung ghi de file cookies / cung an RAM
     if not _resolve_gate.acquire(timeout=30):
         lg.lines.append("=== BO QUA: server dang ban (yt-dlp khac dang chay), thu lai sau ===")
     else:
@@ -1852,11 +2042,11 @@ import zlib
 import http.cookiejar
 import concurrent.futures
 from html.parser import HTMLParser
-_IMG_PIXEL_CAP = int(os.environ.get("BR_MAX_IMG_PIXELS", "4000000"))             # PNG/GIF/WebP...: ~16MB RAM moi anh
-_IMG_JPEG_PIXEL_CAP = int(os.environ.get("BR_MAX_JPEG_PIXELS", "40000000"))      # JPEG co draft -> RAM nho
+_IMG_PIXEL_CAP = int(os.environ.get("BR_MAX_IMG_PIXELS", "4000000"))
+_IMG_JPEG_PIXEL_CAP = int(os.environ.get("BR_MAX_JPEG_PIXELS", "40000000"))
 try:
     from PIL import Image, ImageDraw, ImageFont
-    Image.MAX_IMAGE_PIXELS = max(_IMG_PIXEL_CAP, _IMG_JPEG_PIXEL_CAP) * 2   # PIL chi canh bao/tu choi sau muc nay; kiem tra chinh nam trong _decode_image
+    Image.MAX_IMAGE_PIXELS = max(_IMG_PIXEL_CAP, _IMG_JPEG_PIXEL_CAP) * 2
     _PIL_OK = True
 except Exception as _pil_e:
     _PIL_OK = False
@@ -1875,9 +2065,9 @@ BR_FONT_PX = int(os.environ.get("BR_FONT_PX", "13"))
 BR_SEARCH_URL = os.environ.get("BR_SEARCH_URL", "https://html.duckduckgo.com/html/?q=")
 BR_IMG_WAIT = float(os.environ.get("BR_IMG_WAIT", "2"))
 BR_MAX_HTML = int(os.environ.get("BR_MAX_HTML", "700000"))
-BR_MAX_BLOCKS = int(os.environ.get("BR_MAX_BLOCKS", "1500"))   # ~3x so khoi can de day 9000px -> dung parse som
+BR_MAX_BLOCKS = int(os.environ.get("BR_MAX_BLOCKS", "1500"))
 BR_BUSY_SEC = float(os.environ.get("BR_BUSY_SEC", "20"))
-_IMG_MAX = max(256, OUT_W * BR_SS)   # lon hon chieu rong khung ve (OUT_W*BR_SS - le) la phi RAM: 720 -> 640 khi BR_SS=2
+_IMG_MAX = max(256, OUT_W * BR_SS)
 UA = ("Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) "
       "Chrome/124.0.0.0 Mobile Safari/537.36")
 
@@ -1980,14 +2170,12 @@ if _rq is not None:
 
 
 def _iter_body(r, deadline):
-    """Doc than phan hoi theo tung manh NGAY KHI co du lieu (read1) de han chot thoi gian duoc kiem tra thuong xuyen.
-    r.iter_content(65536) cho den khi du 64KB hoac het du lieu -> nguon nho giot 1 byte/0.5s lam han chot khong bao gio chay (do duoc: 100s)."""
     raw = r.raw
     if hasattr(raw, "read1"):
         while time.monotonic() < deadline:
             try:
                 c = raw.read1(65536, decode_content=True)
-            except TypeError:   # urllib3 ban cu: read1 khong nhan decode_content
+            except TypeError:
                 c = raw.read1(65536)
             if not c:
                 return
@@ -2004,9 +2192,6 @@ def _http(url, data=None, limit=1500000, timeout=None):
     if not _url_is_public(url):
         raise RuntimeError("blocked host (dia chi noi bo / khong hop le)")
     if _sess is not None:
-        # giu ket noi TLS song giua cac lan bam (truoc day moi lan mo 1 ket noi + bat tay TLS moi)
-        # Tu theo redirect tung buoc de kiem tra host dich o MOI buoc (requests mac dinh theo thang -> SSRF qua 302),
-        # va co han chot tong thoi gian (timeout cua requests chi tinh cho tung lan recv: nguon nho giot van treo duoc thread).
         deadline = time.monotonic() + max(to * 2, 8)
         method = "POST" if data is not None else "GET"
         for _hop in range(7):
@@ -2103,10 +2288,6 @@ _TAG_END = re.compile(r">")
 
 
 def _strip_heavy(s):
-    """Bo comment / script / style / noscript / svg / template trong THOI GIAN TUYEN TINH.
-    Regex cu `<script...>.*?</script>` quet toi het chuoi cho MOI the mo khong dong: do thuc te 600KB co 3000 the <script>
-    khong dong mat 11.9 giay CPU (= hon 2 phut tren 0.1 CPU) va regex giu GIL nen dong bang ca server, ke ca luong video dang phat.
-    The khong dong -> bo het phan con lai (trinh duyet that cung an het phan sau, va HTMLParser cung bo qua no)."""
     out, pos, n = [], 0, len(s)
     while True:
         m = _HEAVY_OPEN.search(s, pos)
@@ -2115,7 +2296,7 @@ def _strip_heavy(s):
             break
         out.append(s[pos:m.start()])
         tag = m.group(1)
-        if tag is None:                      # <!-- ... -->
+        if tag is None:
             end = s.find("-->", m.end())
             if end < 0:
                 break
@@ -2129,8 +2310,6 @@ def _strip_heavy(s):
 
 
 def _feed_doc(d, body):
-    """Nap HTML cho _Doc theo tung manh va DUNG SOM khi da du khoi de lap day trang (_render cat o ~9000px).
-    Trang dai (Wikipedia, bao) truoc day van phai parse het ~700KB bang HTMLParser thuan Python."""
     step = 24000
     for i in range(0, len(body), step):
         d.feed(body[i:i + step])
@@ -2138,8 +2317,6 @@ def _feed_doc(d, body):
             break
     d.close()
     d.flush()
-# LUU Y: "embed" la the RONG (khong co the dong) -> khong duoc dua vao day, neu khong skip tang len mai mai
-# va TOAN BO phan con lai cua trang bien mat (loi cu).
 _SKIP = {"script", "style", "noscript", "svg", "template", "select", "canvas", "object", "textarea", "head"}
 _BLOCK = {"p", "div", "br", "li", "tr", "section", "article", "header", "footer", "main", "ul", "ol", "table",
           "blockquote", "pre", "nav", "aside", "dl", "dt", "dd", "figure", "figcaption", "details", "summary",
@@ -2189,7 +2366,6 @@ class _Doc(HTMLParser):
             self.blocks.append(("video", u, ""))
 
     def _close_btn(self):
-        """Dong <button> dang mo (ke ca khi trang quen </button>: truoc day moi chu phia sau bi nuot vao nhan nut)."""
         if self.btn is not None:
             b, self.btn = self.btn, None
             self.blocks.append(("button", b["fi"], (b["label"] or "OK").strip()[:24], b["name"], b["value"]))
@@ -2372,13 +2548,10 @@ def _fetch_image(u):
         return None
 
 
-_IMG_DECODE_SEM = threading.BoundedSemaphore(2)   # giai ma anh la viec CPU: chay song song tren 0.1 CPU khong nhanh hon, chi ton RAM
+_IMG_DECODE_SEM = threading.BoundedSemaphore(2)
 
 
 def _decode_image(raw):
-    """bytes -> anh RGB da thu nho (toi da _IMG_MAX), hoac None.
-    Tu choi anh qua nhieu pixel (decompression bomb). Do thuc te: PNG 25MP chi nang 84KB nhung can +97MB RAM khi giai ma,
-    6 anh song song = +575MB -> OOM tren goi 512MB. JPEG thi giai ma thang o kich thuoc nho (draft) nen duoc phep lon hon."""
     try:
         with _IMG_DECODE_SEM:
             im = Image.open(io.BytesIO(raw))
@@ -2386,7 +2559,7 @@ def _decode_image(raw):
             if px > (_IMG_JPEG_PIXEL_CAP if im.format == "JPEG" else _IMG_PIXEL_CAP):
                 return None
             try:
-                im.draft("RGB", (_IMG_MAX, _IMG_MAX))  # JPEG: giai ma thang o kich thuoc nho (nhanh, it RAM)
+                im.draft("RGB", (_IMG_MAX, _IMG_MAX))
             except Exception:
                 pass
             im.load()
@@ -2434,7 +2607,6 @@ def _load_images(doc, imgs):
 
     _take()
     if pending:
-        # anh cham khong con chan trang: hien chu ngay, anh den sau se xuat hien o lan cuon/ve khung ke tiep
         def _late():
             concurrent.futures.wait(list(pending), timeout=20)
             if _take():
@@ -2452,7 +2624,6 @@ def _yt_oembed_title(url):
 
 
 def _fetch_doc(url, data=None):
-    """-> (doc, imgs, final_url)"""
     imgs = {}
     if url == "about:home":
         d = _Doc("about:home")
@@ -2467,7 +2638,7 @@ def _fetch_doc(url, data=None):
         title = ""
         if not _MEDIA_EXT.search(url):
             if _is_youtube(url):
-                title = _yt_oembed_title(url)   # JSON ~300B thay vi tai 150KB trang watch chi de lay tieu de
+                title = _yt_oembed_title(url)
             if not title:
                 try:
                     u2, ct, cs, raw = _http(url, limit=150000, timeout=3)
@@ -2487,7 +2658,7 @@ def _fetch_doc(url, data=None):
     if ct.startswith("image/"):
         d = _mk_doc(final, final)
         d.blocks.append(("img", final, "", None))
-        im = _decode_image(raw) if _PIL_OK else None   # truoc day khong thu nho/khong gioi han pixel
+        im = _decode_image(raw) if _PIL_OK else None
         if im is not None:
             imgs[final] = im
         return d, imgs, final
@@ -2503,7 +2674,7 @@ def _fetch_doc(url, data=None):
         for ln in body.splitlines()[:400]:
             _text(d, ln)
         return d, imgs, final
-    body = _strip_heavy(body)[:BR_MAX_HTML]  # HTMLParser thuan Python rat cham voi script/css khong lo
+    body = _strip_heavy(body)[:BR_MAX_HTML]
     d = _Doc(final)
     _feed_doc(d, body)
     if d.title:
@@ -2530,15 +2701,13 @@ _jpeg_cache = {}
 
 
 def _render(doc, imgs, url, portrait):
-    """Chi BO CUC (do chu, ngat dong, toa do) - khong ve ca trang dai nua (truoc day: anh RGB cao 18000px = ~35MB
-    moi trang, ve het roi moi cat). _jpeg ve rieng phan dang nhin thay."""
     S = BR_SS
     W = (OUT_H if portrait else OUT_W)
     VH = (OUT_W if portrait else OUT_H)
     Ws = W * S
     M = 4 * S
     base = BR_FONT_PX * S
-    ops = []   # (y0, y1, loai, ...)
+    ops = []
     hits = []
     wl = {}
     y = 3 * S
@@ -2619,7 +2788,7 @@ def _render(doc, imgs, url, portrait):
             maxw, maxh = Ws - 2 * M, int(VH * 0.7) * S
             r = min(maxw / im.width, maxh / im.height, float(S))
             nw, nh = max(1, int(im.width * r)), max(1, int(im.height * r))
-            ops.append((y, y + nh, "img", M, im.resize((nw, nh), Image.BILINEAR)))   # do: LANCZOS cham gap ~2.1 lan, khac biet khong thay duoc o 320px/JPEG q65
+            ops.append((y, y + nh, "img", M, im.resize((nw, nh), Image.BILINEAR)))
             if b[3]:
                 add_hit(M, y, M + nw, y + nh, ("play", b[3]) if _is_video_url(b[3]) else ("link", b[3]))
             y += nh + 3 * S
@@ -2664,8 +2833,6 @@ _band_cache = {}
 
 
 def _band(page, idx):
-    """Ve san 1 'dai' cao 2 man hinh 1 lan roi cache: cuon tiep trong dai nay chi con cat + nen JPEG (~vai ms),
-    khong ve lai chu moi khung."""
     key = (page.serial, idx)
     im = _band_cache.get(key)
     if im is not None:
@@ -2730,7 +2897,7 @@ def _jpeg(page, scroll):
         img.paste(_band(page, i1).crop((0, 0, Ws, VHs - cut_h)), (0, cut_h))
     if S > 1:
         try:
-            v = img.reduce(S)  # box filter C-toc do, thay LANCZOS
+            v = img.reduce(S)
         except Exception:
             v = img.resize((page.vw, page.vh), Image.BOX)
     else:
@@ -2783,7 +2950,7 @@ class _State:
         self.pages.clear()
 
     def goto(self, url, data=None, push=True):
-        _lk.release()  # nha khoa luc cho mang: cuon / ve khung / nut khac khong con bi do cung 1 trang dang tai
+        _lk.release()
         try:
             try:
                 d, imgs, final = _fetch_shared(url, data)
@@ -2800,7 +2967,6 @@ class _State:
             del self.hist[:-30]
         self.docs.pop(final, None)
         self.docs[final] = (d, imgs)
-        # giu 3 trang gan nhat (dict giu thu tu chen -> bo cai cu nhat), truoc day >5 trang thi xoa SACH ca nut "back"
         while len(self.docs) > 3:
             self.docs.pop(next(iter(self.docs)))
         self.url, self.scroll, self.focus = final, 0.0, None
@@ -2815,7 +2981,6 @@ _inflight_lock = threading.Lock()
 
 
 def _fetch_shared(url, data=None):
-    """Cung 1 URL dang tai (vd firmware timeout roi gui lai) -> dung chung 1 lan tai, khong tai chong nhau."""
     key = (url, data)
     with _inflight_lock:
         fut = _inflight.get(key)
@@ -2849,22 +3014,17 @@ def _submit(fi, bname=None, bval=None):
     return _S.goto(urllib.parse.urlunparse(p._replace(query=urllib.parse.urlencode(q), fragment="")))
 
 
-# ======================= ENGINE CHROMIUM THAT (Playwright) =======================
-# BR_ENGINE=auto (mac dinh): dung Chromium neu co Playwright VA RAM container >= BR_CR_MIN_MB, nguoc lai dung bo HTML tho o tren.
-# BR_ENGINE=chromium: ep dung (Free 512MB co the bi OOM). BR_ENGINE=html: tat han.
-# Moi loi cua Chromium (thieu binary, het RAM, treo...) -> tu lui ve bo HTML, thu lai sau BR_CR_RETRY giay.
-# Playwright sync API gan voi luong tao ra no, ma Flask chay moi request 1 luong -> moi thao tac Chromium di qua 1 luong rieng.
 BR_ENGINE = os.environ.get("BR_ENGINE", "auto").strip().lower()
-BR_CR_ZOOM = max(1.0, min(3.0, float(os.environ.get("BR_CR_ZOOM", "1.25"))))     # viewport CSS = khung hinh * zoom, roi thu nho ve khung hinh
-BR_CR_TIMEOUT = float(os.environ.get("BR_CR_TIMEOUT", "15"))                      # giay cho tai trang
-BR_CR_IDLE = float(os.environ.get("BR_CR_IDLE", "120"))                           # nhan roi bay nhieu giay -> tat Chromium tra RAM
-BR_CR_MIN_MB = float(os.environ.get("BR_CR_MIN_MB", "900"))                       # auto: RAM container toi thieu de bat Chromium
-BR_CR_MEM_MAX = float(os.environ.get("BR_CR_MEM_MAX", "0.90"))                    # RAM dung/gioi han vuot muc nay -> khong mo / tat Chromium
+BR_CR_ZOOM = max(1.0, min(3.0, float(os.environ.get("BR_CR_ZOOM", "1.25"))))
+BR_CR_TIMEOUT = float(os.environ.get("BR_CR_TIMEOUT", "15"))
+BR_CR_IDLE = float(os.environ.get("BR_CR_IDLE", "120"))
+BR_CR_MIN_MB = float(os.environ.get("BR_CR_MIN_MB", "900"))
+BR_CR_MEM_MAX = float(os.environ.get("BR_CR_MEM_MAX", "0.90"))
 BR_CR_RETRY = float(os.environ.get("BR_CR_RETRY", "120"))
-BR_CR_SOFT = float(os.environ.get("BR_CR_SOFT", "0.80"))                          # RAM vuot muc nay -> khoi dong lai Chromium (mo lai dung trang dang xem)
-BR_CR_RECYCLE = int(os.environ.get("BR_CR_RECYCLE", "30"))                        # sau chung nay luot chuyen trang -> khoi dong lai (Chromium chay lau bi phinh)
-BR_CR_JS_MB = int(os.environ.get("BR_CR_JS_MB", "128"))                           # tran heap V8
-BR_CR_SINGLE = os.environ.get("BR_CR_SINGLE", "0") == "1"                         # --single-process: tiet kiem RAM nhat nhung de crash
+BR_CR_SOFT = float(os.environ.get("BR_CR_SOFT", "0.80"))
+BR_CR_RECYCLE = int(os.environ.get("BR_CR_RECYCLE", "30"))
+BR_CR_JS_MB = int(os.environ.get("BR_CR_JS_MB", "128"))
+BR_CR_SINGLE = os.environ.get("BR_CR_SINGLE", "0") == "1"
 _CR_BLOCK_HOSTS = ("doubleclick.net", "googlesyndication.com", "googleadservices.com", "google-analytics.com",
                    "googletagmanager.com", "adservice.google.", "adnxs.com", "taboola.com", "outbrain.com",
                    "scorecardresearch.com", "hotjar.com", "connect.facebook.net")
@@ -2875,7 +3035,6 @@ document.addEventListener('click',function(e){var a=e.target&&e.target.closest&&
 if(a&&a.target!=='_self')a.target='_self';},true);
 })();"""
 
-# o dang focus la gi: "line" (go xong Enter de gui), "multi" (nhieu dong, khong Enter), null (khong phai o nhap)
 _CR_FOCUS_JS = """()=>{const e=document.activeElement;if(!e)return null;const t=e.tagName;
 if(t==='INPUT'){const ty=(e.type||'text').toLowerCase();
 if(['button','submit','checkbox','radio','image','reset','file','range','color'].includes(ty))return null;return 'line';}
@@ -2911,19 +3070,17 @@ class _CrUnavailable(RuntimeError):
 
 
 class _Chromium:
-    """Moi phuong thuc (tru __init__) CHI duoc goi tren luong _cr_pool."""
 
     def __init__(self):
         self.pw = self.browser = self.ctx = self.page = None
         self.vp = None
-        self.play = None          # link video bi chan o lop mang -> firmware se phat bang ffmpeg
+        self.play = None
         self.focus = None
         self.home = False
         self.err_url = ""
         self.navs = 0
         self.born = self.last_used = time.monotonic()
 
-    # ---- khoi dong / tat ----
     def start(self):
         try:
             from playwright.sync_api import sync_playwright
@@ -2937,7 +3094,7 @@ class _Chromium:
                 "--renderer-process-limit=1", "--disk-cache-size=1", "--media-cache-size=1",
                 "--js-flags=--max-old-space-size=%d" % BR_CR_JS_MB]
         if hasattr(os, "geteuid") and os.geteuid() == 0:
-            args += ["--no-sandbox", "--no-zygote"]   # container chay root: Chromium khong khoi dong duoc neu con sandbox
+            args += ["--no-sandbox", "--no-zygote"]
         if BR_CR_SINGLE:
             args.append("--single-process")
         self.pw = sync_playwright().start()
@@ -2970,9 +3127,8 @@ class _Chromium:
         self.pw = self.browser = self.ctx = self.page = None
         gc.collect()
 
-    # ---- an toan / tiet kiem ----
     def _on_page(self, p):
-        if self.page is not None and p is not self.page:   # popup / tab moi: dong ngay (window.open da bi doi thanh dieu huong cung tab)
+        if self.page is not None and p is not self.page:
             try:
                 p.close()
             except Exception:
@@ -2984,7 +3140,7 @@ class _Chromium:
             url = req.url
             if url.startswith(("data:", "blob:", "about:")):
                 return route.continue_()
-            if not _url_is_public(url):   # chan SSRF: khong cho trinh duyet cham mang noi bo (ke ca qua redirect / subresource)
+            if not _url_is_public(url):
                 return route.abort("blockedbyclient")
             rt = req.resource_type
             if rt in ("media", "font") or (rt == "image" and not BR_IMAGES):
@@ -2993,7 +3149,7 @@ class _Chromium:
             if any(h in host for h in _CR_BLOCK_HOSTS):
                 return route.abort()
             if rt == "document" and req.is_navigation_request() and req.frame.parent_frame is None and _is_video_url(url):
-                self.play = url   # link video: khong tai trang xem nang, giao cho /br/play (tra trang "Video" nho thay vi loi mang)
+                self.play = url
                 return route.fulfill(status=200, content_type="text/html; charset=utf-8", body=_cr_video_html(url))
             route.continue_()
         except Exception:
@@ -3002,7 +3158,6 @@ class _Chromium:
             except Exception:
                 pass
 
-    # ---- dieu huong ----
     def ensure(self, portrait, home=True):
         w, h = (OUT_H, OUT_W) if portrait else (OUT_W, OUT_H)
         vp = (int(w * BR_CR_ZOOM), int(h * BR_CR_ZOOM))
@@ -3014,14 +3169,14 @@ class _Chromium:
 
     def cur_url(self):
         u = self.page.url
-        if u.startswith("chrome-error:"):   # trang loi mang cua Chromium -> bao dung link nguoi dung da mo
+        if u.startswith("chrome-error:"):
             return self.err_url or u
         return "about:home" if (self.home and u == "about:blank") else u
 
     def set_html(self, body):
         try:
             self.page.set_content(body, wait_until="domcontentloaded")
-        except Exception:   # "Execution context was destroyed": dang co 1 lan dieu huong dang do -> cho xong roi thu lai
+        except Exception:
             try:
                 self.page.wait_for_load_state("domcontentloaded", timeout=2000)
             except Exception:
@@ -3054,7 +3209,7 @@ class _Chromium:
             msg = str(e)
             if self.play:
                 return
-            if not ("ERR_ABORTED" in msg or "Timeout" in msg):   # het gio / bi huy: cu hien phan da tai duoc
+            if not ("ERR_ABORTED" in msg or "Timeout" in msg):
                 self.set_html(_cr_error_html(msg.splitlines()[0] if msg else "loi", url))
                 return
         self.settle()
@@ -3065,13 +3220,12 @@ class _Chromium:
         except Exception:
             return None
 
-    # ---- khung hinh ----
     def shot(self, portrait):
         W, VH = (OUT_H, OUT_W) if portrait else (OUT_W, OUT_H)
         raw = self.page.screenshot(type="jpeg", quality=80, caret="hide", animations="disabled")
         im = Image.open(io.BytesIO(raw)).convert("RGB")
         if im.size != (W, VH):
-            im = im.resize((W, VH), Image.LANCZOS)   # thu nho (zoom) co loc -> chu ro hon la ve thang o co nho
+            im = im.resize((W, VH), Image.LANCZOS)
         try:
             sy, total, ih = self.page.evaluate(
                 "()=>[window.scrollY,document.documentElement.scrollHeight,window.innerHeight]")
@@ -3090,11 +3244,10 @@ class _Chromium:
                 return buf.getvalue()
             q -= 10
 
-    # ---- 1 thao tac -> (jpg, edit, play, url) ----
     def act(self, action, a, portrait, resume=""):
         self.last_used = time.monotonic()
         if resume and action != "open" and self.page.url == "about:blank":
-            self.go(resume)   # vua khoi dong lai de nha RAM / het nhan roi -> mo lai dung trang dang xem
+            self.go(resume)
         self.ensure(portrait, home=action not in ("open",))
         z = BR_CR_ZOOM
         pg = self.page
@@ -3117,7 +3270,7 @@ class _Chromium:
             if dy:
                 before = pg.evaluate("window.scrollY")
                 pg.evaluate("d=>window.scrollBy({top:d,behavior:'instant'})", dy)
-                if pg.evaluate("window.scrollY") == before:   # trang cuon trong 1 khung con (SPA) -> thu lan chuot
+                if pg.evaluate("window.scrollY") == before:
                     pg.mouse.move(self.vp[0] / 2, self.vp[1] / 2)
                     pg.mouse.wheel(0, dy)
                 pg.wait_for_timeout(80)
@@ -3184,8 +3337,6 @@ _cr_resume = ""
 
 
 def _cr_close_async(resume=False):
-    """Tat Chromium de nhuong RAM (chay xong luot dang do roi moi dong). resume=True: lan sau mo lai dung trang dang xem
-    (het nhan roi / don RAM); False: da roi trang web (sang YouTube, dong, loi) -> khong nho."""
     global _cr, _cr_resume
     _cr_resume = _cr_last_url if (resume and _cr_last_url not in ("", "about:home")) else ""
     c, _cr = _cr, None
@@ -3211,7 +3362,7 @@ def _cr_act(action, a, portrait):
     if frac > BR_CR_MEM_MAX:
         raise _CrUnavailable("RAM %.0f%% > %.0f%%" % (frac * 100, BR_CR_MEM_MAX * 100))
     if _cr is None:
-        _trim_caches()   # nha cache cua bo HTML truoc khi nap Chromium
+        _trim_caches()
         _cr = _Chromium()
     c = _cr
     if c.page is None:
@@ -3225,8 +3376,8 @@ def _cr_act(action, a, portrait):
     frac = _mem_frac()
     if (frac > BR_CR_SOFT or c.navs >= BR_CR_RECYCLE) and time.monotonic() - c.born > 15:
         _log("don RAM: %.0f%%, %d luot -> khoi dong lai Chromium" % (frac * 100, c.navs))
-        _cr_close_async(resume=True)   # khung hinh nay van tra binh thuong; lan sau mo lai dung trang nay
-    _S.url = url   # de X-Url tra dung (khi lui ve HTML se reset _S)
+        _cr_close_async(resume=True)
+    _S.url = url
     return jpg, edit, play
 
 
@@ -3235,7 +3386,6 @@ def _cr_run(fn, *args):
 
 
 def _act(action, a, portrait):
-    """-> (jpg, edit, play_url). Chromium that neu bat duoc, loi gi cung tu lui ve bo HTML."""
     global _cr_fail_until
     if _cr_enabled():
         try:
@@ -3248,12 +3398,11 @@ def _act(action, a, portrait):
             u = _cr_last_url
             _S.reset()
             if u and u != "about:home" and action != "open":
-                _S.goto(u, push=False)   # tiep tuc dung trang dang xem bang bo HTML
+                _S.goto(u, push=False)
     return _act_html(action, a, portrait)
 
 
 def _act_html(action, a, portrait):
-    """-> (jpg, edit, play_url)"""
     edit, play = False, None
     if not _S.url:
         _S.goto("about:home", push=False)
@@ -3343,7 +3492,7 @@ def br_play():
     bad = _br_auth()
     if bad:
         return bad
-    _br_last_activity = time.time()   # chi tinh "ban" sau khi qua xac thuc (truoc day ai goi bua cung khoa duoc cap nhat/lam nong)
+    _br_last_activity = time.time()
     url = (request.args.get("u") or _br_last_url or "").strip()
     if not url or url.startswith("about:"):
         return Response("chua co trang nao dang mo - mo link video truoc", 409)
@@ -3371,7 +3520,7 @@ def br_action(action):
     if not _PIL_OK:
         return Response("thieu Pillow: them Pillow vao requirements.txt roi deploy lai", 503)
     if KILL_ON_LEAVE and action in ("open", "tap", "type", "back", "reload"):
-        _kill_stream(_who())  # vua chuyen tu YouTube sang Google: tat ffmpeg cu de nhuong CPU
+        _kill_stream(_who())
     a = request.args.to_dict()
     portrait = a.get("o") == "1"
     t0 = time.monotonic()
@@ -3401,7 +3550,6 @@ _tr_pool = concurrent.futures.ThreadPoolExecutor(max_workers=8)
 
 
 def _tr_one(text):
-    """Dich 1 doan (tieu de + \\n + mo ta) sang tieng Viet -> (tieu_de, mo_ta). Cung cach cat nhu firmware cu."""
     with _tr_lock:
         hit = _tr_cache.get(text)
     if hit is not None:
@@ -3414,7 +3562,6 @@ def _tr_one(text):
     rest = "".join((sg[0] or "") for sg in segs[1:]).strip()
     res = (first, rest)
     if first:
-        # 8 luong cung ghi cache: khong khoa thi pop(next(iter(...))) co the no "dictionary changed size during iteration"
         with _tr_lock:
             if len(_tr_cache) >= 300:
                 _tr_cache.pop(next(iter(_tr_cache)), None)
@@ -3424,11 +3571,9 @@ def _tr_one(text):
 
 @app.route("/tr", methods=["POST"])
 def translate_batch():
-    """Firmware gui ca danh sach ket qua Google 1 lan; server dich SONG SONG (truoc day ESP dich noi tiep tung ket qua, 10-14s).
-    Vao: {"q": ["tieu de\\nmo ta", ...]}  Ra: {"r": [{"t": "...", "s": "..."}, ...]} (muc loi: t rong -> firmware giu ban goc)."""
     body = request.get_json(silent=True)
     q = body.get("q") if isinstance(body, dict) else None
-    if not isinstance(q, list):   # truoc day body la list/chuoi -> AttributeError 500, hoac q la chuoi -> bi cat thanh tung ky tu
+    if not isinstance(q, list):
         return jsonify({"r": []})
     qs = [str(x)[:900] for x in q[:16]]
     if not qs:
@@ -3463,8 +3608,6 @@ def _prewarm_browser():
 
 
 def _warmup_once():
-    """Sau khi khoi dong, tu lay link 1 video luc chua ai dung de nap cache giai ma chu ky YouTube (deno + player JS).
-    Neu khong, lan bam video DAU TIEN sau moi lan deploy mat ~20s o buoc nay. Tat bang YT_WARMUP=0."""
     time.sleep(float(os.environ.get("YT_WARMUP_DELAY", "25")))
     if _active_streams > 0 or _br_busy():
         return
@@ -3478,9 +3621,6 @@ def _warmup_once():
 
 
 def _keepalive_loop():
-    """Render Free ngu sau 15 phut khong co request; lan sau danh thuc mat 30-60s (phan lon ~40s truoc khung hinh dau).
-    Tu goi /healthz qua URL cong khai moi KEEPALIVE_SEC giay de giu server thuc.
-    Luu y: Free chi co 750 gio/thang CHUNG cho ca workspace -> chi bat o 1 service."""
     url = RELAY_URL.rstrip("/") + "/healthz"
     gap = max(60.0, float(os.environ.get("KEEPALIVE_SEC", "540")))
     time.sleep(60)
@@ -3500,6 +3640,6 @@ if __name__ == "__main__":
     if os.environ.get("YT_WARMUP", "1") == "1" and ROLE != "browser":
         threading.Thread(target=_warmup_once, daemon=True).start()
     print(f"[update] yt-dlp hien tai: {_ytdlp_version()} | auto_update={AUTO_UPDATE} moi {UPDATE_HOURS}h", flush=True)
-    if AUTO_UPDATE and ROLE != "browser":   # ROLE=browser khong dung yt-dlp: khong ton pip/khoi dong lai de cap nhat no
+    if AUTO_UPDATE and ROLE != "browser":
         threading.Thread(target=_update_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=PORT, threaded=True, request_handler=HTTP10RequestHandler)
