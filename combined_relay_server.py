@@ -108,7 +108,7 @@ def _clip_pct(s, n):
     i = s.rfind("%")
     return s[:i] if i != -1 and i > len(s) - 3 else s
 
-RELAY_URL = os.environ.get("RELAY_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "https://combined-relay-server-33xi.onrender.com"
+RELAY_URL = os.environ.get("RELAY_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "https://tiktokcasio.onrender.com"
 
 ROLE = os.environ.get("ROLE", "all").strip().lower()
 ROLE = {"youtube": "video", "yt": "video", "google": "browser", "gg": "browser"}.get(ROLE, ROLE)
@@ -156,18 +156,18 @@ def _role_gate():
         _last_req = time.monotonic()
     if ROLE == "video" and p.startswith("/br"):
         return "disabled on this server (ROLE=video)", 404
-    if ROLE == "browser" and p.startswith(("/stream", "/search", "/random")):
+    if ROLE == "browser" and p.startswith(("/stream", "/search", "/random", "/tt")):
         return "disabled on this server (ROLE=browser)", 404
     if p in ("/diag", "/myip") and not _tok_ok(request.args.get("k", ""), BR_TOKEN):
         return "forbidden - can dat BR_TOKEN tren server va them ?k=BR_TOKEN vao URL", 403
-    if STREAM_TOKEN and p.startswith(("/stream", "/search", "/random", "/tr")) \
+    if STREAM_TOKEN and p.startswith(("/stream", "/search", "/random", "/tr", "/tt")) \
             and not _tok_ok(request.args.get("tk", ""), STREAM_TOKEN):
         return "forbidden - them &tk=STREAM_TOKEN vao URL", 403
     if p.startswith(("/stream", "/search", "/random")):
         _br_last_activity = 0.0
         if KILL_ON_LEAVE and p.startswith("/search"):
             _kill_stream(_who())
-        _cr_close_async()
+        _cr_release_for_stream()
     return None
 
 
@@ -175,7 +175,7 @@ def _role_gate():
 def health_check():
 
     return (f"OK | role={ROLE} | {RELAY_URL} | AUDIO_RATE={AUDIO_RATE} MJPEG_Q={MJPEG_Q} FFMPEG_THREADS={FFMPEG_THREADS} "
-            f"cookies={'yes' if os.path.exists(COOKIES_FILE) else 'NO'} | browser={'token-ok' if os.environ.get('BR_TOKEN') else 'NO-TOKEN'} | engine={BR_ENGINE}{'(chromium dang chay)' if _cr is not None else ''} | build=gg2 | direct={'on' if YT_DIRECT and time.monotonic() >= _direct_off_until else 'off'} | mem={_mem_str()}"), 200
+            f"cookies={'yes' if os.path.exists(COOKIES_FILE) else 'NO'} | browser={'token-ok' if os.environ.get('BR_TOKEN') else 'NO-TOKEN'} | engine={BR_ENGINE}{'(chromium dang chay)' if _cr is not None else ''} | build=gg3-yt3 | direct={'on' if YT_DIRECT and time.monotonic() >= _direct_off_until else 'off'} | mem={_mem_str()}"), 200
 
 PORT = int(os.environ.get("PORT", "8000"))
 
@@ -518,14 +518,45 @@ def format_ffmpeg_headers(fmt):
     return "".join(f"{k}: {v}\r\n" for k, v in headers.items())
 
 
-_YT_ATTEMPTS_LITE = [
+_YT_ATTEMPTS_ALL = [
+    # (ten, player_client, dung_cookies, dung_js_runtime)
+    ("visionos",     ["visionos"],       False, False),
     ("android_vr",   ["android_vr"],     False, False),
+    ("web_embedded", ["web_embedded"],   False, False),
     ("tv",           ["tv"],             True,  True),
-    ("tv_simply",    ["tv_simply"],      False, False),
     ("mweb",         ["mweb"],           True,  True),
+    ("android",      ["android"],        False, False),
     ("runtime+ejs",  None,               True,  True),
 ]
-_YT_ATTEMPTS = _YT_ATTEMPTS_LITE
+
+
+def _ytdlp_client_table():
+    for mod in ("yt_dlp.extractor.youtube._base", "yt_dlp.extractor.youtube"):
+        try:
+            m = __import__(mod, fromlist=["INNERTUBE_CLIENTS"])
+            t = getattr(m, "INNERTUBE_CLIENTS", None)
+            if t:
+                return t
+        except Exception:
+            continue
+    return None
+
+
+def _build_attempts():
+    """Chi giu client ma ban yt-dlp dang cai biet (ban cu khong biet 'visionos' thi bo qua, khong ton luot)."""
+    if ROLE == "browser":
+        return _YT_ATTEMPTS_ALL
+    t = _ytdlp_client_table()
+    out = []
+    for a in _YT_ATTEMPTS_ALL:
+        if t is not None and a[1] and any(c not in t for c in a[1]):
+            continue
+        out.append(a)
+    return out or _YT_ATTEMPTS_ALL
+
+
+_YT_ATTEMPTS_LITE = _YT_ATTEMPTS_ALL
+_YT_ATTEMPTS = _build_attempts()
 _yt_preferred = None
 YT_BLOCK_BACKOFF = float(os.environ.get("YT_BLOCK_BACKOFF", "30"))
 YT_BLOCK_MAX = float(os.environ.get("YT_BLOCK_MAX", "900"))
@@ -737,6 +768,7 @@ def _rapid_streams(video_id, height_cap):
 
 RAPID_FAST_HOST = os.environ.get("RAPID_FAST_HOST", "youtube-video-fast-downloader-24-7.p.rapidapi.com").strip()
 RAPID_FAST_QUALITY = os.environ.get("RAPID_FAST_QUALITY", "18").strip()
+RAPID_FAST_QUALITY_LOW = os.environ.get("RAPID_FAST_QUALITY_LOW", "17").strip()
 RAPID_FILE_WAIT = float(os.environ.get("RAPID_FILE_WAIT", "45"))
 RAPID_API_TIMEOUT = float(os.environ.get("RAPID_API_TIMEOUT", "40"))
 RAPID_SKIP_413 = float(os.environ.get("RAPID_SKIP_413", "1800"))
@@ -771,21 +803,32 @@ def _rapid_note_failure(video_id, msg):
 def _rapid_fast_file(video_id):
     if not RAPID_KEY:
         raise ResolveError("chua dat RAPIDAPI_KEY")
-    api = (f"https://{RAPID_FAST_HOST}/download_video/{video_id}?"
-           + urllib.parse.urlencode({"quality": RAPID_FAST_QUALITY}))
-    req = urllib.request.Request(api, headers={
-        "x-rapidapi-host": RAPID_FAST_HOST,
-        "x-rapidapi-key": RAPID_KEY,
-        "User-Agent": UA,
-    })
-    try:
-        with urllib.request.urlopen(req, timeout=RAPID_API_TIMEOUT) as r:
-            data = json.loads(r.read(200_000).decode("utf-8", "replace"))
-    except urllib.error.HTTPError as e:
-        body = e.read(200).decode("utf-8", "replace")
-        raise ResolveError(f"RapidAPI HTTP {e.code}: {body}") from None
-    except (urllib.error.URLError, OSError, ValueError) as e:
-        raise ResolveError(f"RapidAPI loi mang: {str(e)[:100]}") from None
+    qualities = [RAPID_FAST_QUALITY]
+    if RAPID_FAST_QUALITY_LOW and RAPID_FAST_QUALITY_LOW not in qualities:
+        qualities.append(RAPID_FAST_QUALITY_LOW)
+    data = None
+    for qi, qual in enumerate(qualities):
+        api = (f"https://{RAPID_FAST_HOST}/download_video/{video_id}?"
+               + urllib.parse.urlencode({"quality": qual}))
+        req = urllib.request.Request(api, headers={
+            "x-rapidapi-host": RAPID_FAST_HOST,
+            "x-rapidapi-key": RAPID_KEY,
+            "User-Agent": UA,
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=RAPID_API_TIMEOUT) as r:
+                data = json.loads(r.read(200_000).decode("utf-8", "replace"))
+            if qi:
+                print(f"[rapid] chat luong {qualities[0]} qua lon -> dung chat luong thap {qual}", flush=True)
+            break
+        except urllib.error.HTTPError as e:
+            body = e.read(200).decode("utf-8", "replace")
+            if e.code == 413 and qi + 1 < len(qualities):
+                print(f"[rapid] HTTP 413 o chat luong {qual} -> thu chat luong thap hon", flush=True)
+                continue
+            raise ResolveError(f"RapidAPI HTTP {e.code}: {body}") from None
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            raise ResolveError(f"RapidAPI loi mang: {str(e)[:100]}") from None
 
     file_url = data.get("file") if isinstance(data, dict) else None
     if not file_url or not _url_is_public(file_url):
@@ -824,9 +867,106 @@ class _DirectFail(Exception):
     pass
 
 
-def _direct_ua():
-    return (f"com.google.android.apps.youtube.vr.oculus/{YT_DIRECT_VERSION} "
-            f"(Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip")
+YT_DIRECT_CLIENTS = [c.strip().lower() for c in os.environ.get(
+    "YT_DIRECT_CLIENTS", "visionos,android_vr,ios,android").split(",") if c.strip()]
+YT_DIRECT_PROBE = os.environ.get("YT_DIRECT_PROBE", "1") == "1"
+YT_DIRECT_CLIENT_DEAD = float(os.environ.get("YT_DIRECT_CLIENT_DEAD", "180"))
+_GEN_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+           "Chrome/130.0.0.0 Safari/537.36")
+# Gia tri du phong; neu yt-dlp dang cai co client cung ten thi lay cau hinh MOI NHAT tu yt-dlp (xem _dc_cfg)
+_DC_STATIC = {
+    "visionos": {"cid": 101, "client": {
+        "clientName": "VISIONOS", "clientVersion": "0.1", "deviceMake": "Apple",
+        "deviceModel": "RealityDevice14,1", "osName": "visionOS", "osVersion": "1.3.21O771"}},
+    "android_vr": {"cid": 28, "client": {
+        "clientName": "ANDROID_VR", "clientVersion": YT_DIRECT_VERSION, "deviceMake": "Oculus",
+        "deviceModel": "Quest 3", "osName": "Android", "osVersion": "12L", "androidSdkVersion": 32,
+        "userAgent": f"com.google.android.apps.youtube.vr.oculus/{YT_DIRECT_VERSION} "
+                     f"(Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"}},
+    "ios": {"cid": 5, "client": {
+        "clientName": "IOS", "clientVersion": "20.10.4", "deviceMake": "Apple", "deviceModel": "iPhone16,2",
+        "osName": "iPhone", "osVersion": "18.3.2.22D82",
+        "userAgent": "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)"}},
+    "android": {"cid": 3, "client": {
+        "clientName": "ANDROID", "clientVersion": "20.10.38", "osName": "Android", "osVersion": "11",
+        "androidSdkVersion": 30, "userAgent": "com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip"}},
+}
+_dc_dead = {}
+_dc_pref = None
+_yt_visitor = ""
+_yt_visitor_t = 0.0
+
+
+def _df(msg, hard=False):
+    e = _DirectFail(msg)
+    e.hard = hard
+    return e
+
+
+def _dc_cfg(key):
+    base = _DC_STATIC.get(key)
+    if not base:
+        return None
+    cfg = {"cid": base["cid"], "client": dict(base["client"])}
+    t = _ytdlp_client_table()
+    c = (t or {}).get(key)
+    if c:
+        try:
+            for k, v in ((c.get("INNERTUBE_CONTEXT") or {}).get("client") or {}).items():
+                if v not in (None, ""):
+                    cfg["client"][k] = v
+            cfg["cid"] = c.get("INNERTUBE_CONTEXT_CLIENT_NAME") or cfg["cid"]
+        except Exception:
+            pass
+    return cfg
+
+
+def _direct_opener():
+    if YT_PROXY:
+        return urllib.request.build_opener(urllib.request.ProxyHandler({"http": YT_PROXY, "https": YT_PROXY}))
+    return urllib.request.build_opener()
+
+
+def _dc_probe(url, ua, opener, key):
+    """googlevideo hay tra 403 o client nay du player tra URL OK -> thu 2 byte truoc khi giao cho ffmpeg."""
+    req = urllib.request.Request(url, headers={"User-Agent": ua, "Range": "bytes=0-1"})
+    try:
+        with opener.open(req, timeout=6) as r:
+            r.read(2)
+    except urllib.error.HTTPError as e:
+        raise _df(f"{key}: googlevideo HTTP {e.code}", hard=True) from None
+    except (urllib.error.URLError, OSError) as e:
+        raise _df(f"{key}: probe loi {str(e)[:50]}", hard=True) from None
+
+
+def _hls_pick(master, ua, opener, cap):
+    """Chon 1 bien the HLS co tieng (muxed) <= cap de ffmpeg khong tai ban nang nhat."""
+    req = urllib.request.Request(master, headers={"User-Agent": ua})
+    try:
+        with opener.open(req, timeout=YT_DIRECT_TIMEOUT) as r:
+            txt = r.read(600000).decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        raise _df(f"hls HTTP {e.code}", hard=True) from None
+    except (urllib.error.URLError, OSError) as e:
+        raise _df(f"hls loi mang: {str(e)[:50]}", hard=True) from None
+    if "#EXT-X-STREAM-INF" not in txt:
+        return master
+    lines = txt.splitlines()
+    cands = []
+    for i, ln in enumerate(lines):
+        if not ln.startswith("#EXT-X-STREAM-INF"):
+            continue
+        uri = next((x.strip() for x in lines[i + 1:i + 3] if x.strip() and not x.startswith("#")), "")
+        if not uri or not ("mp4a" in ln or "AUDIO=" not in ln):
+            continue
+        mh = re.search(r"RESOLUTION=\d+x(\d+)", ln)
+        mb = re.search(r"BANDWIDTH=(\d+)", ln)
+        cands.append((int(mh.group(1)) if mh else 0, int(mb.group(1)) if mb else 0, uri))
+    if not cands:
+        return master
+    ok = [c for c in cands if 0 < c[0] <= cap]
+    pick = max(ok, key=lambda c: (c[0], -c[1])) if ok else min(cands, key=lambda c: (c[0] or 99999, c[1]))
+    return urllib.parse.urljoin(master, pick[2])
 
 
 def _pick_direct_formats(data, height_cap):
@@ -873,45 +1013,78 @@ def _pick_direct_formats(data, height_cap):
     return None
 
 
-def _direct_streams(video_id, height_cap):
-    ua = _direct_ua()
+def _dc_try(key, video_id, height_cap, opener):
+    global _yt_visitor, _yt_visitor_t
+    cfg = _dc_cfg(key)
+    cl = dict(cfg["client"])
+    cl.setdefault("hl", "en")
+    cl.setdefault("gl", "US")
+    ua = cl.get("userAgent") or _GEN_UA
+    if _yt_visitor and time.monotonic() - _yt_visitor_t < 21600:
+        cl["visitorData"] = _yt_visitor
     body = {
-        "context": {"client": {
-            "clientName": "ANDROID_VR", "clientVersion": YT_DIRECT_VERSION,
-            "deviceMake": "Oculus", "deviceModel": "Quest 3", "osName": "Android", "osVersion": "12L",
-            "androidSdkVersion": 32, "userAgent": ua, "hl": "en", "gl": "US",
-        }},
+        "context": {"client": cl},
         "videoId": video_id,
         "contentCheckOk": True, "racyCheckOk": True,
         "playbackContext": {"contentPlaybackContext": {"html5Preference": "HTML5_PREF_WANTS"}},
     }
-    req = urllib.request.Request(
-        "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
-        data=json.dumps(body).encode("utf-8"), method="POST",
-        headers={"Content-Type": "application/json", "User-Agent": ua, "Origin": "https://www.youtube.com",
-                 "X-YouTube-Client-Name": "28", "X-YouTube-Client-Version": YT_DIRECT_VERSION})
+    hd = {"Content-Type": "application/json", "User-Agent": ua, "Origin": "https://www.youtube.com",
+          "X-YouTube-Client-Name": str(cfg["cid"]), "X-YouTube-Client-Version": str(cl.get("clientVersion", ""))}
+    if cl.get("visitorData"):
+        hd["X-Goog-Visitor-Id"] = cl["visitorData"]
+    req = urllib.request.Request("https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
+                                 data=json.dumps(body).encode("utf-8"), method="POST", headers=hd)
     try:
-        opener = (urllib.request.build_opener(urllib.request.ProxyHandler({"http": YT_PROXY, "https": YT_PROXY}))
-                  if YT_PROXY else urllib.request.build_opener())
         with opener.open(req, timeout=YT_DIRECT_TIMEOUT) as r:
             data = json.loads(r.read(3_000_000).decode("utf-8", "replace"))
     except urllib.error.HTTPError as e:
-        raise _DirectFail(f"HTTP {e.code}") from None
+        raise _df(f"{key}: HTTP {e.code}", hard=True) from None
     except (urllib.error.URLError, OSError, ValueError) as e:
-        raise _DirectFail(f"loi mang/JSON: {str(e)[:80]}") from None
+        raise _df(f"{key}: loi mang/JSON: {str(e)[:60]}", hard=True) from None
     if not isinstance(data, dict):
-        raise _DirectFail("phan hoi khong phai JSON object")
+        raise _df(f"{key}: phan hoi khong phai JSON object", hard=True)
+    vd = (data.get("responseContext") or {}).get("visitorData")
+    if isinstance(vd, str) and vd and (not _yt_visitor or time.monotonic() - _yt_visitor_t >= 21600):
+        _yt_visitor, _yt_visitor_t = vd, time.monotonic()
     ps = data.get("playabilityStatus") or {}
     if ps.get("status") != "OK":
         why = f"{ps.get('status', '?')}: {str(ps.get('reason') or '')[:100]}"
         if any(h in why for h in _NO_RETRY_STRONG):
             raise ResolveError(why, permanent=True)
-        raise _DirectFail(why)
-    pick = _pick_direct_formats(data, height_cap)
-    if not pick:
-        raise _DirectFail("khong co luong co URL (can PO token / SABR?)")
+        raise _df(f"{key}: {why}", hard=(ps.get("status") == "LOGIN_REQUIRED"))
     hdr = f"User-Agent: {ua}\r\n"
-    return pick[0], pick[1], hdr, (hdr if pick[1] else "")
+    pick = _pick_direct_formats(data, height_cap)
+    if pick:
+        if YT_DIRECT_PROBE:
+            _dc_probe(pick[0], ua, opener, key)
+        return pick[0], pick[1], hdr, (hdr if pick[1] else "")
+    hls = (data.get("streamingData") or {}).get("hlsManifestUrl")
+    if isinstance(hls, str) and hls.startswith("http"):
+        return _hls_pick(hls, ua, opener, int(height_cap)), None, hdr, ""
+    raise _df(f"{key}: khong co luong co URL (can PO token / SABR?)")
+
+
+def _direct_streams(video_id, height_cap):
+    """Thu lan luot cac client InnerTube (client chay duoc lan truoc dung dau). Tra (v_url, a_url, v_hdr, a_hdr)."""
+    global _dc_pref
+    opener = _direct_opener()
+    keys = [k for k in YT_DIRECT_CLIENTS if k in _DC_STATIC]
+    now = time.monotonic()
+    live = [k for k in keys if now >= _dc_dead.get(k, 0.0)] or keys
+    if _dc_pref in live:
+        live.sort(key=lambda k: k != _dc_pref)
+    errs = []
+    for k in live:
+        try:
+            res = _dc_try(k, video_id, height_cap, opener)
+            _dc_pref = k
+            _dc_dead.pop(k, None)
+            return res
+        except _DirectFail as e:
+            errs.append(str(e)[:90])
+            if getattr(e, "hard", False):
+                _dc_dead[k] = time.monotonic() + YT_DIRECT_CLIENT_DEAD
+    raise _DirectFail(" | ".join(errs)[:300] or "khong co client truc tiep nao")
 
 
 def _try_direct(video_id, height_cap):
@@ -944,28 +1117,160 @@ def _try_direct(video_id, height_cap):
 WARM_RAPID = os.environ.get("WARM_RAPID", "0") == "1"
 
 
+RAPID_STREAMS_ON = os.environ.get("RAPID_STREAMS", "1") == "1"
+_rs_off_until = 0.0
+ALT_ON = os.environ.get("ALT_FRONTENDS", "1") == "1"
+PIPED_API = [x.strip().rstrip("/") for x in os.environ.get(
+    "PIPED_API", "https://pipedapi.kavin.rocks,https://pipedapi.adminforge.de,https://api.piped.private.coffee"
+).split(",") if x.strip()]
+INVIDIOUS_API = [x.strip().rstrip("/") for x in os.environ.get(
+    "INVIDIOUS_API", "https://inv.nadeko.net,https://yewtu.be"
+).split(",") if x.strip()]
+ALT_TIMEOUT = float(os.environ.get("ALT_TIMEOUT", "8"))
+ALT_BUDGET = float(os.environ.get("ALT_BUDGET", "25"))
+ALT_COOLDOWN = float(os.environ.get("ALT_COOLDOWN", "300"))
+_alt_dead = {}
+_alt_lock = threading.Lock()
+
+
+def _rapid_streams_safe(video_id, height_cap):
+    """Goi _rapid_streams (host tra URL luong, khong tao file -> khong dinh 413)."""
+    global _rs_off_until
+    try:
+        return _rapid_streams(video_id, height_cap)
+    except ResolveError as e:
+        if any(f"HTTP {c}" in str(e) for c in (401, 402, 403, 429)):
+            _rs_off_until = time.monotonic() + RAPID_SKIP_QUOTA
+        raise
+
+
+def _alt_get_json(url):
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=ALT_TIMEOUT) as r:
+        return json.loads(r.read(3_000_000).decode("utf-8", "replace"))
+
+
+def _height_of(item):
+    h = item.get("height")
+    if isinstance(h, int):
+        return h
+    for k in ("resolution", "qualityLabel", "quality"):
+        mm = re.match(r"\s*(\d{3,4})p", str(item.get(k) or ""))
+        if mm:
+            return int(mm.group(1))
+    return 0
+
+
+def _pick_streams(video_items, audio_items, cap):
+    """video_items: dict(url, height, video_only, mime). audio_items: dict(url, bitrate)."""
+    hdr = f"User-Agent: {UA}\r\n"
+    comb = [v for v in video_items if not v["video_only"] and 0 < v["height"] <= cap]
+    if comb:
+        best = max(comb, key=lambda v: (v["height"], "avc1" in v["mime"] or "mp4" in v["mime"]))
+        return best["url"], None, hdr, ""
+    vids = [v for v in video_items if v["video_only"] and 0 < v["height"] <= cap]
+    if not vids or not audio_items:
+        raise ResolveError("khong co luong phu hop")
+    v = max(vids, key=lambda v: ("avc1" in v["mime"], v["height"]))
+    a = min(audio_items, key=lambda x: x.get("bitrate") or 0)
+    return v["url"], a["url"], hdr, hdr
+
+
+def _piped_try(base, video_id, cap):
+    d = _alt_get_json(f"{base}/streams/{video_id}")
+    if not isinstance(d, dict) or d.get("error"):
+        raise ResolveError(str((d or {}).get("message") if isinstance(d, dict) else d)[:80])
+    vi = [{"url": s["url"], "height": _height_of(s), "video_only": bool(s.get("videoOnly")),
+           "mime": str(s.get("mimeType", "")) + str(s.get("codec", ""))}
+          for s in (d.get("videoStreams") or []) if isinstance(s, dict) and s.get("url")]
+    ai = [{"url": s["url"], "bitrate": s.get("bitrate") or 0}
+          for s in (d.get("audioStreams") or []) if isinstance(s, dict) and s.get("url")]
+    return _pick_streams(vi, ai, cap)
+
+
+def _invidious_try(base, video_id, cap):
+    d = _alt_get_json(f"{base}/api/v1/videos/{video_id}?local=true")
+    if not isinstance(d, dict) or d.get("error"):
+        raise ResolveError(str((d or {}).get("error") if isinstance(d, dict) else d)[:80])
+    vi = []
+    for s in (d.get("formatStreams") or []):
+        if isinstance(s, dict) and s.get("url"):
+            vi.append({"url": s["url"], "height": _height_of(s), "video_only": False, "mime": str(s.get("type", ""))})
+    ai = []
+    for s in (d.get("adaptiveFormats") or []):
+        if not (isinstance(s, dict) and s.get("url")):
+            continue
+        t = str(s.get("type", ""))
+        if t.startswith("video/"):
+            vi.append({"url": s["url"], "height": _height_of(s), "video_only": True, "mime": t})
+        elif t.startswith("audio/"):
+            ai.append({"url": s["url"], "bitrate": int(s.get("bitrate") or 0)})
+    return _pick_streams(vi, ai, cap)
+
+
+def _alt_streams(video_id, height_cap):
+    """Thu lan luot cac instance Piped/Invidious (free, khong can key). Tra cung dinh dang nhu _rapid_streams."""
+    cap = int(height_cap)
+    t0 = time.monotonic()
+    errs = []
+    cands = [("piped", b, _piped_try) for b in PIPED_API] + [("invidious", b, _invidious_try) for b in INVIDIOUS_API]
+    for kind, base, fn in cands:
+        if time.monotonic() - t0 > ALT_BUDGET:
+            break
+        with _alt_lock:
+            if time.monotonic() < _alt_dead.get(base, 0.0):
+                continue
+        try:
+            res = fn(base, video_id, cap)
+            if not (_url_is_public(res[0]) and (not res[1] or _url_is_public(res[1]))):
+                raise ResolveError("URL khong hop le")
+            print(f"[alt] {kind} {base} OK cho {video_id}", flush=True)
+            return res
+        except Exception as e:
+            with _alt_lock:
+                _alt_dead[base] = time.monotonic() + ALT_COOLDOWN
+            errs.append(f"{kind}:{str(e)[:50]}")
+    raise ResolveError("khong instance Piped/Invidious nao dung duoc: " + " | ".join(errs)[:300])
+
+
 def _resolve_stream_urls_uncached(video_url, height_cap, background=False):
     m = _YT_ID_RE.search(video_url or "")
-    if m and _is_youtube(video_url):
+    is_yt = bool(m and _is_youtube(video_url))
+    if is_yt:
         _d = _try_direct(m.group(1), height_cap)
         if _d:
             return _d
-    use_rapid = bool(RAPID_KEY and m and _is_youtube(video_url)) and (WARM_RAPID or not background)
-
-    if use_rapid and _rapid_should_skip(m.group(1)):
-        print(f"[resolve] bo qua RapidAPI cho {m.group(1)} (vua that bai)", flush=True)
-        if RAPID_ONLY:
-            raise ResolveError("RapidAPI vua that bai cho video nay (RAPID_ONLY=1)")
-        use_rapid = False
+    use_rapid = bool(RAPID_KEY and is_yt) and (WARM_RAPID or not background)
+    rapid_err = None
 
     if use_rapid:
+        vid = m.group(1)
+        if RAPID_STREAMS_ON and time.monotonic() >= _rs_off_until:
+            try:
+                res = _rapid_streams_safe(vid, height_cap)
+                print(f"[resolve] RapidAPI (streams) OK cho {vid}", flush=True)
+                return res
+            except ResolveError as e:
+                print(f"[resolve] RapidAPI streams that bai: {str(e)[:200]}", flush=True)
+                rapid_err = e
+        if _rapid_should_skip(vid):
+            print(f"[resolve] bo qua RapidAPI file cho {vid} (vua that bai)", flush=True)
+        else:
+            try:
+                return _rapid_fast_file(vid)
+            except ResolveError as e:
+                print(f"[resolve] RapidAPI that bai: {str(e)[:200]}", flush=True)
+                _rapid_note_failure(vid, str(e))
+                rapid_err = e
+
+    if is_yt and ALT_ON and not background:
         try:
-            return _rapid_fast_file(m.group(1))
+            return _alt_streams(m.group(1), height_cap)
         except ResolveError as e:
-            print(f"[resolve] RapidAPI that bai: {str(e)[:200]}", flush=True)
-            _rapid_note_failure(m.group(1), str(e))
-            if background or RAPID_ONLY:
-                raise
+            print(f"[resolve] alt (Piped/Invidious) that bai: {str(e)[:200]}", flush=True)
+
+    if use_rapid and (background or RAPID_ONLY):
+        raise rapid_err or ResolveError("RapidAPI khong dung duoc (RAPID_ONLY=1)")
 
     if background:
         if not _resolve_gate.acquire(blocking=False):
@@ -1113,7 +1418,8 @@ def _idle_for(sec):
 
 
 AUTO_UPDATE = os.environ.get("YTDLP_AUTO_UPDATE", "1") == "1"
-UPDATE_HOURS = float(os.environ.get("YTDLP_UPDATE_HOURS", "12"))
+UPDATE_HOURS = float(os.environ.get("YTDLP_UPDATE_HOURS", "6"))
+YTDLP_CHANNEL = os.environ.get("YTDLP_CHANNEL", "nightly").strip().lower()
 _update_lock = threading.Lock()
 _last_update_try = 0.0
 
@@ -1135,7 +1441,7 @@ def _ver_tuple(v):
 
 def _ytdlp_latest():
     try:
-        req = urllib.request.Request("https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest",
+        req = urllib.request.Request(("https://api.github.com/repos/yt-dlp/yt-dlp-nightly-builds/releases/latest" if YTDLP_CHANNEL == "nightly" else "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest"),
                                      headers={"User-Agent": "relay-server", "Accept": "application/vnd.github+json"})
         with urllib.request.urlopen(req, timeout=10) as r:
             return json.loads(r.read(1_000_000).decode("utf-8", "replace")).get("tag_name") or None
@@ -1159,7 +1465,10 @@ def _update_ytdlp(min_gap=600):
             print(f"[update] RAM dang dung {mi[0]:.0f}/{mi[1]:.0f}MB, khong du cho pip -> de lan sau", flush=True)
             return False
         try:
-            cmd = [sys.executable, "-m", "pip", "install", "-U", "--no-cache-dir", "--quiet", "yt-dlp[default]"]
+            cmd = [sys.executable, "-m", "pip", "install", "-U", "--no-cache-dir", "--quiet"]
+            if YTDLP_CHANNEL == "nightly":
+                cmd.append("--pre")
+            cmd.append("yt-dlp[default]")
             if shutil.which("nice"):
                 cmd = ["nice", "-n", "19"] + cmd
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=YTDLP_PIP_TIMEOUT)
@@ -2063,7 +2372,7 @@ BR_MAX_IMG = int(os.environ.get("BR_MAX_IMG", "8"))
 BR_TIMEOUT = int(os.environ.get("BR_FETCH_TIMEOUT", "12"))
 BR_FONT_PX = int(os.environ.get("BR_FONT_PX", "13"))
 BR_SEARCH_URL = os.environ.get("BR_SEARCH_URL", "https://html.duckduckgo.com/html/?q=")
-BR_IMG_WAIT = float(os.environ.get("BR_IMG_WAIT", "2"))
+BR_IMG_WAIT = float(os.environ.get("BR_IMG_WAIT", "1"))
 BR_MAX_HTML = int(os.environ.get("BR_MAX_HTML", "700000"))
 BR_MAX_BLOCKS = int(os.environ.get("BR_MAX_BLOCKS", "1500"))
 BR_BUSY_SEC = float(os.environ.get("BR_BUSY_SEC", "20"))
@@ -3017,7 +3326,7 @@ def _submit(fi, bname=None, bval=None):
 BR_ENGINE = os.environ.get("BR_ENGINE", "auto").strip().lower()
 BR_CR_ZOOM = max(1.0, min(3.0, float(os.environ.get("BR_CR_ZOOM", "1.25"))))
 BR_CR_TIMEOUT = float(os.environ.get("BR_CR_TIMEOUT", "15"))
-BR_CR_IDLE = float(os.environ.get("BR_CR_IDLE", "120"))
+BR_CR_IDLE = float(os.environ.get("BR_CR_IDLE", "300"))
 BR_CR_MIN_MB = float(os.environ.get("BR_CR_MIN_MB", "900"))
 BR_CR_MEM_MAX = float(os.environ.get("BR_CR_MEM_MAX", "0.90"))
 BR_CR_RETRY = float(os.environ.get("BR_CR_RETRY", "120"))
@@ -3025,9 +3334,21 @@ BR_CR_SOFT = float(os.environ.get("BR_CR_SOFT", "0.80"))
 BR_CR_RECYCLE = int(os.environ.get("BR_CR_RECYCLE", "30"))
 BR_CR_JS_MB = int(os.environ.get("BR_CR_JS_MB", "128"))
 BR_CR_SINGLE = os.environ.get("BR_CR_SINGLE", "0") == "1"
+BR_CR_KEEP = os.environ.get("BR_CR_KEEP", "1") == "1"
+BR_CR_STREAM_FRAC = float(os.environ.get("BR_CR_STREAM_FRAC", "0.60"))
+BR_CR_STRICT_DNS = os.environ.get("BR_CR_STRICT_DNS", "0") == "1"
+BR_CR_LOAD_MS = int(float(os.environ.get("BR_CR_LOAD_WAIT", "1.2")) * 1000)
+BR_CR_NETIDLE_MS = int(float(os.environ.get("BR_CR_IDLE_WAIT", "0.25")) * 1000)
+BR_CR_TAP_WAIT_MS = int(os.environ.get("BR_CR_TAP_WAIT_MS", "120"))
+BR_CR_SCROLL_WAIT_MS = int(os.environ.get("BR_CR_SCROLL_WAIT_MS", "30"))
+_CR_BLOCK_TYPES = ("media", "font", "websocket", "eventsource", "manifest", "texttrack", "ping", "prefetch",
+                   "cspviolationreport")
 _CR_BLOCK_HOSTS = ("doubleclick.net", "googlesyndication.com", "googleadservices.com", "google-analytics.com",
                    "googletagmanager.com", "adservice.google.", "adnxs.com", "taboola.com", "outbrain.com",
-                   "scorecardresearch.com", "hotjar.com", "connect.facebook.net")
+                   "scorecardresearch.com", "hotjar.com", "connect.facebook.net", "amazon-adsystem.com",
+                   "criteo.", "moatads.com", "quantserve.com", "clarity.ms", "adsrvr.org", "pubmatic.com",
+                   "rubiconproject.com", "casalemedia.com", "googletagservices.com", "pagead2.", "adform.net",
+                   "mc.yandex.", "ads-twitter.com", "snap.licdn.com", "analytics.tiktok.com")
 
 _CR_INIT_JS = """(()=>{
 window.open=function(u){if(u){try{location.href=u}catch(e){}}return null;};
@@ -3041,6 +3362,53 @@ if(['button','submit','checkbox','radio','image','reset','file','range','color']
 if(t==='TEXTAREA'){const f=e.form,nm=(e.name||'').toLowerCase();
 if(f&&(e.rows<=1||['q','query','search','s'].includes(nm)||f.getAttribute('role')==='search'))return 'line';return 'multi';}
 if(e.isContentEditable)return 'multi';return null;}"""
+
+_CR_SB_JS = """(z)=>{const de=document.documentElement,sy=window.scrollY,tot=de.scrollHeight,ih=window.innerHeight;
+let b=document.getElementById('__rsb');
+if(tot>ih+4){if(!b){b=document.createElement('div');b.id='__rsb';const s=b.style;s.position='fixed';s.right='0';
+s.width=(2*z)+'px';s.background='#6e6e6e';s.zIndex='2147483647';s.pointerEvents='none';(document.body||de).appendChild(b);}
+const bh=Math.max(10*z,ih*ih/tot);b.style.height=bh+'px';b.style.top=(sy/(tot-ih)*(ih-bh))+'px';b.style.display='block';}
+else if(b){b.style.display='none';}
+return [sy,tot,ih];}"""
+
+
+def _jpeg_dims(b):
+    """(rong, cao) cua JPEG doc tu header, khong can giai ma."""
+    i, n = 2, len(b)
+    while i + 9 < n:
+        if b[i] != 0xFF:
+            i += 1
+            continue
+        m = b[i + 1]
+        if m in (0xC0, 0xC1, 0xC2):
+            return ((b[i + 7] << 8) | b[i + 8], (b[i + 5] << 8) | b[i + 6])
+        if m == 0xFF:
+            i += 1
+        elif m == 0x01 or 0xD0 <= m <= 0xD9:
+            i += 2
+        else:
+            i += 2 + ((b[i + 2] << 8) | b[i + 3])
+    return None
+
+
+def _host_quick_ok(host, url):
+    """Kiem tra nhe (khong DNS) cho tai nguyen phu; DNS day du chi ap dung khi dieu huong trang chinh."""
+    if not url.startswith(("http://", "https://")):
+        return False
+    host = (host or "").strip("[]").rstrip(".")
+    if not host:
+        return False
+    if ALLOW_PRIVATE_HOSTS:
+        return True
+    if host == "localhost" or host.endswith((".localhost", ".local", ".internal", ".localdomain", ".lan", ".home.arpa")):
+        return False
+    try:
+        a = ipaddress.ip_address(host.split("%")[0])
+    except ValueError:
+        return True
+    a = getattr(a, "ipv4_mapped", None) or a
+    return a.is_global
+
 
 _CR_PAGE_CSS = "body{font-family:sans-serif;margin:10px;font-size:15px}input{width:70%;font-size:15px;padding:4px}button{font-size:15px;padding:4px 8px}li{margin:6px 0}"
 
@@ -3090,7 +3458,8 @@ class _Chromium:
                 "--disable-background-networking", "--disable-sync", "--disable-default-apps", "--disable-translate",
                 "--disable-component-update", "--disable-breakpad", "--disable-notifications", "--mute-audio",
                 "--no-first-run", "--no-default-browser-check", "--metrics-recording-only", "--force-color-profile=srgb",
-                "--disable-features=TranslateUI,MediaRouter,AudioServiceOutOfProcess,OptimizationHints,Prerender2",
+                "--disable-features=TranslateUI,MediaRouter,AudioServiceOutOfProcess,OptimizationHints,Prerender2,"
+                "site-per-process,IsolateOrigins", "--disable-site-isolation-trials",
                 "--renderer-process-limit=1", "--disk-cache-size=1", "--media-cache-size=1",
                 "--js-flags=--max-old-space-size=%d" % BR_CR_JS_MB]
         if hasattr(os, "geteuid") and os.geteuid() == 0:
@@ -3103,7 +3472,7 @@ class _Chromium:
         except Exception as e:
             raise _CrUnavailable("khong mo duoc Chromium (da chay 'playwright install chromium'?): %s" % str(e)[:200])
         self.ctx = self.browser.new_context(
-            user_agent=UA, viewport={"width": 400, "height": 212}, device_scale_factor=1, accept_downloads=False,
+            user_agent=UA, viewport={"width": 400, "height": 212}, device_scale_factor=1.0 / BR_CR_ZOOM, accept_downloads=False,
             locale=os.environ.get("BR_CR_LOCALE", "vi-VN"), service_workers="block")
         self.ctx.set_default_timeout(BR_CR_TIMEOUT * 1000)
         self.ctx.add_init_script(_CR_INIT_JS)
@@ -3140,15 +3509,19 @@ class _Chromium:
             url = req.url
             if url.startswith(("data:", "blob:", "about:")):
                 return route.continue_()
-            if not _url_is_public(url):
-                return route.abort("blockedbyclient")
             rt = req.resource_type
-            if rt in ("media", "font") or (rt == "image" and not BR_IMAGES):
+            if rt in _CR_BLOCK_TYPES or (rt == "image" and not BR_IMAGES):
                 return route.abort()
             host = (urllib.parse.urlparse(url).hostname or "").lower()
             if any(h in host for h in _CR_BLOCK_HOSTS):
                 return route.abort()
-            if rt == "document" and req.is_navigation_request() and req.frame.parent_frame is None and _is_video_url(url):
+            top = rt == "document" and req.is_navigation_request() and req.frame.parent_frame is None
+            if top or BR_CR_STRICT_DNS:
+                if not _url_is_public(url):
+                    return route.abort("blockedbyclient")
+            elif not _host_quick_ok(host, url):
+                return route.abort("blockedbyclient")
+            if top and _is_video_url(url):
                 self.play = url
                 return route.fulfill(status=200, content_type="text/html; charset=utf-8", body=_cr_video_html(url))
             route.continue_()
@@ -3185,14 +3558,14 @@ class _Chromium:
 
     def settle(self):
         try:
-            self.page.wait_for_load_state("load", timeout=3000)
+            self.page.wait_for_load_state("load", timeout=BR_CR_LOAD_MS)
         except Exception:
             pass
         try:
-            self.page.wait_for_load_state("networkidle", timeout=800)
+            self.page.wait_for_load_state("networkidle", timeout=BR_CR_NETIDLE_MS)
         except Exception:
             pass
-        self.page.wait_for_timeout(120)
+        self.page.wait_for_timeout(40)
 
     def go(self, url):
         self.play, self.focus = None, None
@@ -3222,20 +3595,17 @@ class _Chromium:
 
     def shot(self, portrait):
         W, VH = (OUT_H, OUT_W) if portrait else (OUT_W, OUT_H)
-        raw = self.page.screenshot(type="jpeg", quality=80, caret="hide", animations="disabled")
+        pg = self.page
+        try:
+            pg.evaluate(_CR_SB_JS, BR_CR_ZOOM)
+        except Exception:
+            pass
+        raw = pg.screenshot(type="jpeg", quality=BR_JPEG_Q, caret="hide", animations="disabled")
+        if len(raw) <= MAX_JPEG and _jpeg_dims(raw) == (W, VH):
+            return raw
         im = Image.open(io.BytesIO(raw)).convert("RGB")
         if im.size != (W, VH):
             im = im.resize((W, VH), Image.LANCZOS)
-        try:
-            sy, total, ih = self.page.evaluate(
-                "()=>[window.scrollY,document.documentElement.scrollHeight,window.innerHeight]")
-        except Exception:
-            sy, total, ih = 0, 0, 1
-        if total > ih + 4:
-            d = ImageDraw.Draw(im)
-            bh = max(10, int(VH * ih / total))
-            by = int(min(1.0, sy / max(1.0, total - ih)) * (VH - bh))
-            d.rectangle((W - 2, by, W - 1, by + bh), fill=(110, 110, 110))
         q = BR_JPEG_Q
         while True:
             buf = io.BytesIO()
@@ -3259,7 +3629,7 @@ class _Chromium:
             self.play = None
             old = pg.url
             pg.mouse.click(px * z, py * z)
-            pg.wait_for_timeout(250)
+            pg.wait_for_timeout(BR_CR_TAP_WAIT_MS)
             if pg.url != old:
                 self.home = False
                 self.navs += 1
@@ -3268,12 +3638,11 @@ class _Chromium:
         elif action == "scroll":
             dy = _f(a, "dy") * z
             if dy:
-                before = pg.evaluate("window.scrollY")
-                pg.evaluate("d=>window.scrollBy({top:d,behavior:'instant'})", dy)
-                if pg.evaluate("window.scrollY") == before:
+                moved = pg.evaluate("d=>{const b=window.scrollY;window.scrollBy({top:d,behavior:'instant'});return window.scrollY-b}", dy)
+                if not moved:
                     pg.mouse.move(self.vp[0] / 2, self.vp[1] / 2)
                     pg.mouse.wheel(0, dy)
-                pg.wait_for_timeout(80)
+                pg.wait_for_timeout(BR_CR_SCROLL_WAIT_MS)
         elif action == "type":
             t = (a.get("t") or "")[:300]
             if t and self.focus:
@@ -3345,6 +3714,25 @@ def _cr_close_async(resume=False):
             _cr_pool.submit(c.close)
         except Exception:
             pass
+
+
+def _cr_release_for_stream():
+    """Truoc day moi lan xem video/tim kiem deu tat Chromium -> lan quay lai phai khoi dong lai (lag vai giay)."""
+    if not BR_CR_KEEP or _mem_frac() > BR_CR_STREAM_FRAC:
+        _cr_close_async(resume=True)
+
+
+def _cr_prewarm():
+    global _cr, _cr_reaper_on
+    if _cr is not None or not _cr_enabled() or _mem_frac() > BR_CR_SOFT:
+        return
+    c = _Chromium()
+    _cr_run(c.start)
+    _cr = c
+    if not _cr_reaper_on:
+        _cr_reaper_on = True
+        threading.Thread(target=_cr_reaper, daemon=True).start()
+    print("[br] chromium khoi dong san", flush=True)
 
 
 def _cr_reaper():
@@ -3499,7 +3887,7 @@ def br_play():
     if "://" not in url:
         url = "https://" + url
     print(f"[br] play {url}", flush=True)
-    _cr_close_async()
+    _cr_release_for_stream()
     return _stream_impl(url)
 
 
@@ -3601,6 +3989,8 @@ def _prewarm_browser():
         if _sess is not None:
             u = urllib.parse.urlsplit(BR_SEARCH_URL)
             _sess.head(f"{u.scheme}://{u.netloc}/", timeout=6)
+        if os.environ.get("BR_CR_PREWARM", "1" if ROLE == "browser" else "0") == "1":
+            _cr_prewarm()
         print("[br] prewarm xong", flush=True)
     except Exception as e:
         _cause = repr(getattr(e, "__cause__", None) or getattr(e, "__context__", None) or "")
@@ -3660,6 +4050,310 @@ def _pot_selfcheck():
             print(f"[pot] LOI: script-deno that bai rc={r.returncode} stdout={out} stderr={err}", flush=True)
     except Exception as e:
         print(f"[pot] LOI: khong chay duoc deno: {type(e).__name__}: {str(e)[:200]}", flush=True)
+
+
+
+# =====================================================================
+#  UNG DUNG TIKTOK (/tt/*) - man hinh ngang kieu iPad tren T-Display S3
+#  /tt/feed     danh sach video (tac gia, mo ta, tim, binh luan, link stream, link anh bia)
+#  /tt/thumb    anh bia da cat/thu nho dung kich thuoc man hinh (JPEG nho)
+#  /tt/comments binh luan (best-effort, phu thuoc yt-dlp)
+#  Phat video: dung /stream co san, link da duoc ghep san trong truong "stream".
+# =====================================================================
+TT_FEED_WAIT = float(os.environ.get("TT_FEED_WAIT", "7"))
+TT_META_TTL = float(os.environ.get("TT_META_TTL", "21600"))
+TT_PAGE_TTL = float(os.environ.get("TT_PAGE_TTL", "900"))
+TT_PAGE_MAX = int(os.environ.get("TT_PAGE_MAX", "20"))
+TT_MAX_META = int(os.environ.get("TT_MAX_META", "400"))
+_TT_ID = re.compile(r"/video/(\d{6,25})")
+_TT_HOST = re.compile(r"^https?://([a-z0-9-]+\.)*tiktok\.com(/|$)", re.I)
+_TT_USER_PAGE = re.compile(r"^https?://([a-z0-9-]+\.)*tiktok\.com/@[^/?#]+/?(\?.*)?$", re.I)
+_TT_NAME = re.compile(r"^[A-Za-z0-9._]{1,40}$")
+_tt_meta = {}
+_tt_pages = {}
+_tt_inflight = {}
+_tt_comments = {}
+_tt_thumbs = {}
+_tt_lock = threading.Lock()
+_tt_gate = threading.BoundedSemaphore(2)
+_tt_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="tt")
+
+
+def _tt_n(v):
+    """12345 -> '12.3K' cho vua man hinh nho."""
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        return ""
+    if n >= 1_000_000_000:
+        return f"{n / 1e9:.1f}B".replace(".0B", "B")
+    if n >= 1_000_000:
+        return f"{n / 1e6:.1f}M".replace(".0M", "M")
+    if n >= 1000:
+        return f"{n / 1e3:.1f}K".replace(".0K", "K")
+    return str(n)
+
+
+def _tt_key(url):
+    m = _TT_ID.search(url or "")
+    return m.group(1) if m else (url or "")
+
+
+def _tt_ydl(flat=False):
+    o = {"quiet": True, "no_warnings": True, "skip_download": True, "socket_timeout": 10,
+         "retries": 1, "extractor_retries": 1, "noplaylist": not flat}
+    if flat:
+        o["extract_flat"] = True
+        o["playlistend"] = TT_PAGE_MAX
+    return o
+
+
+def _tt_stub(url):
+    return {"id": _tt_key(url), "url": url, "author": "", "handle": "", "title": "", "likes": None,
+            "comments": None, "shares": None, "views": None, "dur": 0, "thumb_src": "", "ready": False}
+
+
+def _tt_item(info, url):
+    uid = info.get("uploader_id")
+    return {
+        "id": str(info.get("id") or _tt_key(url)),
+        "url": info.get("webpage_url") or url,
+        "author": str(info.get("uploader") or info.get("channel") or "")[:40],
+        "handle": ("@" + str(uid)) if uid else "",
+        "title": str(info.get("description") or info.get("title") or "")[:220],
+        "likes": info.get("like_count"), "comments": info.get("comment_count"),
+        "shares": info.get("repost_count"), "views": info.get("view_count"),
+        "dur": int(info.get("duration") or 0), "thumb_src": str(info.get("thumbnail") or ""), "ready": True,
+    }
+
+
+def _tt_store(key, item, ttl_left=None):
+    ts = time.monotonic() if ttl_left is None else time.monotonic() - TT_META_TTL + ttl_left
+    with _tt_lock:
+        if len(_tt_meta) >= TT_MAX_META:
+            for k in sorted(_tt_meta, key=lambda k: _tt_meta[k][0])[:TT_MAX_META // 4]:
+                _tt_meta.pop(k, None)
+        _tt_meta[key] = (ts, item)
+        if item.get("id") and item["id"] != key and item.get("ready"):
+            _tt_meta[item["id"]] = (ts, item)
+
+
+def _tt_fetch_meta(url, key):
+    try:
+        with _tt_gate:
+            with yt_dlp.YoutubeDL(_tt_ydl()) as ydl:
+                info = ydl.extract_info(url, download=False)
+        if info and "entries" in info:
+            info = next((e for e in (info.get("entries") or []) if e), None)
+        if not info:
+            raise RuntimeError("khong co thong tin")
+        item = _tt_item(info, url)
+        _tt_store(key, item)
+        return item
+    except Exception as e:
+        print(f"[tt] loi meta {key}: {str(e)[:120]}", flush=True)
+        item = _tt_stub(url)
+        _tt_store(key, item, ttl_left=120)
+        return item
+
+
+def _tt_meta_future(url):
+    key = _tt_key(url)
+    with _tt_lock:
+        hit = _tt_meta.get(key)
+        if hit and time.monotonic() - hit[0] < TT_META_TTL:
+            f = concurrent.futures.Future()
+            f.set_result(hit[1])
+            return f
+        f = _tt_inflight.get(key)
+        if f is not None:
+            return f
+        f = _tt_inflight[key] = _tt_pool.submit(_tt_fetch_meta, url, key)
+    f.add_done_callback(lambda _f, k=key: _tt_inflight.pop(k, None))
+    return f
+
+
+def _tt_expand(src):
+    """Dong trong playlist co the la link video hoac trang nguoi dung (@ten) -> danh sach link video."""
+    if not _TT_USER_PAGE.match(src):
+        return [src]
+    now = time.monotonic()
+    with _tt_lock:
+        hit = _tt_pages.get(src)
+    if hit and now - hit[0] < TT_PAGE_TTL:
+        return hit[1]
+    urls = []
+    try:
+        with _tt_gate:
+            with yt_dlp.YoutubeDL(_tt_ydl(flat=True)) as ydl:
+                info = ydl.extract_info(src, download=False)
+        for e in (info or {}).get("entries") or []:
+            u = (e or {}).get("url") or (e or {}).get("webpage_url") or ""
+            if _TT_HOST.match(u) and _TT_ID.search(u):
+                urls.append(u)
+    except Exception as e:
+        print(f"[tt] loi trang nguoi dung {src}: {str(e)[:120]}", flush=True)
+    with _tt_lock:
+        _tt_pages[src] = (now if urls else now - TT_PAGE_TTL + 60, urls)
+        if len(_tt_pages) > 60:
+            _tt_pages.pop(next(iter(_tt_pages)), None)
+    return urls
+
+
+def _tt_arg(name, default, lo, hi):
+    try:
+        return max(lo, min(hi, int(request.args.get(name, default))))
+    except (TypeError, ValueError):
+        return default
+
+
+def _tt_public(item, w, h, fps, tw, th):
+    q = urllib.parse.quote(item["url"], safe="")
+    return {
+        "id": item["id"], "url": item["url"], "ready": item["ready"],
+        "author": item["author"], "handle": item["handle"], "title": item["title"],
+        "likes": _tt_n(item["likes"]), "comments": _tt_n(item["comments"]),
+        "shares": _tt_n(item["shares"]), "views": _tt_n(item["views"]), "dur": item["dur"],
+        "stream": f"/stream?url={q}&w={w}&h={h}&fps={fps}&height_cap=480",
+        "thumb": f"/tt/thumb?u={q}&w={tw}&h={th}",
+        "comments_url": f"/tt/comments?u={q}",
+    }
+
+
+@app.route("/tt/feed")
+def tt_feed():
+    n = _tt_arg("n", 6, 1, 12)
+    w = _tt_arg("w", 96, 16, 320)
+    h = _tt_arg("h", 170, 16, 320)
+    w -= w % 2
+    h -= h % 2
+    fps = _tt_arg("fps", 12, 1, 30)
+    tw = _tt_arg("tw", 54, 16, 320)
+    th = _tt_arg("th", 96, 16, 320)
+    seen = {x for x in request.args.get("seen", "").split(",") if x}
+    user = request.args.get("user", "").strip().lstrip("@")
+    if user:
+        if not _TT_NAME.match(user):
+            return jsonify({"error": "ten nguoi dung khong hop le"}), 400
+        sources = [f"https://www.tiktok.com/@{user}"]
+    else:
+        sources = load_playlist()
+        if not sources:
+            return jsonify({"error": f"chua co file {os.path.basename(PLAYLIST_FILE)} (moi dong 1 link TikTok hoac trang @nguoidung)"}), 404
+        random.shuffle(sources)
+    sources = [x for x in sources if _TT_HOST.match(x) or "tiktok" in x][:4] or sources[:4]
+    exps = [_tt_pool.submit(_tt_expand, x) for x in sources]
+    concurrent.futures.wait(exps, timeout=TT_FEED_WAIT + 3)
+    cands, dup = [], set()
+    for f in exps:
+        try:
+            urls = f.result(timeout=0) if f.done() else []
+        except Exception:
+            urls = []
+        urls = list(urls)
+        random.shuffle(urls)
+        for u in urls:
+            k = _tt_key(u)
+            if k in seen or k in dup or not _url_is_public(u):
+                continue
+            dup.add(k)
+            cands.append(u)
+    random.shuffle(cands)
+    cands = cands[:n]
+    futs = [_tt_meta_future(u) for u in cands]
+    concurrent.futures.wait(futs, timeout=TT_FEED_WAIT)
+    items = []
+    for u, f in zip(cands, futs):
+        try:
+            it = f.result(timeout=0) if f.done() else _tt_stub(u)
+        except Exception:
+            it = _tt_stub(u)
+        items.append(_tt_public(it, w, h, fps, tw, th))
+    return jsonify({"items": items})
+
+
+def _tt_cover(im, w, h):
+    r = max(w / im.width, h / im.height)
+    nw, nh = max(w, int(im.width * r + 0.5)), max(h, int(im.height * r + 0.5))
+    im = im.resize((nw, nh), Image.BILINEAR)
+    x0, y0 = (nw - w) // 2, (nh - h) // 2
+    return im.crop((x0, y0, x0 + w, y0 + h))
+
+
+@app.route("/tt/thumb")
+def tt_thumb():
+    if not _PIL_OK:
+        return Response("thieu Pillow", 503)
+    url = (request.args.get("u") or "").strip()
+    if not (_TT_HOST.match(url) and _url_is_public(url)):
+        return Response("link khong hop le", 400)
+    w = _tt_arg("w", 54, 16, 320)
+    h = _tt_arg("h", 96, 16, 320)
+    ck = (_tt_key(url), w, h)
+    with _tt_lock:
+        jpg = _tt_thumbs.get(ck)
+    if jpg is None:
+        try:
+            item = _tt_meta_future(url).result(timeout=25)
+            src = item.get("thumb_src")
+            if not src:
+                return Response("khong co anh bia", 404)
+            _, _, _, raw = _http(src, limit=800000, timeout=6)
+            im = _decode_image(raw)
+            if im is None:
+                return Response("khong doc duoc anh", 502)
+            im = _tt_cover(im, w, h)
+        except Exception as e:
+            print(f"[tt] loi anh bia: {str(e)[:100]}", flush=True)
+            return Response("loi anh bia", 502)
+        q = 72
+        while True:
+            buf = io.BytesIO()
+            im.save(buf, "JPEG", quality=q)
+            if buf.tell() <= 14000 or q <= 30:
+                break
+            q -= 10
+        jpg = buf.getvalue()
+        with _tt_lock:
+            if len(_tt_thumbs) >= 80:
+                _tt_thumbs.pop(next(iter(_tt_thumbs)), None)
+            _tt_thumbs[ck] = jpg
+    return Response(jpg, mimetype="image/jpeg", headers={"Cache-Control": "public, max-age=3600"})
+
+
+@app.route("/tt/comments")
+def tt_comments():
+    url = (request.args.get("u") or "").strip()
+    if not (_TT_HOST.match(url) and _url_is_public(url)):
+        return jsonify({"error": "link khong hop le"}), 400
+    n = _tt_arg("n", 8, 1, 20)
+    key = _tt_key(url)
+    with _tt_lock:
+        hit = _tt_comments.get(key)
+    if hit and time.monotonic() - hit[0] < 1800:
+        return jsonify({"items": hit[1][:n], "supported": hit[2]})
+    items, supported = [], True
+    try:
+        o = _tt_ydl()
+        o["getcomments"] = True
+        with _tt_gate:
+            with yt_dlp.YoutubeDL(o) as ydl:
+                info = ydl.extract_info(url, download=False)
+        cm = (info or {}).get("comments")
+        if cm is None:
+            supported = False
+        else:
+            for c in cm[:20]:
+                items.append({"user": str(c.get("author") or "")[:30], "text": str(c.get("text") or "")[:160],
+                              "likes": _tt_n(c.get("like_count"))})
+    except Exception as e:
+        print(f"[tt] loi binh luan {key}: {str(e)[:120]}", flush=True)
+        supported = False
+    with _tt_lock:
+        if len(_tt_comments) > 60:
+            _tt_comments.pop(next(iter(_tt_comments)), None)
+        _tt_comments[key] = (time.monotonic(), items, supported)
+    return jsonify({"items": items[:n], "supported": supported})
 
 
 _bg_started = False
