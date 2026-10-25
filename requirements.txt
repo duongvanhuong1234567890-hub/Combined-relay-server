@@ -1,5 +1,7 @@
-flask>=3.0
-gunicorn>=22.0
+flask>=3.0,<4
+gunicorn>=22.0,<24
+requests>=2.31
+# yt-dlp chua ghim: server tu cap nhat ban nightly luc chay (YTDLP_AUTO_UPDATE). Renovate khong theo doi dong nay.
 yt-dlp[default]
 bgutil-ytdlp-pot-provider==2.0.2
 playwright>=1.45

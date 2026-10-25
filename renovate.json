@@ -11,6 +11,14 @@
       "matchStrings": ["ARG BGUTIL_TAG=(?<currentValue>[0-9][^\\s]*)"],
       "depNameTemplate": "Brainicism/bgutil-ytdlp-pot-provider",
       "datasourceTemplate": "github-tags"
+    },
+    {
+      "customType": "regex",
+      "fileMatch": ["(^|/)Dockerfile$"],
+      "matchStrings": ["ARG WGCF_VERSION=(?<currentValue>[0-9][^\\s]*)"],
+      "depNameTemplate": "ViRb3/wgcf",
+      "datasourceTemplate": "github-releases",
+      "extractVersionTemplate": "^v(?<version>.*)$"
     }
   ],
   "packageRules": [

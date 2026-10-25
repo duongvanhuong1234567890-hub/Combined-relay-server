@@ -25,7 +25,7 @@ import logging
 import builtins
 
 LOG_VERBOSE = os.environ.get("LOG_VERBOSE", "0") == "1"
-_LOG_KEEP = ("[tt]", "[pot]", "[dl-slow]", "loi", "error", "canh bao", "khong tim thay", "[proof]", "blocked", "traceback", "exception")
+_LOG_KEEP = ("[tt]", "[pot]", "[dl-slow]", "loi", "error", "canh bao", "khong tim thay", "[proof]", "blocked", "traceback", "exception", "ket thuc")
 _real_print = builtins.print
 
 
@@ -96,8 +96,9 @@ def _warp_start():
         if not arch:
             _warp_log(f"loi: kien truc khong ho tro: {platform.machine()}")
             return
-        wp = os.path.join(_WARP_DIR, "wireproxy")
-        wg = os.path.join(_WARP_DIR, "wgcf")
+        # Uu tien ban da cai san trong image (Dockerfile); chi tai ve /tmp neu khong co
+        wp = shutil.which("wireproxy") or os.path.join(_WARP_DIR, "wireproxy")
+        wg = shutil.which("wgcf") or os.path.join(_WARP_DIR, "wgcf")
         if not os.path.exists(wp):
             tgz = wp + ".tgz"
             _warp_fetch(f"https://github.com/pufferffish/wireproxy/releases/latest/download/wireproxy_linux_{arch}.tar.gz", tgz)
@@ -262,6 +263,11 @@ if ROLE == "browser":
 else:
     import yt_dlp
 STREAM_TOKEN = os.environ.get("STREAM_TOKEN", "").strip()
+# Mac dinh DONG: neu khong dat STREAM_TOKEN thi /stream /search /tr tra 503 (tranh ai cung dung/giet luong).
+# Chi dat ALLOW_OPEN_STREAM=1 khi chu y muon server mo cong khai.
+ALLOW_OPEN_STREAM = os.environ.get("ALLOW_OPEN_STREAM", "0") == "1"
+if not STREAM_TOKEN and not ALLOW_OPEN_STREAM:
+    print("[config] canh bao: chua dat STREAM_TOKEN -> /stream /search /tr bi khoa (503)", flush=True)
 
 
 def _tok_ok(given, expected):
@@ -299,13 +305,15 @@ def _role_gate():
         return "disabled on this server (ROLE=browser)", 404
     if p in ("/diag", "/myip") and not _tok_ok(request.args.get("k", ""), BR_TOKEN):
         return "forbidden - can dat BR_TOKEN tren server va them ?k=BR_TOKEN vao URL", 403
-    if STREAM_TOKEN and p.startswith(("/stream", "/search", "/tr")) \
-            and not _tok_ok(request.args.get("tk", ""), STREAM_TOKEN):
-        return "forbidden - them &tk=STREAM_TOKEN vao URL", 403
+    if p.startswith(("/stream", "/search", "/tr")):
+        if not STREAM_TOKEN and not ALLOW_OPEN_STREAM:
+            return "chua dat STREAM_TOKEN tren server - dat bien STREAM_TOKEN hoac ALLOW_OPEN_STREAM=1", 503
+        if STREAM_TOKEN and not _tok_ok(request.args.get("tk", ""), STREAM_TOKEN):
+            return "forbidden - them &tk=STREAM_TOKEN vao URL", 403
     if p.startswith(("/stream", "/search")):
+        # Khong giet luong dang phat khi co /search: thiet bi van duyet menu trong luc video chay.
+        # Client ngat ket noi se duoc phat hien qua GeneratorExit / call_on_close (_reap).
         _br_last_activity = 0.0
-        if KILL_ON_LEAVE and p.startswith("/search"):
-            _kill_stream(_who())
         _cr_release_for_stream()
     return None
 
@@ -433,6 +441,8 @@ STREAM_SRC_AUTO = os.environ.get("STREAM_SRC_AUTO", "1") == "1"
 STREAM_NICE = int(os.environ.get("STREAM_NICE", "5"))
 STREAM_READRATE = float(os.environ.get("STREAM_READRATE", "1.4"))
 STREAM_READ_BURST = float(os.environ.get("STREAM_READ_BURST", "4"))
+# Gioi han "lead" (giay video da gui vuot qua thoi gian thuc). 0 = tat. Chong day du lieu don len phia truoc.
+STREAM_MAX_LEAD = float(os.environ.get("STREAM_MAX_LEAD", "12"))
 _ff_caps = None
 
 
@@ -1409,6 +1419,9 @@ def _resolve_stream_urls_uncached(video_url, height_cap, background=False):
                 return res
             except Exception as e:
                 yt_first_err = e
+                if isinstance(e, ResolveError) and e.permanent:
+                    print(f"[resolve] yt-dlp (thu truoc) loi vinh vien, khong thu cach khac: {str(e)[:200]}", flush=True)
+                    raise
                 print(f"[resolve] yt-dlp (thu truoc) that bai sau {time.monotonic() - t_yf:.1f}s: {str(e)[:200]} -> thu RapidAPI", flush=True)
             finally:
                 _resolve_gate.release()
@@ -1587,6 +1600,16 @@ def _who():
         return "?"
 
 
+FIRST_BYTE_WAIT = float(os.environ.get("FIRST_BYTE_WAIT", "25"))
+
+
+def _kill_quiet(p):
+    try:
+        p.kill()
+    except Exception:
+        pass
+
+
 def _kill_stream(why=""):
     global _cur_proc
     with _cur_lock:
@@ -1599,8 +1622,36 @@ def _kill_stream(why=""):
             pass
 
 
+_STREAM_MARK = "/tmp/relay_stream_%d" % os.getpid()
+
+
+def _mark_stream(on=True):
+    """Danh dau 'dang co luong phat' bang file (moi worker gunicorn 1 file) de worker khac biet."""
+    try:
+        if on:
+            with open(_STREAM_MARK, "a"):
+                os.utime(_STREAM_MARK, None)
+        elif os.path.exists(_STREAM_MARK):
+            os.remove(_STREAM_MARK)
+    except OSError:
+        pass
+
+
+def _stream_elsewhere(max_age=60):
+    try:
+        import glob
+        now = time.time()
+        for f in glob.glob("/tmp/relay_stream_*"):
+            if f != _STREAM_MARK and now - os.path.getmtime(f) < max_age:
+                return True
+    except OSError:
+        pass
+    return False
+
+
 def _idle_for(sec):
-    return _active_streams == 0 and not _br_busy() and time.monotonic() - _last_req >= sec
+    return (_active_streams == 0 and not _stream_elsewhere() and not _br_busy()
+            and time.monotonic() - _last_req >= sec)
 
 
 AUTO_UPDATE = os.environ.get("YTDLP_AUTO_UPDATE", "1") == "1"
@@ -1916,8 +1967,9 @@ TURBO = os.environ.get("TURBO", "1") == "1"
 TURBO_WORKERS = max(1, _env_int("TURBO_WORKERS", 5))
 TURBO_CHUNK = max(64, _env_int("TURBO_CHUNK_KB", 512)) * 1024
 TURBO_HEAD = 128 * 1024
+TURBO_MAX_FAIL = max(2, _env_int("TURBO_MAX_FAIL", 6))
 TURBO_HEAD_N = 8
-TURBO_AHEAD = max(4, _env_int("TURBO_AHEAD_MB", 20) * 1024 * 1024 // TURBO_CHUNK + TURBO_HEAD_N)
+TURBO_AHEAD = max(4, _env_int("TURBO_AHEAD_MB", 8) * 1024 * 1024 // TURBO_CHUNK + TURBO_HEAD_N)
 _LOCAL_IPS = ("127.0.0.1", "::1", "::ffff:127.0.0.1")
 _fetchers = {}
 
@@ -1954,6 +2006,7 @@ class _Fetcher:
         self.buf, self.inflight = {}, set()
         self.cond = threading.Condition()
         self.cursor, self.closed, self.err = 0, False, None
+        self.fails = {}  # idx -> (so lan loi lien tiep, loi cuoi)
         self.t0, self.dl_bytes, self.wait_s = time.monotonic(), 0, 0.0
         for _ in range(TURBO_WORKERS):
             threading.Thread(target=self._work, daemon=True).start()
@@ -1999,6 +2052,8 @@ class _Fetcher:
         r = c.getresponse()
         data = r.read()
         if r.status != 206 or len(data) != b - a + 1:
+            if r.status in (401, 403, 410):
+                self.err = RuntimeError(f"HTTP {r.status} (URL het han/bi khoa)")  # loi cung: khong the thu lai
             raise RuntimeError(f"HTTP {r.status}, {len(data)}/{b - a + 1}B")
         return data
 
@@ -2020,6 +2075,7 @@ class _Fetcher:
                     continue
                 self.inflight.add(idx)
             data = None
+            last = None
             for attempt in range(3):
                 try:
                     if c is None:
@@ -2040,10 +2096,14 @@ class _Fetcher:
                     if not self.closed:
                         self.buf[idx] = data
                         self.dl_bytes += len(data)
-                        self.err = None
+                        self.fails.pop(idx, None)
                 else:
-                    self.err = last
+                    n = self.fails.get(idx, (0, None))[0] + 1
+                    self.fails[idx] = (n, last)
                 self.cond.notify_all()
+            if data is None:
+                # chunk loi -> _next() se tu xep hang lai; lui dan de khong don dap googlevideo
+                time.sleep(min(3.0, 0.4 * self.fails.get(idx, (1, None))[0]))
         try:
             c and c.close()
         except Exception:
@@ -2060,8 +2120,13 @@ class _Fetcher:
                 self.cond.notify_all()
             _tw = time.monotonic()
             while idx not in self.buf:
-                if self.closed or self.err:
+                if self.closed:
+                    raise RuntimeError("fetcher da dong")
+                if self.err:  # 401/403/410: URL googlevideo het han
                     raise RuntimeError(f"tai loi: {self.err}")
+                nf, le = self.fails.get(idx, (0, None))
+                if nf >= TURBO_MAX_FAIL:
+                    raise RuntimeError(f"tai loi chunk {idx} {nf} lan: {le}")
                 if time.monotonic() > deadline:
                     raise TimeoutError("het gio cho chunk")
                 self.cond.wait(0.5)
@@ -2149,7 +2214,8 @@ def turbo_src(sid):
                 piece = f.get(pos, min(b - pos + 1, 256 * 1024))
                 pos += len(piece)
                 yield piece
-        except Exception:
+        except Exception as e:
+            print(f"[turbo] loi nguon, cat luong tai byte {pos}/{size}: {str(e)[:120]}", flush=True)
             return
     return Response(gen(), status=status, headers=hd)
 
@@ -2351,10 +2417,15 @@ def _stream_impl(video_url):
             fcntl.fcntl(proc.stdout.fileno(), 1031, 1 << 20)
         except Exception:
             pass
+        wd = threading.Timer(FIRST_BYTE_WAIT, _kill_quiet, (proc,))
+        wd.daemon = True
+        wd.start()
         try:
             first = proc.stdout.read1(65536)
         except Exception:
             first = b""
+        finally:
+            wd.cancel()
         if first:
             print(f"[stream] byte dau tien sau {time.monotonic() - t_req:.1f}s ke tu luc nhan yeu cau", flush=True)
             break
@@ -2384,6 +2455,8 @@ def _stream_impl(video_url):
                 return
             released[0] = True
         _streams_add(-1)
+        if _active_streams == 0:
+            _mark_stream(False)
         _drop_fetchers(sids)
 
     def generate():
@@ -2392,6 +2465,8 @@ def _stream_impl(video_url):
         chunk = first
         w_ff = w_cl = 0.0
         last_log = t0
+        last_mark = 0.0
+        _mark_stream()
         last_sent = 0
         avi = _AviCounter()
 
@@ -2402,6 +2477,10 @@ def _stream_impl(video_url):
             while chunk:
                 sent += len(chunk)
                 avi.feed(chunk)
+                if STREAM_MAX_LEAD > 0 and avi.ok and avi.frames:
+                    over = avi.frames / fps - (time.monotonic() - t0) - STREAM_MAX_LEAD
+                    if over > 0:
+                        time.sleep(min(over, 2.0))
                 expected_elapsed = max(0, sent - burst_bytes) / target_bps
                 actual_elapsed = time.monotonic() - t0
                 if expected_elapsed > actual_elapsed:
@@ -2413,6 +2492,9 @@ def _stream_impl(video_url):
                 t3 = time.monotonic()
                 w_cl += t2 - t1
                 w_ff += t3 - t2
+                if t3 - last_mark >= 5:
+                    last_mark = t3
+                    _mark_stream()
                 if t3 - last_log >= 10:
                     span = t3 - last_log
                     print(f"[stream-diag] {span:.0f}s: ffmpeg_wait={w_ff:.1f}s client_wait={w_cl:.1f}s "
@@ -2634,7 +2716,14 @@ def _font(px, bold=False):
 
 
 _cj = http.cookiejar.CookieJar()
-_opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(_cj))
+class _PubRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not _url_is_public(newurl):
+            raise urllib.error.URLError("blocked host (redirect toi dia chi noi bo)")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(_cj), _PubRedirect())
 
 
 try:
