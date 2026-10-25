@@ -1834,28 +1834,6 @@ def _kill_stream(why=""):
             pass
 
 
-_FF_NOISE = ("Broken pipe", "Error muxing a packet", "Error writing trailer", "Error closing file",
-             "Error submitting a packet to the muxer", "Task finished with error code: -32")
-
-
-def _ff_stderr_drain(proc):
-    """Doc stderr cua ffmpeg; chi in loi that, bo dong 'Broken pipe' khi thiet bi ngat ket noi."""
-    def run():
-        try:
-            for raw in iter(proc.stderr.readline, b""):
-                line = raw.decode("utf-8", "replace").rstrip()
-                if line and not any(k in line for k in _FF_NOISE):
-                    _real_print("[ffmpeg] " + line[:300], flush=True)
-        except Exception:
-            pass
-        finally:
-            try:
-                proc.stderr.close()
-            except Exception:
-                pass
-    threading.Thread(target=run, daemon=True).start()
-
-
 def _park(proc, cleanup):
     """Thiet bi thoat video: giu ffmpeg song, van nhan du lieu nguon (hut bo).
     Tat khi: co video moi (_cur_proc bi kill) hoac het PARK_SEC."""
@@ -2230,7 +2208,7 @@ TURBO = os.environ.get("TURBO", "1") == "1"
 TURBO_WORKERS = max(1, _env_int("TURBO_WORKERS", 5))
 TURBO_CHUNK = max(64, _env_int("TURBO_CHUNK_KB", 512)) * 1024
 TURBO_HEAD = 128 * 1024
-TURBO_MAX_FAIL = max(2, _env_int("TURBO_MAX_FAIL", 6))
+TURBO_MAX_FAIL = max(2, _env_int("TURBO_MAX_FAIL", 12))
 TURBO_HEAD_N = 8
 TURBO_AHEAD = max(4, _env_int("TURBO_AHEAD_MB", 8) * 1024 * 1024 // TURBO_CHUNK + TURBO_HEAD_N)
 _LOCAL_IPS = ("127.0.0.1", "::1", "::ffff:127.0.0.1")
@@ -2254,6 +2232,12 @@ def _turbo_size(i):
     if i < TURBO_HEAD_N:
         return 2 * TURBO_HEAD
     return TURBO_CHUNK
+
+
+class _ChunkError(RuntimeError):
+    def __init__(self, status, msg):
+        super().__init__(msg)
+        self.status = status
 
 
 class _Fetcher:
@@ -2313,11 +2297,16 @@ class _Fetcher:
         h["Range"] = f"bytes={a}-{b}"
         c.request("GET", u.path + ("?" + u.query if u.query else ""), headers=h)
         r = c.getresponse()
+        if r.status != 206:
+            # Khong doc ca than phan hoi (neu nguon bo qua Range se tra ca file 200 -> tran RAM)
+            try:
+                r.read(512)
+            except Exception:
+                pass
+            raise _ChunkError(r.status, f"HTTP {r.status}")
         data = r.read()
-        if r.status != 206 or len(data) != b - a + 1:
-            if r.status in (401, 403, 410):
-                self.err = RuntimeError(f"HTTP {r.status} (URL het han/bi khoa)")  # loi cung: khong the thu lai
-            raise RuntimeError(f"HTTP {r.status}, {len(data)}/{b - a + 1}B")
+        if len(data) != b - a + 1:
+            raise _ChunkError(r.status, f"thieu du lieu {len(data)}/{b - a + 1}B")
         return data
 
     def _next(self):
@@ -2352,7 +2341,8 @@ class _Fetcher:
                     except Exception:
                         pass
                     c = None
-                    time.sleep(0.2 * (attempt + 1))
+                    _slow = getattr(e, "status", 0) in (403, 429, 503)
+                    time.sleep((1.0 if _slow else 0.2) * (attempt + 1))
             with self.cond:
                 self.inflight.discard(idx)
                 if data is not None:
@@ -2385,8 +2375,6 @@ class _Fetcher:
             while idx not in self.buf:
                 if self.closed:
                     raise RuntimeError("fetcher da dong")
-                if self.err:  # 401/403/410: URL googlevideo het han
-                    raise RuntimeError(f"tai loi: {self.err}")
                 nf, le = self.fails.get(idx, (0, None))
                 if nf >= TURBO_MAX_FAIL:
                     raise RuntimeError(f"tai loi chunk {idx} {nf} lan: {le}")
@@ -2405,17 +2393,39 @@ class _Fetcher:
             self.cond.notify_all()
 
 
+_src_app = Flask("relay_src")
+_src_port = 0
+_src_port_lock = threading.Lock()
+
+
+def _src_server_port():
+    """Moi worker tu mo 1 may chu nho tren cong ngau nhien 127.0.0.1 chi phuc vu /_src/<sid>.
+    Tranh 2 loi: (1) nhieu worker gunicorn -> ffmpeg goi nham worker khong co fetcher (404) lam dut luong;
+    (2) het thread cua may chu chinh khi ffmpeg goi nguoc lai chinh no."""
+    global _src_port
+    with _src_port_lock:
+        if _src_port:
+            return _src_port
+        from werkzeug.serving import make_server
+        srv = make_server("127.0.0.1", 0, _src_app, threaded=True)
+        _src_port = srv.server_port
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        print(f"[turbo] may chu nguon cuc bo 127.0.0.1:{_src_port} (pid {os.getpid()})", flush=True)
+        return _src_port
+
+
 def _turbo(url, hdr, proxy):
     if not (TURBO and url and url.startswith(("http://", "https://"))) or re.search(r"\.m3u8|\.mpd|/manifest|/playlist", url, re.I):
         return None
     try:
+        port = _src_server_port()
         f = _Fetcher(url, _hdr_dict(hdr), proxy)
     except Exception as e:
         print(f"[turbo] bo qua ({str(e)[:100]}) -> doc truc tiep", flush=True)
         return None
     sid = secrets.token_hex(16)
     _fetchers[sid] = f
-    return f"http://127.0.0.1:{PORT}/_src/{sid}", sid
+    return f"http://127.0.0.1:{port}/_src/{sid}", sid
 
 
 def _inputs(v_url, a_url, v_hdr, a_hdr, is_yt):
@@ -2478,9 +2488,56 @@ def turbo_src(sid):
                 pos += len(piece)
                 yield piece
         except Exception as e:
-            print(f"[turbo] loi nguon, cat luong tai byte {pos}/{size}: {str(e)[:120]}", flush=True)
-            return
+            print(f"[turbo] loi nguon tai byte {pos}/{size}: {str(e)[:120]} -> chuyen sang tai 1 ket noi", flush=True)
+        if pos <= b and not f.closed:
+            yield from _turbo_fallback(f, pos, b)
     return Response(gen(), status=status, headers=hd)
+
+
+def _turbo_fallback(f, pos, end):
+    """Turbo that bai giua chung: tai not phan con lai bang 1 ket noi (khong song song) de ffmpeg khong bi cat luong."""
+    c, tries = None, 0
+    try:
+        while pos <= end and not f.closed and tries < 4:
+            start = pos
+            try:
+                if c is None:
+                    c = f._conn()
+                u = urllib.parse.urlsplit(f.url)
+                h = dict(f.hdr)
+                h["Range"] = f"bytes={pos}-{end}"
+                c.request("GET", u.path + ("?" + u.query if u.query else ""), headers=h)
+                r = c.getresponse()
+                if r.status != 206:
+                    raise _ChunkError(r.status, f"HTTP {r.status}")
+                while pos <= end:
+                    piece = r.read(65536)
+                    if not piece:
+                        break
+                    piece = piece[:end - pos + 1]
+                    pos += len(piece)
+                    yield piece
+                if pos <= end:
+                    raise RuntimeError("nguon cat ngang")
+            except Exception as e:
+                try:
+                    c and c.close()
+                except Exception:
+                    pass
+                c = None
+                tries = 0 if pos > start else tries + 1
+                print(f"[turbo] loi tai du phong tai byte {pos}: {str(e)[:100]} (lan {tries})", flush=True)
+                time.sleep(0.5 * (tries + 1))
+        if pos <= end:
+            print(f"[turbo] loi: tai du phong that bai, cat luong tai byte {pos}/{end + 1}", flush=True)
+    finally:
+        try:
+            c and c.close()
+        except Exception:
+            pass
+
+
+_src_app.add_url_rule("/_src/<sid>", "turbo_src", turbo_src, methods=["GET", "HEAD"])
 
 
 def _ffmpeg_cmd(v_url, a_url, v_hdr, a_hdr, is_yt, w, h, fps, q, ar, v_local=False, a_local=False):
@@ -2693,13 +2750,12 @@ def _stream_impl(video_url):
                 except Exception:
                     pass
             try:
-                proc = subprocess.Popen(_nice_prefix() + cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=1 << 20)
+                proc = subprocess.Popen(_nice_prefix() + cmd, stdout=subprocess.PIPE, bufsize=1 << 20)
             except OSError as e:
                 print(f"[stream] khong chay duoc ffmpeg: {e}", flush=True)
                 _drop_fetchers(sids)
                 return jsonify({"error": "ffmpeg_missing", "detail": str(e)[:120]}), 500
             _cur_proc = proc
-        _ff_stderr_drain(proc)
         _streams_add(1)
         try:
             fcntl.fcntl(proc.stdout.fileno(), 1031, 1 << 20)
