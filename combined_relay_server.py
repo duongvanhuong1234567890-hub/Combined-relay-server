@@ -844,6 +844,32 @@ _NO_RETRY_STRONG = ("Private video", "has been removed", "not available in your 
 _NO_RETRY_WEAK = ("Video unavailable", "This video is not available")
 # Video bi chan theo vung: doi client yt-dlp khong giup ich, dung vong thu yt-dlp (van cho phep RapidAPI/Piped thu tiep)
 _GEO_HINTS = ("not made this video available in your country", "not available in your country")
+_GEO_RE = re.compile(r"available in your (?:country|region|location)|blocked it in your country|"
+                     r"geo[- ]?restrict|not (?:available|accessible) in your (?:country|region)|from your location", re.I)
+_geo_blocked = {}
+_geo_lock = threading.Lock()
+GEO_TTL = float(os.environ.get("GEO_TTL", "3600"))
+
+
+def _is_geo_error(e, msg):
+    if type(e).__name__ == "GeoRestrictedError" or any(h in msg for h in _GEO_HINTS) or _GEO_RE.search(msg or ""):
+        return True
+    ei = getattr(e, "exc_info", None)
+    return bool(ei and ei[0] is not None and getattr(ei[0], "__name__", "") == "GeoRestrictedError")
+
+
+def _geo_mark(vid):
+    now = time.monotonic()
+    with _geo_lock:
+        if len(_geo_blocked) > 300:
+            for k in [k for k, t in _geo_blocked.items() if now >= t]:
+                _geo_blocked.pop(k, None)
+        _geo_blocked[vid] = now + GEO_TTL
+
+
+def _geo_known(vid):
+    with _geo_lock:
+        return time.monotonic() < _geo_blocked.get(vid, 0.0)
 
 
 _resolve_gate = threading.Lock()
@@ -923,6 +949,7 @@ RAPID_SKIP_413 = float(os.environ.get("RAPID_SKIP_413", "1800"))
 RAPID_SKIP_OTHER = float(os.environ.get("RAPID_SKIP_OTHER", "90"))
 RAPID_SKIP_QUOTA = float(os.environ.get("RAPID_SKIP_QUOTA", "600"))
 _rapid_skip = {}
+_rapid_big = {}
 _rapid_skip_all = 0.0
 _rapid_skip_lock = threading.Lock()
 
@@ -954,6 +981,8 @@ def _rapid_fast_file(video_id):
     qualities = [RAPID_FAST_QUALITY]
     if RAPID_FAST_QUALITY_LOW and RAPID_FAST_QUALITY_LOW not in qualities:
         qualities.append(RAPID_FAST_QUALITY_LOW)
+    if len(qualities) > 1 and time.monotonic() < _rapid_big.get(video_id, 0.0):
+        qualities = qualities[1:]
     data = None
     for qi, qual in enumerate(qualities):
         api = (f"https://{RAPID_FAST_HOST}/download_video/{video_id}?"
@@ -973,6 +1002,9 @@ def _rapid_fast_file(video_id):
             body = e.read(200).decode("utf-8", "replace")
             if e.code == 413 and qi + 1 < len(qualities):
                 print(f"[rapid] HTTP 413 o chat luong {qual} -> thu chat luong thap hon", flush=True)
+                if len(_rapid_big) > 300:
+                    _rapid_big.clear()
+                _rapid_big[video_id] = time.monotonic() + RAPID_SKIP_413
                 continue
             raise ResolveError(f"RapidAPI HTTP {e.code}: {body}") from None
         except (urllib.error.URLError, OSError, ValueError) as e:
@@ -1410,7 +1442,12 @@ def _resolve_stream_urls_uncached(video_url, height_cap, background=False):
     is_yt = bool(m and _is_youtube(video_url))
     yt_first_tried = False
     yt_first_err = None
-    if is_yt and YT_FIRST and not background:
+    if is_yt and _geo_known(m.group(1)):
+        # Da biet video bi chan theo vung: khong ton ~30s thu yt-dlp nua, di thang RapidAPI/Piped
+        print(f"[resolve] {m.group(1)} bi chan theo vung (da biet) -> bo qua yt-dlp", flush=True)
+        yt_first_tried = True
+        yt_first_err = ResolveError("video bi chan theo vung (khong phat duoc o vung may chu)")
+    elif is_yt and YT_FIRST and not background:
         # Thu yt-dlp truoc (chat luong cao theo height_cap); that bai thi roi xuong direct/RapidAPI
         if _resolve_gate.acquire(timeout=YT_FIRST_GATE):
             yt_first_tried = True
@@ -1550,11 +1587,14 @@ def _resolve_stream_urls_inner(video_url, height_cap, budget=None, background=Fa
                 _nocookie_fails = _nocookie_vids.add(vkey)
                 if _nocookie_fails >= YT_NOCOOKIE_MAX_FAILS:
                     _nocookie_skip_until = time.monotonic() + YT_NOCOOKIE_COOLDOWN
+            if _is_geo_error(e, msg):
+                # Chan theo vung KHONG phai loi vinh vien: RapidAPI/Piped o vung khac van co the phat duoc
+                print("[resolve] video bi chan theo vung -> bo cac client yt-dlp con lai", flush=True)
+                if _vm:
+                    _geo_mark(_vm.group(1))
+                break
             if any(h in msg for h in _NO_RETRY_STRONG):
                 permanent = True
-                break
-            if any(h in msg for h in _GEO_HINTS):
-                print("[resolve] video bi chan theo vung -> bo cac client yt-dlp con lai", flush=True)
                 break
             if any(h in msg for h in _NO_RETRY_WEAK):
                 weak_hits += 1
