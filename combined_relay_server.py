@@ -842,6 +842,8 @@ _NO_RETRY_STRONG = ("Private video", "has been removed", "not available in your 
                     "members-only", "Join this channel", "live event will begin", "Premieres in",
                     "account associated with this video has been terminated")
 _NO_RETRY_WEAK = ("Video unavailable", "This video is not available")
+# Video bi chan theo vung: doi client yt-dlp khong giup ich, dung vong thu yt-dlp (van cho phep RapidAPI/Piped thu tiep)
+_GEO_HINTS = ("not made this video available in your country", "not available in your country")
 
 
 _resolve_gate = threading.Lock()
@@ -1550,6 +1552,9 @@ def _resolve_stream_urls_inner(video_url, height_cap, budget=None, background=Fa
                     _nocookie_skip_until = time.monotonic() + YT_NOCOOKIE_COOLDOWN
             if any(h in msg for h in _NO_RETRY_STRONG):
                 permanent = True
+                break
+            if any(h in msg for h in _GEO_HINTS):
+                print("[resolve] video bi chan theo vung -> bo cac client yt-dlp con lai", flush=True)
                 break
             if any(h in msg for h in _NO_RETRY_WEAK):
                 weak_hits += 1
@@ -3708,6 +3713,7 @@ class _Chromium:
         self.focus = None
         self.home = False
         self.err_url = ""
+        self.shown_err = None
         self.navs = 0
         self.born = self.last_used = time.monotonic()
 
@@ -3799,11 +3805,13 @@ class _Chromium:
         if vp != self.vp:
             self.page.set_viewport_size({"width": vp[0], "height": vp[1]})
             self.vp = vp
-        if home and self.page.url == "about:blank" and not self.home:
+        if home and self.page.url == "about:blank" and not self.home and not self.shown_err:
             self.go("about:home")
 
     def cur_url(self):
         u = self.page.url
+        if self.shown_err and u == self.shown_err[0]:
+            return self.shown_err[1]
         if u.startswith("chrome-error:"):
             return self.err_url or u
         return "about:home" if (self.home and u == "about:blank") else u
@@ -3831,6 +3839,7 @@ class _Chromium:
 
     def go(self, url):
         self.play, self.focus = None, None
+        self.shown_err = None
         if url == "about:home":
             self.set_html(_cr_home_html())
             self.home = True
@@ -3838,16 +3847,37 @@ class _Chromium:
         self.home = False
         self.err_url = url
         self.navs += 1
+        before = self.page.url
         try:
             self.page.goto(url, wait_until="domcontentloaded", timeout=BR_CR_TIMEOUT * 1000)
         except Exception as e:
             msg = str(e)
             if self.play:
                 return
-            if not ("ERR_ABORTED" in msg or "Timeout" in msg):
-                self.set_html(_cr_error_html(msg.splitlines()[0] if msg else "loi", url))
+            if "Timeout" in msg:
+                # Trang treo: huy navigation dang cho, neu khong screenshot se bi ket them ~25s
+                self._halt()
+                if self.page.url == before:
+                    self.show_error("Het thoi gian cho (%ds)" % BR_CR_TIMEOUT, url)
+                    return
+            elif "ERR_ABORTED" not in msg:
+                self.show_error(msg.splitlines()[0] if msg else "loi", url)
                 return
         self.settle()
+
+    def _halt(self):
+        try:
+            cdp = self.ctx.new_cdp_session(self.page)
+            try:
+                cdp.send("Page.stopLoading")
+            finally:
+                cdp.detach()
+        except Exception:
+            pass
+
+    def show_error(self, msg, url):
+        self.set_html(_cr_error_html(msg, url))
+        self.shown_err = (self.page.url, url)
 
     def get_focus(self):
         try:
@@ -3929,18 +3959,20 @@ class _Chromium:
                 pg.go_back(wait_until="domcontentloaded", timeout=BR_CR_TIMEOUT * 1000)
                 self.settle()
             except Exception:
-                pass
+                self._halt()
             if pg.url in ("about:blank", ""):
                 self.go("about:home")
         elif action == "reload":
             if self.cur_url() == "about:home":
                 self.go("about:home")
+            elif self.shown_err and pg.url == self.shown_err[0]:
+                self.go(self.shown_err[1])
             else:
                 self.play = None
                 try:
                     pg.reload(wait_until="domcontentloaded", timeout=BR_CR_TIMEOUT * 1000)
                 except Exception:
-                    pass
+                    self._halt()
                 self.settle()
         jpg = self.shot(portrait)
         play, self.play = self.play, None
@@ -4183,7 +4215,7 @@ def br_action(action):
         return Response("loi: %s" % str(e)[:200], 500)
     _br_last_url = play or url
     _log(f"{action} {int((time.monotonic() - t0) * 1000)}ms {len(jpg)}B {url[:70]}{' PLAY' if play else ''}")
-    h = {"X-Url": _clip_pct(urllib.parse.quote(url, safe=":/?&=%#"), 300), "X-Edit": "1" if edit else "0", "Cache-Control": "no-store"}
+    h = {"X-Url": _clip_pct(urllib.parse.quote(url, safe=":/?&=%#+@,;~-._!*()'$"), 300), "X-Edit": "1" if edit else "0", "Cache-Control": "no-store"}
     if play:
         h["X-Play"] = _clip_pct(urllib.parse.quote(play, safe=":/?&=%#@,+;~-._!*()'$"), 700)
     return Response(jpg, mimetype="image/jpeg", headers=h)
