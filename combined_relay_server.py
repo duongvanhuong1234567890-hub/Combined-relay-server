@@ -1834,6 +1834,28 @@ def _kill_stream(why=""):
             pass
 
 
+_FF_NOISE = ("Broken pipe", "Error muxing a packet", "Error writing trailer", "Error closing file",
+             "Error submitting a packet to the muxer", "Task finished with error code: -32")
+
+
+def _ff_stderr_drain(proc):
+    """Doc stderr cua ffmpeg; chi in loi that, bo dong 'Broken pipe' khi thiet bi ngat ket noi."""
+    def run():
+        try:
+            for raw in iter(proc.stderr.readline, b""):
+                line = raw.decode("utf-8", "replace").rstrip()
+                if line and not any(k in line for k in _FF_NOISE):
+                    _real_print("[ffmpeg] " + line[:300], flush=True)
+        except Exception:
+            pass
+        finally:
+            try:
+                proc.stderr.close()
+            except Exception:
+                pass
+    threading.Thread(target=run, daemon=True).start()
+
+
 def _park(proc, cleanup):
     """Thiet bi thoat video: giu ffmpeg song, van nhan du lieu nguon (hut bo).
     Tat khi: co video moi (_cur_proc bi kill) hoac het PARK_SEC."""
@@ -2671,12 +2693,13 @@ def _stream_impl(video_url):
                 except Exception:
                     pass
             try:
-                proc = subprocess.Popen(_nice_prefix() + cmd, stdout=subprocess.PIPE, bufsize=1 << 20)
+                proc = subprocess.Popen(_nice_prefix() + cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=1 << 20)
             except OSError as e:
                 print(f"[stream] khong chay duoc ffmpeg: {e}", flush=True)
                 _drop_fetchers(sids)
                 return jsonify({"error": "ffmpeg_missing", "detail": str(e)[:120]}), 500
             _cur_proc = proc
+        _ff_stderr_drain(proc)
         _streams_add(1)
         try:
             fcntl.fcntl(proc.stdout.fileno(), 1031, 1 << 20)
