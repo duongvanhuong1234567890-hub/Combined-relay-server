@@ -760,7 +760,7 @@ class _RecentFails:
 _yt_fails = _RecentFails(YT_BLOCK_WINDOW)
 
 YT_NOCOOKIE_MAX_FAILS = int(os.environ.get("YT_NOCOOKIE_MAX_FAILS", "2"))
-YT_NOCOOKIE_COOLDOWN = float(os.environ.get("YT_NOCOOKIE_COOLDOWN", "300"))
+YT_NOCOOKIE_COOLDOWN = float(os.environ.get("YT_NOCOOKIE_COOLDOWN", "1800"))
 _nocookie_fails = 0
 _nocookie_skip_until = 0.0
 _nocookie_vids = _RecentFails(YT_BLOCK_WINDOW)
@@ -1521,6 +1521,12 @@ def _resolve_stream_urls_uncached(video_url, height_cap, background=False):
         _resolve_gate.release()
 
 
+# Chay dua (race): thu nhieu client yt-dlp CUNG LUC, cai nao xong truoc thi dung. YT_RACE_PAR=1 de quay ve tuan tu.
+# Moi lan chua co "cach tot" nao duoc nho thi dua YT_RACE_FIRST (mac dinh mweb) len dau.
+YT_RACE_PAR = max(1, int(os.environ.get("YT_RACE_PAR", "2")))
+YT_RACE_FIRST = os.environ.get("YT_RACE_FIRST", "mweb").strip()
+
+
 def _resolve_stream_urls_inner(video_url, height_cap, budget=None, background=False):
     global _yt_preferred, _nocookie_fails, _nocookie_skip_until, _yt_block_until, _block_level
     fmt = (
@@ -1563,44 +1569,100 @@ def _resolve_stream_urls_inner(video_url, height_cap, budget=None, background=Fa
     errors = []
     permanent = False
     weak_hits = 0
-    for name, client, use_cookies, runtimes in attempts:
-        if errors and time.monotonic() - t_start > budget:
-            break
+    pending = list(attempts)
+    if not _yt_preferred and YT_RACE_FIRST:
+        pending.sort(key=lambda a: a[0] != YT_RACE_FIRST)  # sort on dinh: giu nguyen thu tu con lai
+    race = {"res": None, "name": None, "cookies": False, "running": 0, "stop": False}
+    race_lock = threading.Lock()
+    race_wake = threading.Event()
+
+    def _race_worker(name, client, use_cookies, runtimes):
+        nonlocal permanent, weak_hits
+        global _nocookie_fails, _nocookie_skip_until
+        ck = None
         try:
-            _yt_pace()
-            res = _extract_with(video_url, _build_ydl_opts(fmt, client, use_cookies, runtimes, YT_PROXY))
-            if _yt_preferred != name:
-                print(f"[resolve] cach '{name}' thanh cong", flush=True)
-            _yt_preferred = name
-            _yt_fails.clear()
-            _block_level = 0
-            if not use_cookies:
-                _nocookie_fails = 0
-                _nocookie_skip_until = 0.0
-                _nocookie_vids.clear()
-            return res
+            _yt_pace()  # van giu khoang cach toi thieu giua cac request len YouTube
+            with race_lock:
+                if race["stop"] or race["res"] is not None:
+                    return
+            opts = _build_ydl_opts(fmt, client, use_cookies, runtimes, YT_PROXY)
+            if YT_RACE_PAR > 1 and opts.get("cookiefile"):
+                # yt-dlp ghi lai cookiefile khi dong -> moi luong 1 ban sao rieng, tranh ghi de nhau
+                try:
+                    ck = "/tmp/ytck_%d_%d.txt" % (os.getpid(), threading.get_ident())
+                    shutil.copyfile(opts["cookiefile"], ck)
+                    opts["cookiefile"] = ck
+                except OSError:
+                    ck = None
+            res = _extract_with(video_url, opts)
+            with race_lock:
+                if race["res"] is None:
+                    race["res"], race["name"], race["cookies"] = res, name, use_cookies
         except Exception as e:
             msg = str(e)
             print(f"[resolve] cach '{name}' that bai: {msg[:140]}", flush=True)
-            errors.append(f"{name}: {msg[:110]}")
-            if not background and not use_cookies and "player response" in msg:
-                _nocookie_fails = _nocookie_vids.add(vkey)
-                if _nocookie_fails >= YT_NOCOOKIE_MAX_FAILS:
-                    _nocookie_skip_until = time.monotonic() + YT_NOCOOKIE_COOLDOWN
-            if _is_geo_error(e, msg):
-                # Chan theo vung KHONG phai loi vinh vien: RapidAPI/Piped o vung khac van co the phat duoc
-                print("[resolve] video bi chan theo vung -> bo cac client yt-dlp con lai", flush=True)
-                if _vm:
-                    _geo_mark(_vm.group(1))
-                break
-            if any(h in msg for h in _NO_RETRY_STRONG):
-                permanent = True
-                break
-            if any(h in msg for h in _NO_RETRY_WEAK):
-                weak_hits += 1
-                if weak_hits >= 2:
+            with race_lock:
+                errors.append(f"{name}: {msg[:110]}")
+                if not background and not use_cookies and ("player response" in msg or "not a bot" in msg):
+                    _nocookie_fails = _nocookie_vids.add(vkey)
+                    if _nocookie_fails >= YT_NOCOOKIE_MAX_FAILS:
+                        _nocookie_skip_until = time.monotonic() + YT_NOCOOKIE_COOLDOWN
+                if _is_geo_error(e, msg):
+                    # Chan theo vung KHONG phai loi vinh vien: RapidAPI/Piped o vung khac van co the phat duoc
+                    print("[resolve] video bi chan theo vung -> bo cac client yt-dlp con lai", flush=True)
+                    if _vm:
+                        _geo_mark(_vm.group(1))
+                    race["stop"] = True
+                elif any(h in msg for h in _NO_RETRY_STRONG):
                     permanent = True
-                    break
+                    race["stop"] = True
+                elif any(h in msg for h in _NO_RETRY_WEAK):
+                    weak_hits += 1
+                    if weak_hits >= 2:
+                        permanent = True
+                        race["stop"] = True
+        finally:
+            if ck:
+                try:
+                    os.remove(ck)
+                except OSError:
+                    pass
+            with race_lock:
+                race["running"] -= 1
+            race_wake.set()
+
+    hard_end = t_start + budget + 60
+    while True:
+        job = None
+        with race_lock:
+            if race["res"] is not None or race["stop"]:
+                break
+            if pending and race["running"] < YT_RACE_PAR and not (errors and time.monotonic() - t_start > budget):
+                job = pending.pop(0)
+                race["running"] += 1
+            elif race["running"] == 0:
+                break
+        if time.monotonic() > hard_end:
+            break
+        if job is not None:
+            threading.Thread(target=_race_worker, args=job, daemon=True).start()
+            continue
+        race_wake.wait(0.5)
+        race_wake.clear()
+
+    if race["res"] is not None:
+        name, use_cookies = race["name"], race["cookies"]
+        if _yt_preferred != name:
+            print(f"[resolve] cach '{name}' thanh cong", flush=True)
+        print(f"[resolve] race xong sau {time.monotonic() - t_start:.1f}s bang '{name}' (song song toi da {YT_RACE_PAR})", flush=True)
+        _yt_preferred = name
+        _yt_fails.clear()
+        _block_level = 0
+        if not use_cookies:
+            _nocookie_fails = 0
+            _nocookie_skip_until = 0.0
+            _nocookie_vids.clear()
+        return race["res"]
     if not permanent and not background:
         _yt_preferred = None
         _joined = " | ".join(errors)
