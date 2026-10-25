@@ -1248,10 +1248,33 @@ def _rapid_urls_usable(res):
     return True
 
 
+YT_FIRST = os.environ.get("YT_FIRST", "1") == "1"
+YT_FIRST_BUDGET = float(os.environ.get("YT_FIRST_BUDGET", "25"))
+YT_FIRST_GATE = float(os.environ.get("YT_FIRST_GATE", "5"))
+
+
 def _resolve_stream_urls_uncached(video_url, height_cap, background=False):
     global _rs_off_until
     m = _YT_ID_RE.search(video_url or "")
     is_yt = bool(m and _is_youtube(video_url))
+    yt_first_tried = False
+    yt_first_err = None
+    if is_yt and YT_FIRST and not background:
+        # Thu yt-dlp truoc (chat luong cao theo height_cap); that bai thi roi xuong direct/RapidAPI
+        if _resolve_gate.acquire(timeout=YT_FIRST_GATE):
+            yt_first_tried = True
+            t_yf = time.monotonic()
+            try:
+                res = _resolve_stream_urls_inner(video_url, height_cap, YT_FIRST_BUDGET, False)
+                print(f"[resolve] yt-dlp (thu truoc) OK sau {time.monotonic() - t_yf:.1f}s cho {m.group(1)}", flush=True)
+                return res
+            except Exception as e:
+                yt_first_err = e
+                print(f"[resolve] yt-dlp (thu truoc) that bai sau {time.monotonic() - t_yf:.1f}s: {str(e)[:200]} -> thu RapidAPI", flush=True)
+            finally:
+                _resolve_gate.release()
+        else:
+            print("[resolve] yt-dlp (thu truoc) bo qua: dang co resolve khac", flush=True)
     if is_yt:
         _d = _try_direct(m.group(1), height_cap)
         if _d:
@@ -1288,6 +1311,10 @@ def _resolve_stream_urls_uncached(video_url, height_cap, background=False):
             return _alt_streams(m.group(1), height_cap)
         except ResolveError as e:
             print(f"[resolve] alt (Piped/Invidious) that bai: {str(e)[:200]}", flush=True)
+
+    if yt_first_tried:
+        # yt-dlp da thu o dau ham, khong lap lai (tranh ton them thoi gian)
+        raise rapid_err or yt_first_err or ResolveError("khong cach nao chay")
 
     if use_rapid and (background or RAPID_ONLY):
         raise rapid_err or ResolveError("RapidAPI khong dung duoc (RAPID_ONLY=1)")
