@@ -1,0 +1,18 @@
+# === THEM DOAN NAY vao Dockerfile, ngay TRUOC dong CMD cuoi cung ===
+
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# wireproxy: WireGuard userspace -> HTTP proxy (khong can quyen NET_ADMIN)
+RUN curl -fsSL https://github.com/pufferffish/wireproxy/releases/latest/download/wireproxy_linux_amd64.tar.gz \
+ | tar -xz -C /usr/local/bin wireproxy
+
+# wgcf: tu dang ky tai khoan WARP mien phi
+RUN curl -fsSL "$(curl -fsSL https://api.github.com/repos/ViRb3/wgcf/releases/latest | grep -o 'https://[^"]*linux_amd64')" \
+ -o /usr/local/bin/wgcf && chmod +x /usr/local/bin/wgcf
+
+COPY start-warp.sh /usr/local/bin/start-warp.sh
+RUN chmod +x /usr/local/bin/start-warp.sh
+ENTRYPOINT ["/usr/local/bin/start-warp.sh"]
+
+# (giu nguyen dong CMD cu cua ban ben duoi, vi du CMD ["gunicorn", ...])
