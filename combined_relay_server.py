@@ -15,6 +15,7 @@ import fcntl
 import shutil
 import hmac
 import socket
+import struct
 import ipaddress
 import gc
 from flask import Flask, request, Response, jsonify, g
@@ -2479,6 +2480,30 @@ def _nice_prefix():
     return []
 
 
+def _sock_diag(sock):
+    """Chan doan ket noi luc luong bi dut: ben kia dong (FIN), bi reset (RST), hay ket noi con song."""
+    if sock is None:
+        return "sock=n/a"
+    out = []
+    try:
+        d = sock.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
+        out.append("peek=FIN(ben kia da dong)" if d == b"" else "peek=con_du_lieu")
+    except BlockingIOError:
+        out.append("peek=ket_noi_con_mo")
+    except ConnectionResetError:
+        out.append("peek=RST(bi reset)")
+    except OSError as e:
+        out.append(f"peek=loi:{type(e).__name__}")
+    try:
+        ti = sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 104)
+        st, _ca, retr = struct.unpack_from("3B", ti, 0)
+        unacked, _sacked, lost, retrans = struct.unpack_from("4I", ti, 24)
+        out.append(f"tcp_state={st} retrans={retr} unacked={unacked} lost={lost}")
+    except Exception as e:
+        out.append(f"tcpinfo=loi:{type(e).__name__}")
+    return " ".join(out)
+
+
 class _AviCounter:
     def __init__(self):
         self.buf = b""
@@ -2671,8 +2696,12 @@ def _stream_impl(video_url):
             _mark_stream(False)
         _drop_fetchers(sids)
 
+    _csock = request.environ.get("gunicorn.socket")
+
     def generate():
         t0 = time.monotonic()
+        max_gap = 0.0
+        last_t2 = t0
         sent = 0
         chunk = first
         w_ff = w_cl = 0.0
@@ -2698,8 +2727,11 @@ def _stream_impl(video_url):
                 if expected_elapsed > actual_elapsed:
                     time.sleep(expected_elapsed - actual_elapsed)
                 t1 = time.monotonic()
+                if t1 - last_t2 > max_gap:
+                    max_gap = t1 - last_t2
                 yield chunk
                 t2 = time.monotonic()
+                last_t2 = t2
                 chunk = proc.stdout.read1(65536)
                 t3 = time.monotonic()
                 w_cl += t2 - t1
@@ -2724,7 +2756,8 @@ def _stream_impl(video_url):
             except Exception:
                 rc = proc.poll()
             print(f"[stream] KET THUC sau {time.monotonic() - t0:.0f}s, gui {sent // 1024}KB | ly do: {reason} | "
-                  f"ffmpeg rc={rc} | lead={_lead()} | RAM {_mem_str()}", flush=True)
+                  f"ffmpeg rc={rc} | lead={_lead()} | RAM {_mem_str()} | "
+                  f"max_gap={max_gap:.1f}s im_lang_cuoi={time.monotonic() - last_t2:.1f}s | {_sock_diag(_csock)}", flush=True)
             _release()
             _terminate(proc)
 
