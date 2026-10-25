@@ -291,21 +291,21 @@ def _purpose_headers(resp):
 
 _last_req = time.monotonic()
 KILL_ON_LEAVE = os.environ.get("KILL_ON_LEAVE", "1") == "1"
-_inflight = 0
-_inflight_lock = threading.Lock()
+_reqbusy = 0
+_reqbusy_lock = threading.Lock()
 
 
-def _inflight_add(d):
-    global _inflight
-    with _inflight_lock:
-        _inflight = max(0, _inflight + d)
+def _reqbusy_add(d):
+    global _reqbusy
+    with _reqbusy_lock:
+        _reqbusy = max(0, _reqbusy + d)
 
 
 @app.teardown_request
-def _inflight_done(exc):
-    if getattr(g, "_inflight_on", False):
-        g._inflight_on = False
-        _inflight_add(-1)
+def _reqbusy_done(exc):
+    if getattr(g, "_reqbusy_on", False):
+        g._reqbusy_on = False
+        _reqbusy_add(-1)
 
 
 @app.before_request
@@ -314,8 +314,8 @@ def _role_gate():
     p = request.path
     if p not in ("/", "/healthz", "/about") and not p.startswith("/_src/"):
         _last_req = time.monotonic()
-        g._inflight_on = True
-        _inflight_add(1)
+        g._reqbusy_on = True
+        _reqbusy_add(1)
     if ROLE == "video" and p.startswith("/br"):
         return "disabled on this server (ROLE=video)", 404
     if ROLE == "browser" and p.startswith(("/stream", "/search")):
@@ -1859,7 +1859,7 @@ def _stream_elsewhere(max_age=60):
 
 
 def _idle_for(sec):
-    return (_active_streams == 0 and _inflight == 0 and not _stream_elsewhere() and not _br_busy()
+    return (_active_streams == 0 and _reqbusy == 0 and not _stream_elsewhere() and not _br_busy()
             and time.monotonic() - _last_req >= sec)
 
 
