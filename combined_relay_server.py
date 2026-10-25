@@ -315,7 +315,7 @@ def _reqbusy_done(exc):
 def _role_gate():
     global _br_last_activity, _last_req
     p = request.path
-    if p not in ("/", "/healthz", "/about", "/dbg") and not p.startswith("/_src/"):
+    if p not in ("/", "/healthz", "/dbg") and not p.startswith("/_src/"):
         _last_req = time.monotonic()
         g._reqbusy_on = True
         _reqbusy_add(1)
@@ -323,8 +323,6 @@ def _role_gate():
         return "disabled on this server (ROLE=video)", 404
     if ROLE == "browser" and p.startswith(("/stream", "/search")):
         return "disabled on this server (ROLE=browser)", 404
-    if p in ("/diag", "/myip") and not _tok_ok(request.args.get("k", ""), BR_TOKEN):
-        return "forbidden - can dat BR_TOKEN tren server va them ?k=BR_TOKEN vao URL", 403
     if p.startswith(("/stream", "/search", "/tr")):
         if not STREAM_TOKEN and not ALLOW_OPEN_STREAM:
             return "chua dat STREAM_TOKEN tren server - dat bien STREAM_TOKEN hoac ALLOW_OPEN_STREAM=1", 503
@@ -381,31 +379,6 @@ def cookies_update():
     finally:
         _resolve_gate.release()
     return f"da cap nhat cookies: {len(txt)} bytes", 200
-
-
-@app.route("/about")
-def about():
-    up = int(time.time() - _stat["since"])
-    last = int(time.time() - _stat["last"]) if _stat["last"] else None
-    body = {
-        "purpose": RELAY_PURPOSE,
-        "what_it_does": [
-            "nhan link/ID video do thiet bi LilyGo gui len",
-            "tai luong video tam thoi bang yt-dlp/ffmpeg",
-            "giai ma va ha kich thuoc/chat luong (MJPEG + audio) de ESP32-S3 phat duoc",
-            "truyen thang ve thiet bi, khong luu lai",
-        ],
-        "what_it_does_not": [
-            "khong luu video/audio ra o dia (ffmpeg pipe truc tiep, bo dem trong RAM, Cache-Control: no-store); chi cookies.txt cua chu server nam tren dia",
-            "khong dang lai, khong chia se, khong cong khai kho video nao",
-            "khong co tai khoan nguoi dung / khong thu thap du lieu ca nhan",
-        ],
-        "access_control": "can token" if STREAM_TOKEN else "khong dat STREAM_TOKEN",
-        "uptime_s": up,
-        "streams_since_start": _stat["streams"],
-        "last_stream_s_ago": last,
-    }
-    return jsonify(body), 200
 
 
 @app.route("/healthz")
@@ -564,23 +537,6 @@ def search_via_api(query, n):
     ]
 
 
-@app.route("/myip")
-def myip():
-    def _get(proxy=""):
-        try:
-            handlers = [urllib.request.ProxyHandler({"http": proxy, "https": proxy})] if proxy else []
-            with urllib.request.build_opener(*handlers).open("https://api.ipify.org", timeout=10) as r:
-                return r.read().decode().strip()
-        except Exception as e:
-            return f"loi: {str(e)[:120]}"
-    lines = [f"IP truc tiep (Render): {_get()}"]
-    if YT_PROXY:
-        lines.append(f"IP qua YT_PROXY:       {_get(YT_PROXY)}")
-    else:
-        lines.append("YT_PROXY: chua dat")
-    return Response("\n".join(lines), mimetype="text/plain; charset=utf-8")
-
-
 _search_cache = {}
 _search_lock = threading.Lock()
 SEARCH_TTL = int(os.environ.get("SEARCH_TTL", "600"))
@@ -721,7 +677,6 @@ def _build_attempts():
     return out or _YT_ATTEMPTS_ALL
 
 
-_YT_ATTEMPTS_LITE = _YT_ATTEMPTS_ALL
 _YT_ATTEMPTS = _build_attempts()
 _yt_preferred = None
 YT_BLOCK_BACKOFF = float(os.environ.get("YT_BLOCK_BACKOFF", "30"))
@@ -1320,18 +1275,6 @@ WARM_RAPID = os.environ.get("WARM_RAPID", "0") == "1"
 
 RAPID_STREAMS_ON = os.environ.get("RAPID_STREAMS", "1") == "1"
 _rs_off_until = 0.0
-ALT_ON = os.environ.get("ALT_FRONTENDS", "1") == "1"
-PIPED_API = [x.strip().rstrip("/") for x in os.environ.get(
-    "PIPED_API", "https://pipedapi.kavin.rocks,https://pipedapi.adminforge.de,https://api.piped.private.coffee"
-).split(",") if x.strip()]
-INVIDIOUS_API = [x.strip().rstrip("/") for x in os.environ.get(
-    "INVIDIOUS_API", "https://inv.nadeko.net,https://yewtu.be"
-).split(",") if x.strip()]
-ALT_TIMEOUT = float(os.environ.get("ALT_TIMEOUT", "8"))
-ALT_BUDGET = float(os.environ.get("ALT_BUDGET", "25"))
-ALT_COOLDOWN = float(os.environ.get("ALT_COOLDOWN", "300"))
-_alt_dead = {}
-_alt_lock = threading.Lock()
 
 
 def _rapid_streams_safe(video_id, height_cap):
@@ -1343,95 +1286,6 @@ def _rapid_streams_safe(video_id, height_cap):
         if any(f"HTTP {c}" in str(e) for c in (401, 402, 403, 429)):
             _rs_off_until = time.monotonic() + RAPID_SKIP_QUOTA
         raise
-
-
-def _alt_get_json(url):
-    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=ALT_TIMEOUT) as r:
-        return json.loads(r.read(3_000_000).decode("utf-8", "replace"))
-
-
-def _height_of(item):
-    h = item.get("height")
-    if isinstance(h, int):
-        return h
-    for k in ("resolution", "qualityLabel", "quality"):
-        mm = re.match(r"\s*(\d{3,4})p", str(item.get(k) or ""))
-        if mm:
-            return int(mm.group(1))
-    return 0
-
-
-def _pick_streams(video_items, audio_items, cap):
-    """video_items: dict(url, height, video_only, mime). audio_items: dict(url, bitrate)."""
-    hdr = f"User-Agent: {UA}\r\n"
-    comb = [v for v in video_items if not v["video_only"] and 0 < v["height"] <= cap]
-    if comb:
-        best = max(comb, key=lambda v: (v["height"], "avc1" in v["mime"] or "mp4" in v["mime"]))
-        return best["url"], None, hdr, ""
-    vids = [v for v in video_items if v["video_only"] and 0 < v["height"] <= cap]
-    if not vids or not audio_items:
-        raise ResolveError("khong co luong phu hop")
-    v = max(vids, key=lambda v: ("avc1" in v["mime"], v["height"]))
-    a = min(audio_items, key=lambda x: x.get("bitrate") or 0)
-    return v["url"], a["url"], hdr, hdr
-
-
-def _piped_try(base, video_id, cap):
-    d = _alt_get_json(f"{base}/streams/{video_id}")
-    if not isinstance(d, dict) or d.get("error"):
-        raise ResolveError(str((d or {}).get("message") if isinstance(d, dict) else d)[:80])
-    vi = [{"url": s["url"], "height": _height_of(s), "video_only": bool(s.get("videoOnly")),
-           "mime": str(s.get("mimeType", "")) + str(s.get("codec", ""))}
-          for s in (d.get("videoStreams") or []) if isinstance(s, dict) and s.get("url")]
-    ai = [{"url": s["url"], "bitrate": s.get("bitrate") or 0}
-          for s in (d.get("audioStreams") or []) if isinstance(s, dict) and s.get("url")]
-    return _pick_streams(vi, ai, cap)
-
-
-def _invidious_try(base, video_id, cap):
-    d = _alt_get_json(f"{base}/api/v1/videos/{video_id}?local=true")
-    if not isinstance(d, dict) or d.get("error"):
-        raise ResolveError(str((d or {}).get("error") if isinstance(d, dict) else d)[:80])
-    vi = []
-    for s in (d.get("formatStreams") or []):
-        if isinstance(s, dict) and s.get("url"):
-            vi.append({"url": s["url"], "height": _height_of(s), "video_only": False, "mime": str(s.get("type", ""))})
-    ai = []
-    for s in (d.get("adaptiveFormats") or []):
-        if not (isinstance(s, dict) and s.get("url")):
-            continue
-        t = str(s.get("type", ""))
-        if t.startswith("video/"):
-            vi.append({"url": s["url"], "height": _height_of(s), "video_only": True, "mime": t})
-        elif t.startswith("audio/"):
-            ai.append({"url": s["url"], "bitrate": int(s.get("bitrate") or 0)})
-    return _pick_streams(vi, ai, cap)
-
-
-def _alt_streams(video_id, height_cap):
-    """Thu lan luot cac instance Piped/Invidious (free, khong can key). Tra cung dinh dang nhu _rapid_streams."""
-    cap = int(height_cap)
-    t0 = time.monotonic()
-    errs = []
-    cands = [("piped", b, _piped_try) for b in PIPED_API] + [("invidious", b, _invidious_try) for b in INVIDIOUS_API]
-    for kind, base, fn in cands:
-        if time.monotonic() - t0 > ALT_BUDGET:
-            break
-        with _alt_lock:
-            if time.monotonic() < _alt_dead.get(base, 0.0):
-                continue
-        try:
-            res = fn(base, video_id, cap)
-            if not (_url_is_public(res[0]) and (not res[1] or _url_is_public(res[1]))):
-                raise ResolveError("URL khong hop le")
-            print(f"[alt] {kind} {base} OK cho {video_id}", flush=True)
-            return res
-        except Exception as e:
-            with _alt_lock:
-                _alt_dead[base] = time.monotonic() + ALT_COOLDOWN
-            errs.append(f"{kind}:{str(e)[:50]}")
-    raise ResolveError("khong instance Piped/Invidious nao dung duoc: " + " | ".join(errs)[:300])
 
 
 def _rapid_urls_usable(res):
@@ -1601,12 +1455,6 @@ def _resolve_stream_urls_uncached(video_url, height_cap, background=False):
                 print(f"[resolve] RapidAPI that bai: {str(e)[:200]}", flush=True)
                 _rapid_note_failure(vid, str(e))
                 rapid_err = e
-
-    if is_yt and ALT_ON and not background:
-        try:
-            return _alt_streams(m.group(1), height_cap)
-        except ResolveError as e:
-            print(f"[resolve] alt (Piped/Invidious) that bai: {str(e)[:200]}", flush=True)
 
     if yt_first_tried:
         # yt-dlp da thu o dau ham, khong lap lai (tranh ton them thoi gian)
@@ -2928,71 +2776,6 @@ def _stream_impl(video_url):
     return resp
 
 
-class _DiagLogger:
-    def __init__(self):
-        self.lines = []
-    def debug(self, m):
-        self.lines.append(str(m))
-    def info(self, m):
-        self.lines.append(str(m))
-    def warning(self, m):
-        self.lines.append("WARNING: " + str(m))
-    def error(self, m):
-        self.lines.append("ERROR: " + str(m))
-
-
-@app.route("/diag")
-def diag():
-    vid = request.args.get("v", "dQw4w9WgXcQ")
-    if not re.fullmatch(r"[A-Za-z0-9_-]{6,20}", vid):
-        return Response("v khong hop le (chi nhan ID video YouTube)", 400, mimetype="text/plain; charset=utf-8")
-    mode = request.args.get("mode", "cur")
-    if mode not in ("cur", "def", "noremote", "deno"):
-        mode = "cur"
-    lg = _DiagLogger()
-    head = [f"mode={mode} video={vid}", f"python={sys.version.split()[0]} yt-dlp={_ytdlp_version()}"]
-    try:
-        from importlib.metadata import version as _v
-        head.append(f"yt-dlp-ejs={_v('yt-dlp-ejs')}")
-    except Exception as e:
-        head.append(f"yt-dlp-ejs: khong doc duoc ({e})")
-    for exe in ("deno", "node"):
-        try:
-            r = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=10)
-            head.append(f"{exe}: {(r.stdout or r.stderr).strip().splitlines()[0] if (r.stdout or r.stderr).strip() else 'khong co dau ra'}")
-        except Exception as e:
-            head.append(f"{exe}: KHONG CHAY DUOC ({e})")
-    head.append(f"cookies={'yes' if os.path.exists(COOKIES_FILE) else 'NO'}")
-
-    opts = {"quiet": False, "verbose": True, "logger": lg, "skip_download": True,
-            "format": "bestvideo+bestaudio/best", "socket_timeout": 15}
-    if mode == "cur":
-        opts["js_runtimes"] = {"node": {}, "deno": {}}
-        opts["remote_components"] = ["ejs:github"]
-    elif mode == "noremote":
-        opts["js_runtimes"] = {"node": {}, "deno": {}}
-    elif mode == "deno":
-        opts["js_runtimes"] = {"deno": {}}
-    _cl = request.args.get("client", "").strip()
-    if _cl:
-        opts["extractor_args"] = {"youtube": {"player_client": [c.strip() for c in _cl.split(",") if c.strip()]}}
-    if os.path.exists(COOKIES_FILE) and request.args.get("nocookie") != "1":
-        opts["cookiefile"] = COOKIES_FILE
-    if not _resolve_gate.acquire(timeout=30):
-        lg.lines.append("=== BO QUA: server dang ban (yt-dlp khac dang chay), thu lai sau ===")
-    else:
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(f"https://www.youtube.com/watch?v={vid}", download=False)
-                lg.lines.append(f"=== THANH CONG: {info.get('title')} ===")
-        except Exception as e:
-            lg.lines.append(f"=== THAT BAI: {str(e)[:300]} ===")
-        finally:
-            _resolve_gate.release()
-    text = "\n".join(head) + "\n\n" + "\n".join(lg.lines)
-    return Response(text, mimetype="text/plain; charset=utf-8")
-
-
 import io
 import bisect
 import itertools
@@ -3248,7 +3031,6 @@ def _to_url(t):
 
 _HEAVY_OPEN = re.compile(r"<(?:!--|(script|style|noscript|svg|template)\b)", re.I)
 _HEAVY_CLOSE = {t: re.compile(r"</%s\s*>" % t, re.I) for t in ("script", "style", "noscript", "svg", "template")}
-_TAG_END = re.compile(r">")
 
 
 def _strip_heavy(s):
@@ -4743,7 +4525,6 @@ def _pot_selfcheck():
             print(f"[pot] LOI: script-deno that bai rc={r.returncode} stdout={out} stderr={err}", flush=True)
     except Exception as e:
         print(f"[pot] LOI: khong chay duoc deno: {type(e).__name__}: {str(e)[:200]}", flush=True)
-
 
 
 _bg_started = False
