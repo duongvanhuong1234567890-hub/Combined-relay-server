@@ -2289,14 +2289,52 @@ class _Fetcher:
                 return c
         return (http.client.HTTPSConnection if https else http.client.HTTPConnection)(u.hostname, port, timeout=15)
 
+    def _request(self, c, a, b):
+        """Gui GET Range a-b, tu theo redirect 301/302/303/307/308 (googlevideo hay 302 sang host khac tu giua file).
+        Tra ve (conn, response). Cap nhat self.url sang dia chi moi de cac chunk sau di thang."""
+        r = None
+        for _hop in range(5):
+            if c is None:
+                c = self._conn()
+            u = urllib.parse.urlsplit(self.url)
+            h = dict(self.hdr)
+            h["Range"] = f"bytes={a}-{b}"
+            try:
+                c.request("GET", u.path + ("?" + u.query if u.query else ""), headers=h)
+                r = c.getresponse()
+            except Exception:
+                try:
+                    c.close()
+                except Exception:
+                    pass
+                raise
+            if r.status in (301, 302, 303, 307, 308):
+                loc = r.getheader("Location", "")
+                try:
+                    r.read(512)
+                except Exception:
+                    pass
+                try:
+                    c.close()
+                except Exception:
+                    pass
+                c = None
+                if not loc:
+                    raise _ChunkError(r.status, f"HTTP {r.status} khong co Location")
+                new = urllib.parse.urljoin(self.url, loc)
+                if not new.startswith(("http://", "https://")) or not _url_is_public(new):
+                    raise _ChunkError(r.status, f"HTTP {r.status} redirect khong hop le")
+                if new != self.url:
+                    print(f"[turbo] theo redirect {r.status} -> {urllib.parse.urlsplit(new).hostname}", flush=True)
+                    self.url = new
+                continue
+            return c, r
+        raise _ChunkError(r.status if r is not None else 0, "qua nhieu redirect")
+
     def _fetch(self, c, idx):
         a = self.starts[idx]
         b = self.starts[idx + 1] - 1
-        u = urllib.parse.urlsplit(self.url)
-        h = dict(self.hdr)
-        h["Range"] = f"bytes={a}-{b}"
-        c.request("GET", u.path + ("?" + u.query if u.query else ""), headers=h)
-        r = c.getresponse()
+        c, r = self._request(c, a, b)
         if r.status != 206:
             # Khong doc ca than phan hoi (neu nguon bo qua Range se tra ca file 200 -> tran RAM)
             try:
@@ -2307,7 +2345,7 @@ class _Fetcher:
         data = r.read()
         if len(data) != b - a + 1:
             raise _ChunkError(r.status, f"thieu du lieu {len(data)}/{b - a + 1}B")
-        return data
+        return data, c
 
     def _next(self):
         for i in range(self.cursor, min(self.n, self.cursor + TURBO_AHEAD)):
@@ -2330,9 +2368,7 @@ class _Fetcher:
             last = None
             for attempt in range(3):
                 try:
-                    if c is None:
-                        c = self._conn()
-                    data = self._fetch(c, idx)
+                    data, c = self._fetch(c, idx)
                     break
                 except Exception as e:
                     last = e
@@ -2501,13 +2537,7 @@ def _turbo_fallback(f, pos, end):
         while pos <= end and not f.closed and tries < 4:
             start = pos
             try:
-                if c is None:
-                    c = f._conn()
-                u = urllib.parse.urlsplit(f.url)
-                h = dict(f.hdr)
-                h["Range"] = f"bytes={pos}-{end}"
-                c.request("GET", u.path + ("?" + u.query if u.query else ""), headers=h)
-                r = c.getresponse()
+                c, r = f._request(c, pos, end)
                 if r.status != 206:
                     raise _ChunkError(r.status, f"HTTP {r.status}")
                 while pos <= end:
