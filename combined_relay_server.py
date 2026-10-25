@@ -1230,7 +1230,26 @@ def _alt_streams(video_id, height_cap):
     raise ResolveError("khong instance Piped/Invidious nao dung duoc: " + " | ".join(errs)[:300])
 
 
+def _rapid_urls_usable(res):
+    """Thu 2 byte tu moi URL RapidAPI tra ve. 401/403/410 = URL khoa theo IP/het han (khong dung duoc tu Render);
+    loi mang tam thoi thi van coi la dung duoc de khong bo nham."""
+    for u in (res[0], res[1] if len(res) > 1 else None):
+        if not u:
+            continue
+        req = urllib.request.Request(u, headers={"User-Agent": UA, "Range": "bytes=0-1"})
+        try:
+            with urllib.request.urlopen(req, timeout=8) as r:
+                r.read(2)
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403, 410):
+                return False
+        except Exception:
+            pass
+    return True
+
+
 def _resolve_stream_urls_uncached(video_url, height_cap, background=False):
+    global _rs_off_until
     m = _YT_ID_RE.search(video_url or "")
     is_yt = bool(m and _is_youtube(video_url))
     if is_yt:
@@ -1245,6 +1264,10 @@ def _resolve_stream_urls_uncached(video_url, height_cap, background=False):
         if RAPID_STREAMS_ON and time.monotonic() >= _rs_off_until:
             try:
                 res = _rapid_streams_safe(vid, height_cap)
+                if not _rapid_urls_usable(res):
+                    # URL googlevideo bi khoa theo IP cua RapidAPI -> Render nhan 403, ffmpeg khong ra du lieu
+                    _rs_off_until = time.monotonic() + RAPID_SKIP_QUOTA
+                    raise ResolveError("RapidAPI streams: URL bi khoa theo IP (googlevideo 403), thu cach khac")
                 print(f"[resolve] RapidAPI (streams) OK cho {vid}", flush=True)
                 return res
             except ResolveError as e:
@@ -1484,6 +1507,13 @@ def _restart_when_idle():
     for _ in range(360):
         if _idle_for(20):
             print("[update] khoi dong lai de nap yt-dlp moi", flush=True)
+            if "gunicorn" in os.path.basename(sys.argv[0] or ""):
+                # Dang chay duoi gunicorn: execv trong worker se mo them 1 gunicorn thu hai, tranh cong 8000
+                # voi master ("Address already in use") va lam server chet vai giay. Gui HUP cho master de no
+                # tu nap worker moi mot cach dung quy trinh.
+                import signal
+                os.kill(os.getppid(), signal.SIGHUP)
+                return
             os.execv(sys.executable, [sys.executable] + sys.argv)
         time.sleep(10)
 
