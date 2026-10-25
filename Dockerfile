@@ -36,7 +36,7 @@ COPY --from=potbuild /src/server /root/bgutil-ytdlp-pot-provider/server
 
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt && playwright install --with-deps chromium
+RUN pip install --no-cache-dir -r requirements.txt && pip install --no-cache-dir -U --pre "yt-dlp[default]" && playwright install --with-deps chromium
 
 COPY combined_relay_server.py ./
 

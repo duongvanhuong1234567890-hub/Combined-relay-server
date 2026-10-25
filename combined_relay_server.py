@@ -17,7 +17,7 @@ import hmac
 import socket
 import ipaddress
 import gc
-from flask import Flask, request, Response, jsonify
+from flask import Flask, request, Response, jsonify, g
 from werkzeug.exceptions import HTTPException
 from werkzeug.serving import WSGIRequestHandler
 
@@ -291,6 +291,21 @@ def _purpose_headers(resp):
 
 _last_req = time.monotonic()
 KILL_ON_LEAVE = os.environ.get("KILL_ON_LEAVE", "1") == "1"
+_inflight = 0
+_inflight_lock = threading.Lock()
+
+
+def _inflight_add(d):
+    global _inflight
+    with _inflight_lock:
+        _inflight = max(0, _inflight + d)
+
+
+@app.teardown_request
+def _inflight_done(exc):
+    if getattr(g, "_inflight_on", False):
+        g._inflight_on = False
+        _inflight_add(-1)
 
 
 @app.before_request
@@ -299,6 +314,8 @@ def _role_gate():
     p = request.path
     if p not in ("/", "/healthz", "/about") and not p.startswith("/_src/"):
         _last_req = time.monotonic()
+        g._inflight_on = True
+        _inflight_add(1)
     if ROLE == "video" and p.startswith("/br"):
         return "disabled on this server (ROLE=video)", 404
     if ROLE == "browser" and p.startswith(("/stream", "/search")):
@@ -1842,7 +1859,7 @@ def _stream_elsewhere(max_age=60):
 
 
 def _idle_for(sec):
-    return (_active_streams == 0 and not _stream_elsewhere() and not _br_busy()
+    return (_active_streams == 0 and _inflight == 0 and not _stream_elsewhere() and not _br_busy()
             and time.monotonic() - _last_req >= sec)
 
 
@@ -1912,9 +1929,12 @@ def _update_ytdlp(min_gap=600):
         return before != after
 
 
+YTDLP_QUIET_SEC = float(os.environ.get("YTDLP_QUIET_SEC", "600"))
+
+
 def _restart_when_idle():
-    for _ in range(360):
-        if _idle_for(20):
+    for _ in range(720):
+        if _idle_for(YTDLP_QUIET_SEC):
             print("[update] khoi dong lai de nap yt-dlp moi", flush=True)
             if "gunicorn" in os.path.basename(sys.argv[0] or ""):
                 # Dang chay duoi gunicorn: execv trong worker se mo them 1 gunicorn thu hai, tranh cong 8000
@@ -1928,8 +1948,8 @@ def _restart_when_idle():
 
 
 def _update_and_maybe_restart(min_gap=600):
-    for _ in range(360):
-        if _idle_for(90):
+    for _ in range(720):
+        if _idle_for(YTDLP_QUIET_SEC):
             break
         time.sleep(10)
     else:
