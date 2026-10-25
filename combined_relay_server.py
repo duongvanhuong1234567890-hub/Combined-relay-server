@@ -22,25 +22,6 @@ from flask import Flask, request, Response, jsonify, g
 from werkzeug.exceptions import HTTPException
 from werkzeug.serving import WSGIRequestHandler
 
-import logging
-import builtins
-
-LOG_VERBOSE = os.environ.get("LOG_VERBOSE", "0") == "1"
-_LOG_KEEP = ("loi", "error", "canh bao", "khong tim thay", "blocked", "traceback", "exception", "ket thuc")
-_real_print = builtins.print
-
-
-def print(*args, **kwargs):
-    if not LOG_VERBOSE:
-        txt = " ".join(str(a) for a in args).lower()
-        if not any(k in txt for k in _LOG_KEEP):
-            return
-    _real_print(*args, **kwargs)
-
-
-if not LOG_VERBOSE:
-    logging.getLogger("werkzeug").setLevel(logging.ERROR)
-
 if not os.environ.get("MALLOC_ARENA_MAX"):
     try:
         import ctypes
@@ -58,7 +39,7 @@ _WARP_DIR = "/tmp/warp"
 
 
 def _warp_log(msg):
-    _real_print("[warp] " + msg, flush=True)
+    print("[warp] " + msg, flush=True)
 
 
 def _warp_fetch(url, dest, timeout=40):
@@ -4397,7 +4378,7 @@ def esp_exit_report():
     def _c(k, n=100):
         v = (request.args.get(k) or "?")[:n]
         return "".join(ch if 32 <= ord(ch) < 127 else "_" for ch in v)
-    _real_print(f"[esp-exit] why={_c('why', 120)} res={_c('res', 4)} played={_c('ms', 10)}ms recv={_c('kb', 10)}KB "
+    print(f"[esp-exit] why={_c('why', 120)} res={_c('res', 4)} played={_c('ms', 10)}ms recv={_c('kb', 10)}KB "
                 f"rssi={_c('rssi', 6)} heap={_c('heap', 10)} wifi={_c('wst', 4)} | {_who()}", flush=True)
     return Response("", 204)
 
