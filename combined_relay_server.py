@@ -26,7 +26,7 @@ import logging
 import builtins
 
 LOG_VERBOSE = os.environ.get("LOG_VERBOSE", "0") == "1"
-_LOG_KEEP = ("[tt]", "[pot]", "[dl-slow]", "loi", "error", "canh bao", "khong tim thay", "[proof]", "blocked", "traceback", "exception", "ket thuc")
+_LOG_KEEP = ("loi", "error", "canh bao", "khong tim thay", "blocked", "traceback", "exception", "ket thuc")
 _real_print = builtins.print
 
 
@@ -2591,7 +2591,7 @@ def _stream_impl(video_url):
     height_cap = str(max(_cap, _env_int("MIN_HEIGHT", 240)))
     _last_height_cap = height_cap
     fps = _int_arg("fps", 15, 1, 30)
-    _fmin = _env_int("STREAM_FPS_MIN", 0)
+    _fmin = _env_int("STREAM_FPS_MIN", 10)
     if _fmin:
         fps = min(30, max(fps, _fmin))
     fps = max(1, min(fps, STREAM_FPS_MAX))
@@ -2600,7 +2600,7 @@ def _stream_impl(video_url):
     bps_cap = _env_int("STREAM_MAX_BPS_CAP", 3000000)
     target_bps = _int_arg("bps", _env_int("STREAM_MAX_BPS", 1000000), 25000, max(25000, bps_cap))
     target_bps = max(target_bps, _env_int("STREAM_MIN_BPS", 160000))
-    burst_bytes = _env_int("STREAM_BURST_BYTES", 1536 * 1024)
+    burst_bytes = _env_int("STREAM_BURST_BYTES", 512 * 1024)
     is_yt = _is_youtube(video_url)
 
     if _mem_frac() > 0.70:
