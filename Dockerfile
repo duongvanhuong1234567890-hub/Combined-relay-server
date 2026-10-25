@@ -13,19 +13,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg ca-certificates curl fonts-noto-core fonts-noto-color-emoji fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
 
-# WARP (cai san luc build, server KHONG tai lai luc chay):
-#  - wgcf: dang ky tai khoan WARP. Tai truc tiep tu release (khong dung api.github.com, hay bi rate limit).
-#  - wireproxy: WireGuard -> HTTP proxy 127.0.0.1:8118 (khong can quyen NET_ADMIN).
-RUN curl -fsSL -o /usr/local/bin/wgcf \
-        "https://github.com/ViRb3/wgcf/releases/download/v${WGCF_VERSION}/wgcf_${WGCF_VERSION}_linux_amd64" \
-    && chmod +x /usr/local/bin/wgcf \
-    && mkdir -p /tmp/wp \
-    && curl -fsSL https://github.com/pufferffish/wireproxy/releases/latest/download/wireproxy_linux_amd64.tar.gz \
-        | tar -xz -C /tmp/wp \
-    && mv "$(find /tmp/wp -type f -name wireproxy | head -n 1)" /usr/local/bin/wireproxy \
-    && chmod +x /usr/local/bin/wireproxy \
-    && rm -rf /tmp/wp \
-    && wgcf --version >/dev/null 2>&1
+# WARP preinstall (TUY CHON): loi o day KHONG lam hong build. Neu that bai, server tu tai wgcf/wireproxy luc chay.
+#  - wgcf: tai truc tiep tu release (khong dung api.github.com, hay bi rate limit)
+#  - wireproxy: WireGuard -> HTTP proxy 127.0.0.1:8118 (khong can NET_ADMIN)
+RUN ( set -e; \
+      curl -fsSL -o /usr/local/bin/wgcf \
+          "https://github.com/ViRb3/wgcf/releases/download/v${WGCF_VERSION}/wgcf_${WGCF_VERSION}_linux_amd64"; \
+      mkdir -p /tmp/wp; \
+      curl -fsSL https://github.com/pufferffish/wireproxy/releases/latest/download/wireproxy_linux_amd64.tar.gz \
+          | tar -xz -C /tmp/wp; \
+      find /tmp/wp -type f -name wireproxy -exec mv {} /usr/local/bin/wireproxy \; ; \
+      chmod +x /usr/local/bin/wgcf /usr/local/bin/wireproxy; \
+      test -s /usr/local/bin/wgcf; \
+      test -s /usr/local/bin/wireproxy \
+    ) || { echo "[build] WARP preinstall that bai - bo qua, server se tu tai luc chay"; \
+           rm -f /usr/local/bin/wgcf /usr/local/bin/wireproxy; }; \
+    rm -rf /tmp/wp
 
 COPY --from=denoland/deno:bin /deno /usr/local/bin/deno
 # Plugin mac dinh tim server o ~/bgutil-ytdlp-pot-provider/server (HOME=/root)
