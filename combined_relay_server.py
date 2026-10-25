@@ -47,6 +47,127 @@ if not os.environ.get("MALLOC_ARENA_MAX"):
     except Exception:
         pass
 
+# ==================== WARP: doi IP thoat YouTube (khong can sua Dockerfile) ====================
+# Tu tai wireproxy + wgcf luc khoi dong, dang ky WARP mien phi, mo HTTP proxy 127.0.0.1:WARP_PORT
+# roi dat YT_PROXY (phai chay TRUOC dong YT_PROXY = os.environ.get(...) ben duoi).
+# Tat bang bien moi truong WARP=0. Neu da dat YT_PROXY thu cong thi bo qua. Loi thi chay nhu cu (khong proxy).
+WARP_ON = os.environ.get("WARP", "1") == "1"
+WARP_PORT = int(os.environ.get("WARP_PORT", "8118"))
+_WARP_DIR = "/tmp/warp"
+
+
+def _warp_log(msg):
+    _real_print("[warp] " + msg, flush=True)
+
+
+def _warp_fetch(url, dest, timeout=40):
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as r, open(dest, "wb") as f:
+        shutil.copyfileobj(r, f)
+
+
+def _warp_check(port):
+    """True neu proxy HTTP tren port that su di qua WARP."""
+    try:
+        px = f"http://127.0.0.1:{port}"
+        op = urllib.request.build_opener(urllib.request.ProxyHandler({"http": px, "https": px}))
+        with op.open("https://www.cloudflare.com/cdn-cgi/trace", timeout=12) as r:
+            txt = r.read(4000).decode("utf-8", "replace")
+        return "warp=on" in txt or "warp=plus" in txt
+    except Exception:
+        return False
+
+
+def _warp_start():
+    if not WARP_ON or os.environ.get("YT_PROXY", "").strip():
+        return
+    if os.environ.get("ROLE", "all").strip().lower() in ("browser", "google", "gg"):
+        return
+    try:
+        import platform
+        import tarfile
+        px = f"http://127.0.0.1:{WARP_PORT}"
+        if _warp_check(WARP_PORT):  # worker khoi dong lai (HUP): proxy cu van dang chay
+            os.environ["YT_PROXY"] = px
+            _warp_log(f"OK (dung lai proxy dang chay) -> YT_PROXY={px}")
+            return
+        os.makedirs(_WARP_DIR, exist_ok=True)
+        arch = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}.get(platform.machine().lower())
+        if not arch:
+            _warp_log(f"loi: kien truc khong ho tro: {platform.machine()}")
+            return
+        wp = os.path.join(_WARP_DIR, "wireproxy")
+        wg = os.path.join(_WARP_DIR, "wgcf")
+        if not os.path.exists(wp):
+            tgz = wp + ".tgz"
+            _warp_fetch(f"https://github.com/pufferffish/wireproxy/releases/latest/download/wireproxy_linux_{arch}.tar.gz", tgz)
+            with tarfile.open(tgz) as t:
+                mem = next((m for m in t.getmembers() if m.isfile() and os.path.basename(m.name) == "wireproxy"), None)
+                if mem is None:
+                    _warp_log("loi: khong thay file wireproxy trong goi tai ve")
+                    return
+                with t.extractfile(mem) as src, open(wp, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+            os.chmod(wp, 0o755)
+        if not os.path.exists(wg):
+            api = "https://api.github.com/repos/ViRb3/wgcf/releases/latest"
+            req = urllib.request.Request(api, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/vnd.github+json"})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                rel = json.loads(r.read().decode("utf-8", "replace"))
+            link = next((a["browser_download_url"] for a in rel.get("assets", [])
+                         if a.get("name", "").endswith(f"linux_{arch}")), "")
+            if not link:
+                _warp_log("loi: khong tim thay ban wgcf cho linux_" + arch)
+                return
+            _warp_fetch(link, wg)
+            os.chmod(wg, 0o755)
+        prof = os.path.join(_WARP_DIR, "wgcf-profile.conf")
+        if not os.path.exists(prof):
+            for args in (["register", "--accept-tos"], ["generate"]):
+                subprocess.run([wg] + args, cwd=_WARP_DIR, capture_output=True, timeout=45, stdin=subprocess.DEVNULL)
+        if not os.path.exists(prof):
+            _warp_log("loi: khong tao duoc profile WARP (wgcf register that bai)")
+            return
+        with open(prof, "r", encoding="utf-8") as fh:
+            conf = fh.read()
+        conf += f"\n[http]\nBindAddress = 127.0.0.1:{WARP_PORT}\n"
+        cpath = os.path.join(_WARP_DIR, "wireproxy.conf")
+        with open(cpath, "w", encoding="utf-8") as fh:
+            fh.write(conf)
+        logf = open(os.path.join(_WARP_DIR, "wireproxy.log"), "ab")
+        proc = subprocess.Popen([wp, "-c", cpath], stdout=logf, stderr=logf, stdin=subprocess.DEVNULL)
+        ok = False
+        for _ in range(8):
+            time.sleep(1)
+            if proc.poll() is not None:
+                break
+            try:
+                socket.create_connection(("127.0.0.1", WARP_PORT), timeout=1).close()
+                ok = _warp_check(WARP_PORT)
+                break
+            except OSError:
+                continue
+        if ok:
+            os.environ["YT_PROXY"] = px
+            _warp_log(f"OK -> YT_PROXY={px}")
+        else:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
+                with open(os.path.join(_WARP_DIR, "wireproxy.log"), "rb") as fh:
+                    tail = fh.read()[-300:].decode("utf-8", "replace")
+            except Exception:
+                tail = ""
+            _warp_log(f"loi: proxy khong len, chay khong proxy | {tail}")
+    except Exception as e:
+        _warp_log(f"loi: {type(e).__name__}: {str(e)[:200]}")
+
+
+_warp_start()
+# ==================== het khoi WARP ====================
+
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 1_000_000
 
