@@ -291,7 +291,9 @@ def _purpose_headers(resp):
 
 
 _last_req = time.monotonic()
-KILL_ON_LEAVE = os.environ.get("KILL_ON_LEAVE", "1") == "1"
+KILL_ON_LEAVE = os.environ.get("KILL_ON_LEAVE", "1") == "1"  # video MOI se tat video cu
+BR_KILL_ON_LEAVE = os.environ.get("BR_KILL_ON_LEAVE", "0") == "1"  # thoat/back/tap trong trinh duyet: KHONG tat stream
+PARK_SEC = float(os.environ.get("PARK_SEC", "120"))  # thoat video: giu ffmpeg chay nen toi da n giay (0 = tat ngay nhu cu)
 _reqbusy = 0
 _reqbusy_lock = threading.Lock()
 
@@ -1832,6 +1834,32 @@ def _kill_stream(why=""):
             pass
 
 
+def _park(proc, cleanup):
+    """Thiet bi thoat video: giu ffmpeg song, van nhan du lieu nguon (hut bo).
+    Tat khi: co video moi (_cur_proc bi kill) hoac het PARK_SEC."""
+    tm = threading.Timer(PARK_SEC, _kill_quiet, (proc,))
+    tm.daemon = True
+    tm.start()
+
+    def run():
+        try:
+            while proc.poll() is None:
+                if not proc.stdout.read1(65536):
+                    break
+        except Exception:
+            pass
+        finally:
+            tm.cancel()
+            _terminate(proc)
+            try:
+                cleanup()
+            except Exception:
+                pass
+            print("[stream] ffmpeg chay nen da dung (het gio hoac co video moi)", flush=True)
+
+    threading.Thread(target=run, daemon=True).start()
+
+
 _STREAM_MARK = "/tmp/relay_stream_%d" % os.getpid()
 
 
@@ -2685,8 +2713,9 @@ def _stream_impl(video_url):
         return jsonify({"error": "ffmpeg_no_output", "detail": "ffmpeg khong nhan duoc luong tu nguon"}), 502
 
     released = [False]
+    parked = [False]
 
-    def _release():
+    def _release(drop=True):
         with _active_lock:
             if released[0]:
                 return
@@ -2694,7 +2723,8 @@ def _stream_impl(video_url):
         _streams_add(-1)
         if _active_streams == 0:
             _mark_stream(False)
-        _drop_fetchers(sids)
+        if drop:
+            _drop_fetchers(sids)
 
     _csock = request.environ.get("gunicorn.socket")
 
@@ -2758,10 +2788,19 @@ def _stream_impl(video_url):
             print(f"[stream] KET THUC sau {time.monotonic() - t0:.0f}s, gui {sent // 1024}KB | ly do: {reason} | "
                   f"ffmpeg rc={rc} | lead={_lead()} | RAM {_mem_str()} | "
                   f"max_gap={max_gap:.1f}s im_lang_cuoi={time.monotonic() - last_t2:.1f}s | {_sock_diag(_csock)}", flush=True)
-            _release()
-            _terminate(proc)
+            if (reason.startswith("THIET BI") and PARK_SEC > 0 and proc.poll() is None
+                    and _cur_proc is proc):
+                parked[0] = True
+                _release(drop=False)
+                _park(proc, lambda: _drop_fetchers(sids))
+                print(f"[stream] thoat video -> giu ffmpeg chay nen toi da {PARK_SEC:.0f}s (video moi se thay the)", flush=True)
+            else:
+                _release()
+                _terminate(proc)
 
     def _reap():
+        if parked[0]:
+            return
         try:
             if proc.poll() is None:
                 proc.kill()
@@ -4441,7 +4480,7 @@ def br_action(action):
         return Response("unknown action", 404)
     if not _PIL_OK:
         return Response("thieu Pillow: them Pillow vao requirements.txt roi deploy lai", 503)
-    if KILL_ON_LEAVE and action in ("open", "tap", "type", "back", "reload"):
+    if BR_KILL_ON_LEAVE and action in ("open", "tap", "type", "back", "reload"):
         _kill_stream(_who())
     a = request.args.to_dict()
     portrait = a.get("o") == "1"
