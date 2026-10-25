@@ -156,20 +156,17 @@ def _role_gate():
         _last_req = time.monotonic()
     if ROLE == "video" and p.startswith("/br"):
         return "disabled on this server (ROLE=video)", 404
-    if ROLE == "browser" and p.startswith(("/stream", "/search", "/random", "/tt")):
+    if ROLE == "browser" and p.startswith(("/stream", "/search")):
         return "disabled on this server (ROLE=browser)", 404
     if p in ("/diag", "/myip") and not _tok_ok(request.args.get("k", ""), BR_TOKEN):
         return "forbidden - can dat BR_TOKEN tren server va them ?k=BR_TOKEN vao URL", 403
-    if STREAM_TOKEN and p.startswith(("/stream", "/search", "/random", "/tr", "/tt")) \
+    if STREAM_TOKEN and p.startswith(("/stream", "/search", "/tr")) \
             and not _tok_ok(request.args.get("tk", ""), STREAM_TOKEN):
         return "forbidden - them &tk=STREAM_TOKEN vao URL", 403
-    if p.startswith(("/stream", "/search", "/random")):
+    if p.startswith(("/stream", "/search")):
         _br_last_activity = 0.0
         if KILL_ON_LEAVE and p.startswith("/search"):
             _kill_stream(_who())
-        _cr_release_for_stream()
-    elif p.startswith("/tt"):
-        _br_last_activity = 0.0
         _cr_release_for_stream()
     return None
 
@@ -269,12 +266,6 @@ if os.path.exists(COOKIES_FILE):
         print("[cookies] CANH BAO: file qua nho, co the dan thieu noi dung hoac rong")
 else:
     print(f"[cookies] KHONG TIM THAY {COOKIES_FILE} - Secret File chua duoc tao dung, hoac sai ten file")
-
-
-_SECRET_PLAYLIST = "/etc/secrets/tiktok_links.txt"
-PLAYLIST_FILE = (os.environ.get("TIKTOK_LINKS_FILE")
-                 or (_SECRET_PLAYLIST if os.path.exists(_SECRET_PLAYLIST)
-                     else os.path.join(os.path.dirname(os.path.abspath(__file__)), "tiktok_links.txt")))
 
 
 class HTTP10RequestHandler(WSGIRequestHandler):
@@ -1684,37 +1675,6 @@ def warm_results(results):
     threading.Thread(target=_warm_worker, args=(ids, _warm_height()), daemon=True).start()
 
 
-def load_playlist():
-    lines = []
-    if os.path.exists(PLAYLIST_FILE):
-        with open(PLAYLIST_FILE, "r", encoding="utf-8") as f:
-            lines += [ln.strip() for ln in f]
-    env = os.environ.get("TIKTOK_LINKS", "")
-    if env:
-        lines += [x.strip() for x in re.split(r"[\s,]+", env)]
-    out, seen = [], set()
-    for ln in lines:
-        if ln and not ln.startswith("#") and ln not in seen:
-            seen.add(ln)
-            out.append(ln)
-    return out
-
-
-print(f"[tiktok] playlist: {PLAYLIST_FILE} ({'co' if os.path.exists(PLAYLIST_FILE) else 'KHONG TIM THAY'}), "
-      f"env TIKTOK_LINKS: {'co' if os.environ.get('TIKTOK_LINKS') else 'khong'}, tong {len(load_playlist())} link")
-
-
-@app.route("/random")
-def random_link():
-    links = load_playlist()
-    if not links:
-        return jsonify({
-            "error": f"Playlist rỗng hoặc chưa có file {os.path.basename(PLAYLIST_FILE)} - "
-                     f"thêm mỗi link TikTok 1 dòng vào file đó rồi thử lại."
-        }), 404
-    return jsonify({"url": random.choice(links)})
-
-
 @app.route("/stream")
 def stream():
     return _stream_impl(request.args.get("url", ""))
@@ -2578,7 +2538,6 @@ def _decode(raw, cs):
 _VIDEO_RE = re.compile(
     r"^https?://([a-z0-9-]+\.)*("
     r"youtube\.com/(watch|shorts/|live/|embed/)|youtu\.be/|"
-    r"tiktok\.com/(@[^/]+/video/|t/|v/)|vm\.tiktok\.com/|vt\.tiktok\.com/|"
     r"facebook\.com/(reel/|watch/?\?v=|[^/]+/videos/|video\.php)|fb\.watch/|"
     r"instagram\.com/(reel|reels|tv)/|vimeo\.com/\d+|dailymotion\.com/video/|"
     r"bilibili\.com/video/)", re.I)
@@ -2857,7 +2816,7 @@ def _text(d, s, head=0, bold=0):
 
 _HOME_HTML = """<h2>Trình duyệt</h2>
 <form action="%s" method="get"><input name="q" placeholder="Tìm kiếm hoặc gõ link"><button>Tìm</button></form>
-<p>Dán link video (YouTube, TikTok, Facebook...) để phát.</p>
+<p>Dán link video (YouTube, Facebook...) để phát.</p>
 <ul>
 <li><a href="https://vi.wikipedia.org">Wikipedia</a></li>
 <li><a href="https://vnexpress.net">VnExpress</a></li>
@@ -3435,7 +3394,7 @@ def _cr_home_html():
     act = html.escape(BR_SEARCH_URL.split("?")[0], quote=True)
     return ("<!doctype html><meta charset=utf-8><title>Trình duyệt</title><style>%s</style><h2>Trình duyệt</h2>"
             "<form action=\"%s\" method=\"get\"><input name=\"q\" placeholder=\"Tìm kiếm hoặc gõ link\"> <button>Tìm</button></form>"
-            "<p>Dán link video (YouTube, TikTok, Facebook...) để phát.</p><ul>"
+            "<p>Dán link video (YouTube, Facebook...) để phát.</p><ul>"
             "<li><a href=\"https://vi.wikipedia.org\">Wikipedia</a></li><li><a href=\"https://vnexpress.net\">VnExpress</a></li>"
             "<li><a href=\"https://tuoitre.vn\">Tuổi Trẻ</a></li><li><a href=\"https://thanhnien.vn\">Thanh Niên</a></li>"
             "<li><a href=\"https://news.ycombinator.com\">Hacker News</a></li></ul>") % (_CR_PAGE_CSS, act)
@@ -4069,414 +4028,6 @@ def _pot_selfcheck():
     except Exception as e:
         print(f"[pot] LOI: khong chay duoc deno: {type(e).__name__}: {str(e)[:200]}", flush=True)
 
-
-
-# =====================================================================
-#  UNG DUNG TIKTOK (/tt/*) - man hinh ngang kieu iPad tren T-Display S3
-#  /tt/feed     danh sach video (tac gia, mo ta, tim, binh luan, link stream, link anh bia)
-#  /tt/thumb    anh bia da cat/thu nho dung kich thuoc man hinh (JPEG nho)
-#  /tt/comments binh luan (best-effort, phu thuoc yt-dlp)
-#  Phat video: dung /stream co san, link da duoc ghep san trong truong "stream".
-# =====================================================================
-TT_FEED_WAIT = float(os.environ.get("TT_FEED_WAIT", "7"))
-TT_META_TTL = float(os.environ.get("TT_META_TTL", "21600"))
-TT_PAGE_TTL = float(os.environ.get("TT_PAGE_TTL", "900"))
-TT_PAGE_MAX = int(os.environ.get("TT_PAGE_MAX", "20"))
-TT_MAX_META = int(os.environ.get("TT_MAX_META", "400"))
-_TT_ID = re.compile(r"/video/(\d{6,25})")
-_TT_HOST = re.compile(r"^https?://([a-z0-9-]+\.)*tiktok\.com(/|$)", re.I)
-_TT_USER_PAGE = re.compile(r"^https?://([a-z0-9-]+\.)*tiktok\.com/(@[^/?#]+|tag/[^/?#]+)/?(\?.*)?$", re.I)
-TT_AUTO_TAGS = [x.strip().lstrip("#") for x in os.environ.get("TT_AUTO_TAGS", "fyp,viral,xuhuong,trending").split(",") if x.strip()]
-_TT_NAME = re.compile(r"^[A-Za-z0-9._]{1,40}$")
-TT_AUTO_USERS = [x.strip().lstrip("@") for x in os.environ.get("TT_AUTO_USERS", "").split(",") if x.strip()]
-# Nhom tai khoan cong khai co san (dung khi khong co playlist) - co the ghi de bang bien TT_AUTO_USERS
-_TT_DEFAULT_USERS = ["khaby.lame", "mrbeast", "zachking", "gordonramsayofficial", "nasa", "willsmith",
-                     "charlidamelio", "bellapoarch", "therock", "spencerx", "tiktok", "chefreactions"]
-TT_EXPLORE_TTL = float(os.environ.get("TT_EXPLORE_TTL", "600"))
-_TT_EXPLORE_PAGES = ("https://www.tiktok.com/explore", "https://www.tiktok.com/foryou")
-_TT_VIDEO_LINK = re.compile(r"/@([\w.\-]{1,40})/video/(\d{6,25})")
-_tt_explore_cache = [float("-inf"), []]
-_tt_last_err = [""]
-_tt_keep = []
-_tt_meta = {}
-_tt_pages = {}
-_tt_inflight = {}
-_tt_comments = {}
-_tt_thumbs = {}
-_tt_lock = threading.Lock()
-_TT_LOW = bool((_mi0 := _mem_info()) and _mi0[1] < 1024)
-TT_PAR = max(1, _env_int("TT_YDL_PAR", 1 if _TT_LOW else 2))
-TT_FEED_BUDGET = float(os.environ.get("TT_FEED_BUDGET", "12"))
-TT_MEM_STOP = float(os.environ.get("TT_MEM_STOP", "0.85"))
-TT_COMMENTS = os.environ.get("TT_COMMENTS", "0" if _TT_LOW else "1") == "1"
-_tt_gate = threading.BoundedSemaphore(TT_PAR)
-_tt_img_gate = threading.BoundedSemaphore(2)
-_tt_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="tt")
-
-
-def _tt_yield():
-    """Nhuong CPU/RAM cho luong video dang phat va khi RAM sat tran (Render free: 512MB, CPU rat yeu)."""
-    return _active_streams > 0 or _mem_frac() > TT_MEM_STOP
-
-
-def _tt_n(v):
-    """12345 -> '12.3K' cho vua man hinh nho."""
-    try:
-        n = int(v)
-    except (TypeError, ValueError):
-        return ""
-    if n >= 1_000_000_000:
-        return f"{n / 1e9:.1f}B".replace(".0B", "B")
-    if n >= 1_000_000:
-        return f"{n / 1e6:.1f}M".replace(".0M", "M")
-    if n >= 1000:
-        return f"{n / 1e3:.1f}K".replace(".0K", "K")
-    return str(n)
-
-
-def _tt_key(url):
-    m = _TT_ID.search(url or "")
-    return m.group(1) if m else (url or "")
-
-
-def _tt_ydl(flat=False):
-    o = {"quiet": True, "no_warnings": True, "skip_download": True, "socket_timeout": 10,
-         "retries": 1, "extractor_retries": 1, "noplaylist": not flat}
-    if flat:
-        o["extract_flat"] = True
-        o["playlistend"] = TT_PAGE_MAX
-    return o
-
-
-def _tt_stub(url):
-    return {"id": _tt_key(url), "url": url, "author": "", "handle": "", "title": "", "likes": None,
-            "comments": None, "shares": None, "views": None, "dur": 0, "thumb_src": "", "ready": False}
-
-
-def _tt_item(info, url):
-    uid = info.get("uploader_id")
-    return {
-        "id": str(info.get("id") or _tt_key(url)),
-        "url": info.get("webpage_url") or url,
-        "author": str(info.get("uploader") or info.get("channel") or "")[:40],
-        "handle": ("@" + str(uid)) if uid else "",
-        "title": str(info.get("description") or info.get("title") or "")[:220],
-        "likes": info.get("like_count"), "comments": info.get("comment_count"),
-        "shares": info.get("repost_count"), "views": info.get("view_count"),
-        "dur": int(info.get("duration") or 0), "thumb_src": str(info.get("thumbnail") or ""), "ready": True,
-    }
-
-
-def _tt_store(key, item, ttl_left=None):
-    ts = time.monotonic() if ttl_left is None else time.monotonic() - TT_META_TTL + ttl_left
-    with _tt_lock:
-        if len(_tt_meta) >= TT_MAX_META:
-            for k in sorted(_tt_meta, key=lambda k: _tt_meta[k][0])[:TT_MAX_META // 4]:
-                _tt_meta.pop(k, None)
-        _tt_meta[key] = (ts, item)
-        if item.get("id") and item["id"] != key and item.get("ready"):
-            _tt_meta[item["id"]] = (ts, item)
-
-
-def _tt_fetch_meta(url, key):
-    if _tt_yield():
-        item = _tt_stub(url)
-        _tt_store(key, item, ttl_left=15)
-        return item
-    try:
-        with _tt_gate:
-            with yt_dlp.YoutubeDL(_tt_ydl()) as ydl:
-                info = ydl.extract_info(url, download=False)
-        if info and "entries" in info:
-            info = next((e for e in (info.get("entries") or []) if e), None)
-        if not info:
-            raise RuntimeError("khong co thong tin")
-        item = _tt_item(info, url)
-        _tt_store(key, item)
-        return item
-    except Exception as e:
-        _tt_last_err[0] = "meta: " + str(e)[:100]
-        print(f"[tt] loi meta {key}: {str(e)[:120]}", flush=True)
-        item = _tt_stub(url)
-        _tt_store(key, item, ttl_left=120)
-        return item
-
-
-def _tt_meta_future(url):
-    key = _tt_key(url)
-    with _tt_lock:
-        hit = _tt_meta.get(key)
-        if hit and time.monotonic() - hit[0] < TT_META_TTL:
-            f = concurrent.futures.Future()
-            f.set_result(hit[1])
-            return f
-        f = _tt_inflight.get(key)
-        if f is not None:
-            return f
-        f = _tt_inflight[key] = _tt_pool.submit(_tt_fetch_meta, url, key)
-    f.add_done_callback(lambda _f, k=key: _tt_inflight.pop(k, None))
-    return f
-
-
-def _tt_expand(src):
-    """Dong trong playlist co the la link video hoac trang nguoi dung (@ten) -> danh sach link video."""
-    if not _TT_USER_PAGE.match(src):
-        return [src]
-    now = time.monotonic()
-    with _tt_lock:
-        hit = _tt_pages.get(src)
-    if hit and now - hit[0] < TT_PAGE_TTL:
-        return hit[1]
-    if _tt_yield():
-        return hit[1] if hit else []
-    urls = []
-    try:
-        with _tt_gate:
-            with yt_dlp.YoutubeDL(_tt_ydl(flat=True)) as ydl:
-                info = ydl.extract_info(src, download=False)
-        for e in (info or {}).get("entries") or []:
-            u = (e or {}).get("url") or (e or {}).get("webpage_url") or ""
-            if _TT_HOST.match(u) and _TT_ID.search(u):
-                urls.append(u)
-    except Exception as e:
-        _tt_last_err[0] = "trang: " + str(e)[:100]
-        print(f"[tt] loi trang nguoi dung {src}: {str(e)[:120]}", flush=True)
-    with _tt_lock:
-        _tt_pages[src] = (now if urls else now - TT_PAGE_TTL + 60, urls)
-        if len(_tt_pages) > 60:
-            _tt_pages.pop(next(iter(_tt_pages)), None)
-    return urls
-
-
-def _tt_explore():
-    """Thu lay link video de xuat truc tiep tu trang explore/foryou cong khai cua TikTok (khong can dang nhap)."""
-    now = time.monotonic()
-    with _tt_lock:
-        if now - _tt_explore_cache[0] < TT_EXPLORE_TTL:
-            return list(_tt_explore_cache[1])
-    if _tt_yield():
-        return []
-    found, dup = [], set()
-    for page in _TT_EXPLORE_PAGES:
-        try:
-            _, _, _, raw = _http(page, limit=600000, timeout=5)
-        except Exception as e:
-            _tt_last_err[0] = "explore: " + str(e)[:100]
-            print(f"[tt] loi explore {page}: {str(e)[:100]}", flush=True)
-            continue
-        txt = raw.decode("utf-8", "replace").replace("\\u002F", "/").replace("\\/", "/")
-        for m in _TT_VIDEO_LINK.finditer(txt):
-            if m.group(2) not in dup:
-                dup.add(m.group(2))
-                found.append(f"https://www.tiktok.com/@{m.group(1)}/video/{m.group(2)}")
-        del raw, txt
-    with _tt_lock:
-        _tt_explore_cache[0] = now if found else now - TT_EXPLORE_TTL + 60
-        _tt_explore_cache[1] = found
-    print(f"[tt] explore: {len(found)} video", flush=True)
-    return list(found)
-
-
-def _tt_auto_sources():
-    """Tu de xuat khi khong co playlist: trang tai khoan ngau nhien + 1 trang tag."""
-    pool = TT_AUTO_USERS or _TT_DEFAULT_USERS
-    src = [f"https://www.tiktok.com/@{u}" for u in random.sample(pool, min(3, len(pool)))]
-    if TT_AUTO_TAGS:
-        src.append(f"https://www.tiktok.com/tag/{urllib.parse.quote(random.choice(TT_AUTO_TAGS))}")
-    return src
-
-
-def _tt_arg(name, default, lo, hi):
-    try:
-        return max(lo, min(hi, int(request.args.get(name, default))))
-    except (TypeError, ValueError):
-        return default
-
-
-def _tt_public(item, w, h, fps, tw, th):
-    q = urllib.parse.quote(item["url"], safe="")
-    return {
-        "id": item["id"], "url": item["url"], "ready": item["ready"],
-        "author": item["author"], "handle": item["handle"], "title": item["title"],
-        "likes": _tt_n(item["likes"]), "comments": _tt_n(item["comments"]),
-        "shares": _tt_n(item["shares"]), "views": _tt_n(item["views"]), "dur": item["dur"],
-        "stream": f"/stream?url={q}&w={w}&h={h}&fps={fps}&height_cap=480",
-        "thumb": f"/tt/thumb?u={q}&w={tw}&h={th}",
-        "comments_url": f"/tt/comments?u={q}",
-    }
-
-
-@app.route("/tt/feed")
-def tt_feed():
-    n = _tt_arg("n", 6, 1, 12)
-    w = _tt_arg("w", 96, 16, 320)
-    h = _tt_arg("h", 170, 16, 320)
-    w -= w % 2
-    h -= h % 2
-    fps = _tt_arg("fps", 12, 1, 30)
-    tw = _tt_arg("tw", 54, 16, 320)
-    th = _tt_arg("th", 96, 16, 320)
-    seen = {x for x in request.args.get("seen", "").split(",") if x}
-    t_end = time.monotonic() + TT_FEED_BUDGET
-    extra, ex_f = [], None
-    user = request.args.get("user", "").strip().lstrip("@")
-    if user:
-        if not _TT_NAME.match(user):
-            return jsonify({"error": "ten nguoi dung khong hop le"}), 400
-        sources = [f"https://www.tiktok.com/@{user}"]
-    else:
-        sources = load_playlist()
-        if not sources:
-            ex_f = _tt_pool.submit(_tt_explore)
-            sources = _tt_auto_sources()
-        random.shuffle(sources)
-    sources = [x for x in sources if _TT_HOST.match(x) or "tiktok" in x][:TT_PAR + 2] or sources[:TT_PAR + 2]
-    if _tt_yield():
-        sources = []
-    exps = [_tt_pool.submit(_tt_expand, x) for x in sources]
-    concurrent.futures.wait(exps + ([ex_f] if ex_f else []),
-                            timeout=max(1.0, min(TT_FEED_WAIT + 3, t_end - time.monotonic() - 3)))
-    if ex_f is not None and ex_f.done():
-        try:
-            extra = list(ex_f.result(timeout=0))
-        except Exception:
-            extra = []
-    cands, dup = [], set()
-    random.shuffle(extra)
-    for f in [None] + exps:
-        if f is None:
-            urls = list(extra)
-        else:
-            try:
-                urls = f.result(timeout=0) if f.done() else []
-            except Exception:
-                urls = []
-            urls = list(urls)
-            random.shuffle(urls)
-        for u in urls:
-            k = _tt_key(u)
-            if k in seen or k in dup or not _url_is_public(u):
-                continue
-            dup.add(k)
-            cands.append(u)
-    random.shuffle(cands)
-    n_cands = len(cands)
-    with _tt_lock:
-        if cands:
-            for u in cands:
-                if u not in _tt_keep:
-                    _tt_keep.append(u)
-            del _tt_keep[:-200]
-        elif _tt_keep:
-            pool = [u for u in _tt_keep if _tt_key(u) not in seen] or list(_tt_keep)
-            random.shuffle(pool)
-            cands = pool[:n]
-    cands = cands[:n]
-    print(f"[tt] feed: nguon={len(sources)} explore={len(extra)} ung_vien={n_cands} tra_ve={len(cands)}", flush=True)
-    futs = [_tt_meta_future(u) for u in cands]
-    concurrent.futures.wait(futs, timeout=max(0.5, min(TT_FEED_WAIT, t_end - time.monotonic())))
-    items = []
-    for u, f in zip(cands, futs):
-        try:
-            it = f.result(timeout=0) if f.done() else _tt_stub(u)
-        except Exception:
-            it = _tt_stub(u)
-        items.append(_tt_public(it, w, h, fps, tw, th))
-    out = {"items": items}
-    if not items:
-        out["reason"] = _tt_last_err[0] or "khong lay duoc video nao (TikTok chan hoac nguon rong)"
-    if request.args.get("debug"):
-        out["debug"] = {"sources": sources, "explore": len(extra), "candidates": n_cands,
-                        "ready": sum(1 for x in items if x["ready"]), "yt_dlp": _ytdlp_version()}
-    return jsonify(out)
-
-
-def _tt_cover(im, w, h):
-    r = max(w / im.width, h / im.height)
-    nw, nh = max(w, int(im.width * r + 0.5)), max(h, int(im.height * r + 0.5))
-    im = im.resize((nw, nh), Image.BILINEAR)
-    x0, y0 = (nw - w) // 2, (nh - h) // 2
-    return im.crop((x0, y0, x0 + w, y0 + h))
-
-
-@app.route("/tt/thumb")
-def tt_thumb():
-    if not _PIL_OK:
-        return Response("thieu Pillow", 503)
-    url = (request.args.get("u") or "").strip()
-    if not (_TT_HOST.match(url) and _url_is_public(url)):
-        return Response("link khong hop le", 400)
-    w = _tt_arg("w", 54, 16, 320)
-    h = _tt_arg("h", 96, 16, 320)
-    ck = (_tt_key(url), w, h)
-    with _tt_lock:
-        jpg = _tt_thumbs.get(ck)
-    if jpg is None:
-        try:
-            item = _tt_meta_future(url).result(timeout=12)
-            src = item.get("thumb_src")
-            if not src:
-                return Response("khong co anh bia", 404)
-            with _tt_img_gate:
-                _, _, _, raw = _http(src, limit=800000, timeout=6)
-                im = _decode_image(raw)
-                del raw
-                if im is None:
-                    return Response("khong doc duoc anh", 502)
-                im = _tt_cover(im, w, h)
-        except Exception as e:
-            print(f"[tt] loi anh bia: {str(e)[:100]}", flush=True)
-            return Response("loi anh bia", 502)
-        q = 72
-        while True:
-            buf = io.BytesIO()
-            im.save(buf, "JPEG", quality=q)
-            if buf.tell() <= 14000 or q <= 30:
-                break
-            q -= 10
-        jpg = buf.getvalue()
-        with _tt_lock:
-            if len(_tt_thumbs) >= 80:
-                _tt_thumbs.pop(next(iter(_tt_thumbs)), None)
-            _tt_thumbs[ck] = jpg
-    return Response(jpg, mimetype="image/jpeg", headers={"Cache-Control": "public, max-age=3600"})
-
-
-@app.route("/tt/comments")
-def tt_comments():
-    url = (request.args.get("u") or "").strip()
-    if not (_TT_HOST.match(url) and _url_is_public(url)):
-        return jsonify({"error": "link khong hop le"}), 400
-    n = _tt_arg("n", 8, 1, 20)
-    key = _tt_key(url)
-    with _tt_lock:
-        hit = _tt_comments.get(key)
-    if not hit and (not TT_COMMENTS or _tt_yield()):
-        return jsonify({"items": [], "supported": False})
-    if hit and time.monotonic() - hit[0] < 1800:
-        return jsonify({"items": hit[1][:n], "supported": hit[2]})
-    items, supported = [], True
-    try:
-        o = _tt_ydl()
-        o["getcomments"] = True
-        with _tt_gate:
-            with yt_dlp.YoutubeDL(o) as ydl:
-                info = ydl.extract_info(url, download=False)
-        cm = (info or {}).get("comments")
-        if cm is None:
-            supported = False
-        else:
-            for c in cm[:20]:
-                items.append({"user": str(c.get("author") or "")[:30], "text": str(c.get("text") or "")[:160],
-                              "likes": _tt_n(c.get("like_count"))})
-    except Exception as e:
-        print(f"[tt] loi binh luan {key}: {str(e)[:120]}", flush=True)
-        supported = False
-    with _tt_lock:
-        if len(_tt_comments) > 60:
-            _tt_comments.pop(next(iter(_tt_comments)), None)
-        _tt_comments[key] = (time.monotonic(), items, supported)
-    return jsonify({"items": items[:n], "supported": supported})
 
 
 _bg_started = False
