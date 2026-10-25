@@ -944,6 +944,7 @@ RAPID_FAST_HOST = os.environ.get("RAPID_FAST_HOST", "youtube-video-fast-download
 RAPID_FAST_QUALITY = os.environ.get("RAPID_FAST_QUALITY", "18").strip()
 RAPID_FAST_QUALITY_LOW = os.environ.get("RAPID_FAST_QUALITY_LOW", "17").strip()
 RAPID_FILE_WAIT = float(os.environ.get("RAPID_FILE_WAIT", "45"))
+RAPID_POLL = max(0.5, float(os.environ.get("RAPID_POLL", "1.5")))
 RAPID_API_TIMEOUT = float(os.environ.get("RAPID_API_TIMEOUT", "40"))
 RAPID_SKIP_413 = float(os.environ.get("RAPID_SKIP_413", "1800"))
 RAPID_SKIP_OTHER = float(os.environ.get("RAPID_SKIP_OTHER", "90"))
@@ -1028,7 +1029,7 @@ def _rapid_fast_file(video_id):
             pass
         if time.monotonic() > deadline:
             raise ResolveError(f"file chua san sang sau {RAPID_FILE_WAIT:.0f}s")
-        time.sleep(5)
+        time.sleep(RAPID_POLL)
     print("[rapid] file san sang, bat dau phat", flush=True)
     return file_url, None, "", ""
 
@@ -1436,17 +1437,101 @@ YT_FIRST_BUDGET = float(os.environ.get("YT_FIRST_BUDGET", "25"))
 YT_FIRST_GATE = float(os.environ.get("YT_FIRST_GATE", "5"))
 
 
+# Chay dua giua 2 NGUON khac nhau (yt-dlp va RapidAPI file) thay vi doi yt-dlp that bai roi moi thu RapidAPI.
+# Log that: yt-dlp 33-70s, RapidAPI file 10-50s. Tong tuan tu = ~50-100s, chay dua = min(). RACE_RAPID=0 de tat.
+# Luu y: moi lan chay dua se ton 1 luot RapidAPI ke ca khi yt-dlp len truoc.
+RACE_RAPID = os.environ.get("RACE_RAPID", "1") == "1"
+
+
+def _race_ytdlp_rapid(video_url, height_cap, vid):
+    box = {"res": None, "src": None, "yt_err": None, "rapid_err": None, "yt_done": False, "rapid_done": False}
+    cv = threading.Condition()
+    t0 = time.monotonic()
+
+    def _finish(key_err, key_done, err):
+        with cv:
+            box[key_err] = err
+            box[key_done] = True
+            cv.notify_all()
+
+    def _yt():
+        err = None
+        try:
+            if _resolve_gate.acquire(timeout=YT_FIRST_GATE):
+                try:
+                    r = _resolve_stream_urls_inner(video_url, height_cap, YT_FIRST_BUDGET, False)
+                    with cv:
+                        if box["res"] is None:
+                            box["res"], box["src"] = r, "yt-dlp"
+                            cv.notify_all()
+                finally:
+                    _resolve_gate.release()
+            else:
+                err = ResolveError("yt-dlp bo qua: dang co resolve khac")
+        except Exception as e:
+            err = e
+        _finish("yt_err", "yt_done", err)
+
+    def _rp():
+        err = None
+        try:
+            if _rapid_should_skip(vid):
+                err = ResolveError("bo qua RapidAPI (vua that bai)")
+            else:
+                r = _rapid_fast_file(vid)
+                with cv:
+                    if box["res"] is None:
+                        box["res"], box["src"] = r, "rapidapi"
+                        cv.notify_all()
+        except ResolveError as e:
+            _rapid_note_failure(vid, str(e))
+            err = e
+        except Exception as e:
+            err = e
+        _finish("rapid_err", "rapid_done", err)
+
+    threading.Thread(target=_yt, daemon=True).start()
+    threading.Thread(target=_rp, daemon=True).start()
+    deadline = t0 + max(YT_FIRST_BUDGET + 60.0, RAPID_FILE_WAIT + RAPID_API_TIMEOUT + 10.0)
+    with cv:
+        while box["res"] is None and not (box["yt_done"] and box["rapid_done"]):
+            ye = box["yt_err"]
+            if isinstance(ye, ResolveError) and ye.permanent:
+                break  # video rieng tu/bi go: khong can cho RapidAPI
+            rem = deadline - time.monotonic()
+            if rem <= 0:
+                break
+            cv.wait(min(rem, 1.0))
+    if box["res"] is not None:
+        print(f"[race] {box['src']} thang sau {time.monotonic() - t0:.1f}s cho {vid}", flush=True)
+    else:
+        print(f"[race] ca 2 nguon that bai sau {time.monotonic() - t0:.1f}s cho {vid}", flush=True)
+    return box
+
+
 def _resolve_stream_urls_uncached(video_url, height_cap, background=False):
     global _rs_off_until
     m = _YT_ID_RE.search(video_url or "")
     is_yt = bool(m and _is_youtube(video_url))
     yt_first_tried = False
     yt_first_err = None
+    race_ran = False
+    race_rapid_err = None
     if is_yt and _geo_known(m.group(1)):
         # Da biet video bi chan theo vung: khong ton ~30s thu yt-dlp nua, di thang RapidAPI/Piped
         print(f"[resolve] {m.group(1)} bi chan theo vung (da biet) -> bo qua yt-dlp", flush=True)
         yt_first_tried = True
         yt_first_err = ResolveError("video bi chan theo vung (khong phat duoc o vung may chu)")
+    elif is_yt and RACE_RAPID and RAPID_KEY and YT_FIRST and not background:
+        _bx = _race_ytdlp_rapid(video_url, height_cap, m.group(1))
+        if _bx["res"] is not None:
+            return _bx["res"]
+        race_ran = True
+        yt_first_tried = True
+        yt_first_err = _bx["yt_err"]
+        race_rapid_err = _bx["rapid_err"]
+        if isinstance(yt_first_err, ResolveError) and yt_first_err.permanent:
+            raise yt_first_err
     elif is_yt and YT_FIRST and not background:
         # Thu yt-dlp truoc (chat luong cao theo height_cap); that bai thi roi xuong direct/RapidAPI
         if _resolve_gate.acquire(timeout=YT_FIRST_GATE):
@@ -1470,8 +1555,8 @@ def _resolve_stream_urls_uncached(video_url, height_cap, background=False):
         _d = _try_direct(m.group(1), height_cap)
         if _d:
             return _d
-    use_rapid = bool(RAPID_KEY and is_yt) and (WARM_RAPID or not background)
-    rapid_err = None
+    use_rapid = bool(RAPID_KEY and is_yt) and (WARM_RAPID or not background) and not race_ran
+    rapid_err = race_rapid_err
 
     if use_rapid:
         vid = m.group(1)
@@ -1523,7 +1608,7 @@ def _resolve_stream_urls_uncached(video_url, height_cap, background=False):
 
 # Chay dua (race): thu nhieu client yt-dlp CUNG LUC, cai nao xong truoc thi dung. YT_RACE_PAR=1 de quay ve tuan tu.
 # Moi lan chua co "cach tot" nao duoc nho thi dua YT_RACE_FIRST (mac dinh mweb) len dau.
-YT_RACE_PAR = max(1, int(os.environ.get("YT_RACE_PAR", "2")))
+YT_RACE_PAR = max(1, int(os.environ.get("YT_RACE_PAR", "1")))
 YT_RACE_FIRST = os.environ.get("YT_RACE_FIRST", "mweb").strip()
 
 
