@@ -315,7 +315,7 @@ def _reqbusy_done(exc):
 def _role_gate():
     global _br_last_activity, _last_req
     p = request.path
-    if p not in ("/", "/healthz", "/about") and not p.startswith("/_src/"):
+    if p not in ("/", "/healthz", "/about", "/dbg") and not p.startswith("/_src/"):
         _last_req = time.monotonic()
         g._reqbusy_on = True
         _reqbusy_add(1)
@@ -4577,6 +4577,17 @@ def br_action(action):
     if play:
         h["X-Play"] = _clip_pct(urllib.parse.quote(play, safe=":/?&=%#@,+;~-._!*()'$"), 700)
     return Response(jpg, mimetype="image/jpeg", headers=h)
+
+
+@app.route("/dbg")
+def esp_exit_report():
+    """ESP bao ly do no tu thoat video (de biet ben nao ngat). Chi ghi log, khong lam gi khac."""
+    def _c(k, n=100):
+        v = (request.args.get(k) or "?")[:n]
+        return "".join(ch if 32 <= ord(ch) < 127 else "_" for ch in v)
+    _real_print(f"[esp-exit] why={_c('why', 120)} res={_c('res', 4)} played={_c('ms', 10)}ms recv={_c('kb', 10)}KB "
+                f"rssi={_c('rssi', 6)} heap={_c('heap', 10)} wifi={_c('wst', 4)} | {_who()}", flush=True)
+    return Response("", 204)
 
 
 def _log(*a):
