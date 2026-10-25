@@ -110,16 +110,34 @@ def _warp_start():
                     shutil.copyfileobj(src, dst)
             os.chmod(wp, 0o755)
         if not os.path.exists(wg):
-            api = "https://api.github.com/repos/ViRb3/wgcf/releases/latest"
-            req = urllib.request.Request(api, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/vnd.github+json"})
-            with urllib.request.urlopen(req, timeout=20) as r:
-                rel = json.loads(r.read().decode("utf-8", "replace"))
-            link = next((a["browser_download_url"] for a in rel.get("assets", [])
-                         if a.get("name", "").endswith(f"linux_{arch}")), "")
-            if not link:
-                _warp_log("loi: khong tim thay ban wgcf cho linux_" + arch)
+            # Khong dung api.github.com (hay bi "rate limit exceeded" tren IP Render).
+            # /releases/latest se redirect sang .../tag/vX.Y.Z -> lay so phien ban tu URL cuoi.
+            tags = []
+            try:
+                req = urllib.request.Request("https://github.com/ViRb3/wgcf/releases/latest", headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=20) as r:
+                    m = re.search(r"/tag/(v[0-9][0-9.]*)", r.geturl())
+                    if m:
+                        tags.append(m.group(1))
+            except Exception as e:
+                _warp_log(f"canh bao: khong lay duoc phien ban wgcf moi nhat ({type(e).__name__}), dung ban ghim")
+            tags.append("v2.2.22")  # ban ghim du phong
+            got = False
+            for tag in tags:
+                link = f"https://github.com/ViRb3/wgcf/releases/download/{tag}/wgcf_{tag[1:]}_linux_{arch}"
+                try:
+                    _warp_fetch(link, wg)
+                    got = True
+                    break
+                except Exception as e:
+                    _warp_log(f"canh bao: tai wgcf {tag} that bai: {type(e).__name__}: {str(e)[:80]}")
+                    try:
+                        os.remove(wg)
+                    except OSError:
+                        pass
+            if not got:
+                _warp_log("loi: khong tai duoc wgcf")
                 return
-            _warp_fetch(link, wg)
             os.chmod(wg, 0o755)
         prof = os.path.join(_WARP_DIR, "wgcf-profile.conf")
         if not os.path.exists(prof):
