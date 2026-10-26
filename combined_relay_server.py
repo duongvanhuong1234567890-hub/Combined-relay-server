@@ -302,14 +302,14 @@ def _role_gate():
         _reqbusy_add(1)
     if ROLE == "video" and p.startswith("/br"):
         return "disabled on this server (ROLE=video)", 404
-    if ROLE == "browser" and p.startswith(("/stream", "/search")):
+    if ROLE == "browser" and p.startswith(("/stream", "/search", "/ytm")):
         return "disabled on this server (ROLE=browser)", 404
     if p.startswith(("/stream", "/search", "/tr")):
         if not STREAM_TOKEN and not ALLOW_OPEN_STREAM:
             return "chua dat STREAM_TOKEN tren server - dat bien STREAM_TOKEN hoac ALLOW_OPEN_STREAM=1", 503
         if STREAM_TOKEN and not _tok_ok(request.args.get("tk", ""), STREAM_TOKEN):
             return "forbidden - them &tk=STREAM_TOKEN vao URL", 403
-    if p.startswith(("/stream", "/search")):
+    if p.startswith(("/stream", "/search", "/ytm")):
         # Khong giet luong dang phat khi co /search: thiet bi van duyet menu trong luc video chay.
         # Client ngat ket noi se duoc phat hien qua GeneratorExit / call_on_close (_reap).
         _br_last_activity = 0.0
@@ -2026,6 +2026,118 @@ def _normalize_input_url(u):
     if not re.match(r"^https?://", u, re.I):
         return ""
     return u if _url_is_public(u) else ""
+
+
+
+# ==================== YOUTUBE MUSIC: /ytm (JSON) + /ytm_audio (MP3) ====================
+# Firmware goi /ytm?url=<link YouTube>  -> {success, title, cover_url, audio_url}
+# roi tai audio_url (= /ytm_audio) la luong MP3 mono de minimp3 tren ESP giai ma.
+# Relay CHI phat nhac. Key kich hoat va chan MAC nam hoan toan o activation_server (firmware tu hoi o do).
+YTM_BITRATE = os.environ.get("YTM_BITRATE", "64k")
+YTM_RATE = _env_int("YTM_RATE", 22050)
+YTM_HEIGHT = 240
+YTM_MAX_STREAMS = max(1, _env_int("YTM_MAX_STREAMS", 2))
+_ytm_slots = threading.BoundedSemaphore(YTM_MAX_STREAMS)
+_ytm_titles = {}
+
+
+def _ytm_title(url, vid):
+    if vid in _ytm_titles:
+        return _ytm_titles[vid]
+    t = ""
+    try:
+        q = urllib.parse.quote(url, safe="")
+        with urllib.request.urlopen(f"https://www.youtube.com/oembed?url={q}&format=json", timeout=5) as r:
+            t = str(json.loads(r.read().decode("utf-8", "replace")).get("title", "")).strip()
+    except Exception:
+        t = ""
+    t = t or "YouTube Music"
+    if len(_ytm_titles) > 300:
+        _ytm_titles.clear()
+    _ytm_titles[vid] = t
+    return t
+
+
+@app.route("/ytm")
+def ytm_info():
+    url = _normalize_input_url(request.args.get("url", ""))
+    if not url:
+        return jsonify(success=False, message="URL khong hop le"), 400
+    m = _YT_ID_RE.search(url)
+    vid = m.group(1) if m else ""
+    try:
+        resolve_stream_urls(url, YTM_HEIGHT)
+    except ResolveError as e:
+        return jsonify(success=False, message=str(e)[:120]), 502
+    scheme = request.headers.get("X-Forwarded-Proto", request.scheme).split(",")[0].strip() or "http"
+    base = f"{scheme}://{request.host}"
+    audio_url = f"{base}/ytm_audio?url={urllib.parse.quote(url, safe='')}"
+    return jsonify(success=True, title=_ytm_title(url, vid or url), audio_url=audio_url,
+                   cover_url=(f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg" if vid else ""))
+
+
+def _ytm_clean_hdr(h):
+    return "".join(l + "\r\n" for l in (h or "").split("\r\n")
+                   if l and not l.lower().startswith(("range:", "host:", "connection:", "accept-encoding:")))
+
+
+@app.route("/ytm_audio")
+def ytm_audio():
+    url = _normalize_input_url(request.args.get("url", ""))
+    if not url:
+        return Response("URL khong hop le", 400)
+    try:
+        v_url, a_url, v_hdr, a_hdr = resolve_stream_urls(url, YTM_HEIGHT)
+    except ResolveError as e:
+        return Response(str(e)[:120], 502)
+    src, hdr = (a_url, a_hdr) if a_url else (v_url, v_hdr)
+    if not src or not _url_is_public(src):
+        return Response("nguon audio khong hop le", 502)
+    if not _ytm_slots.acquire(blocking=False):
+        return Response("server dang phat nhieu bai, thu lai sau", 503)
+    cmd = _nice_prefix() + ["ffmpeg", "-nostdin", "-v", "error",
+                            "-protocol_whitelist", "http,https,tcp,tls,crypto,data,httpproxy",
+                            "-reconnect", "1", "-reconnect_streamed", "1",
+                            "-reconnect_delay_max", "5", "-rw_timeout", "20000000"]
+    if YT_PROXY and _is_youtube(url):
+        cmd += ["-http_proxy", YT_PROXY]
+    hdr = _ytm_clean_hdr(hdr)
+    if hdr:
+        cmd += ["-headers", hdr]
+    cmd += ["-threads", str(FFMPEG_THREADS), "-i", src, "-vn", "-map", "0:a:0",
+            "-ac", "1", "-ar", str(YTM_RATE), "-c:a", "libmp3lame", "-b:a", YTM_BITRATE,
+            "-id3v2_version", "0", "-write_xing", "0", "-flush_packets", "1", "-f", "mp3", "pipe:1"]
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+    except Exception as e:
+        _ytm_slots.release()
+        print(f"[ytm] loi khoi dong ffmpeg: {type(e).__name__}: {e}", flush=True)
+        return Response("khong chay duoc ffmpeg", 500)
+    t0 = time.monotonic()
+    print(f"[ytm] phat {url} ({YTM_BITRATE} {YTM_RATE}Hz)", flush=True)
+
+    def gen():
+        sent = 0
+        try:
+            while True:
+                b = proc.stdout.read(8192)
+                if not b:
+                    break
+                sent += len(b)
+                yield b
+        finally:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=3)
+            except Exception:
+                pass
+            _ytm_slots.release()
+            print(f"[ytm] ket thuc sau {time.monotonic() - t0:.0f}s, gui {sent // 1024}KB", flush=True)
+
+    return Response(gen(), mimetype="audio/mpeg", headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
 
 
 import http.client
