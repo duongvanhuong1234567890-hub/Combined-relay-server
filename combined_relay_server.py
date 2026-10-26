@@ -2435,12 +2435,71 @@ def ytm_search():
     for r in res:
         r["thumb"] = f"{base}/ytm_cover?id={r['id']}"
     if res:
+        threading.Thread(target=_ytm_prefetch_list, args=([r["id"] for r in res if _YTM_ID_ONLY.match(str(r.get("id", "")))], 32), daemon=True).start()
+    if res:
         with _ytm_search_lock:
             if len(_ytm_search_cache) > 100:
                 for k in sorted(_ytm_search_cache, key=lambda k: _ytm_search_cache[k][0])[:40]:
                     _ytm_search_cache.pop(k, None)
             _ytm_search_cache[ck] = (time.monotonic(), res)
     return jsonify(res)
+
+
+_ytm_cover_gen_lock = threading.Lock()
+YTM_COVER_PREFETCH_PX = _env_int("YTM_COVER_PREFETCH_PX", 64)
+
+
+def _ytm_prefetch_list(ids, px):
+    for v in ids[:12]:
+        try:
+            _ytm_cover_get(v, px)
+        except Exception:
+            pass
+
+
+def _ytm_cover_get(vid, px):
+    key = (vid, px)
+    with _ytm_cover_lock:
+        data = _ytm_cover_cache.get(key)
+    if data:
+        return data
+    with _ytm_cover_gen_lock:
+        with _ytm_cover_lock:
+            data = _ytm_cover_cache.get(key)
+        if data:
+            return data
+        src = None
+        for name in ("mqdefault", "hqdefault", "default"):
+            try:
+                rq = urllib.request.Request(f"https://i.ytimg.com/vi/{vid}/{name}.jpg", headers={"User-Agent": UA})
+                with urllib.request.urlopen(rq, timeout=8) as r:
+                    src = r.read(600_000)
+                if src:
+                    break
+            except Exception as e:
+                print(f"[ytm] anh bia {name} loi: {type(e).__name__}", flush=True)
+        if not src:
+            print(f"[ytm] khong tai duoc anh bia {vid}", flush=True)
+            return None
+        data = b""
+        try:
+            vf = f"scale={px}:{px}:force_original_aspect_ratio=increase,crop={px}:{px}"
+            pr = subprocess.run(_nice_prefix() + ["ffmpeg", "-nostdin", "-v", "error", "-i", "pipe:0", "-vf", vf,
+                                                  "-frames:v", "1", "-q:v", "5", "-f", "mjpeg", "pipe:1"],
+                                input=src, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=40)
+            data = pr.stdout
+            if not data:
+                print(f"[ytm] ffmpeg anh bia khong ra du lieu: {pr.stderr.decode('utf-8', 'replace')[:150]}", flush=True)
+        except Exception as e:
+            print(f"[ytm] loi cat anh bia: {type(e).__name__}", flush=True)
+        if not data:
+            return None
+        with _ytm_cover_lock:
+            if len(_ytm_cover_cache) > 150:
+                for k in list(_ytm_cover_cache)[:60]:
+                    _ytm_cover_cache.pop(k, None)
+            _ytm_cover_cache[key] = data
+        return data
 
 
 @app.route("/ytm_cover")
@@ -2452,38 +2511,9 @@ def ytm_cover():
         px = max(32, min(240, int(request.args.get("px", YTM_COVER_PX_DEFAULT))))
     except ValueError:
         px = YTM_COVER_PX_DEFAULT
-    key = (vid, px)
-    with _ytm_cover_lock:
-        data = _ytm_cover_cache.get(key)
-    if data is None:
-        src = None
-        for name in ("mqdefault", "hqdefault", "default"):
-            try:
-                rq = urllib.request.Request(f"https://i.ytimg.com/vi/{vid}/{name}.jpg", headers={"User-Agent": UA})
-                with urllib.request.urlopen(rq, timeout=8) as r:
-                    src = r.read(600_000)
-                if src:
-                    break
-            except Exception:
-                continue
-        if not src:
-            return Response("khong lay duoc anh", 502)
-        try:
-            vf = f"scale={px}:{px}:force_original_aspect_ratio=increase,crop={px}:{px}"
-            pr = subprocess.run(_nice_prefix() + ["ffmpeg", "-nostdin", "-v", "error", "-i", "pipe:0", "-vf", vf,
-                                                  "-frames:v", "1", "-q:v", "5", "-f", "mjpeg", "pipe:1"],
-                                input=src, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=15)
-            data = pr.stdout
-        except Exception as e:
-            print(f"[ytm] loi cat anh bia: {type(e).__name__}", flush=True)
-            data = b""
-        if not data:
-            return Response("khong xu ly duoc anh", 502)
-        with _ytm_cover_lock:
-            if len(_ytm_cover_cache) > 150:
-                for k in list(_ytm_cover_cache)[:60]:
-                    _ytm_cover_cache.pop(k, None)
-            _ytm_cover_cache[key] = data
+    data = _ytm_cover_get(vid, px)
+    if not data:
+        return Response("khong lay duoc anh", 502)
     return Response(data, mimetype="image/jpeg", headers={"Cache-Control": "public, max-age=86400"})
 
 
@@ -2515,6 +2545,8 @@ def ytm_info():
         ytm_resolve_audio(url)
     except ResolveError as e:
         return jsonify(success=False, message=str(e)[:120]), 502
+    if vid and _YTM_ID_ONLY.match(vid):
+        threading.Thread(target=_ytm_cover_get, args=(vid, YTM_COVER_PREFETCH_PX), daemon=True).start()
     scheme = request.headers.get("X-Forwarded-Proto", request.scheme).split(",")[0].strip() or "http"
     base = f"{scheme}://{request.host}"
     audio_url = f"{base}/ytm_audio?url={urllib.parse.quote(url, safe='')}"
