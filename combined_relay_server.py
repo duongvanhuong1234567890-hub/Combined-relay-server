@@ -5246,7 +5246,8 @@ def esp_exit_report():
         v = (request.args.get(k) or "?")[:n]
         return "".join(ch if 32 <= ord(ch) < 127 else "_" for ch in v)
     print(f"[esp-exit] why={_c('why', 120)} res={_c('res', 4)} played={_c('ms', 10)}ms recv={_c('kb', 10)}KB "
-                f"rssi={_c('rssi', 6)} heap={_c('heap', 10)} wifi={_c('wst', 4)} | {_who()}", flush=True)
+                f"rssi={_c('rssi', 6)} heap={_c('heap', 10)} wifi={_c('wst', 4)} "
+                f"drops={_c('drops', 5)} dwhy={_c('dwhy', 3)}(1=connected()false 2=wifi 3=stall) | {_who()}", flush=True)
     if request.args.get("end") == "1" and request.args.get("sid"):
         _sess_drop(request.args.get("sid"), "ESP bao thoat han")
     return Response("", 204)
