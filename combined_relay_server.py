@@ -2081,8 +2081,12 @@ def _ytm_resolve_ytdlp(url, vid):
         raise ResolveError(f"server nhac dang ban, cho qua {YTM_GATE_WAIT:.0f}s")
     try:
         attempts = list(_YT_ATTEMPTS)
-        if _ytm_preferred:
-            attempts.sort(key=lambda a: a[0] != _ytm_preferred)
+        # Cach nao chay duoc thi len dau; chua biet thi dung YTM_FIRST (mac dinh = YT_RACE_FIRST = 'mweb', cung cach YouTube video dang chay).
+        # Co cookies.txt thi cac cach CO cookies di truoc: tren IP Render, visionos/android_vr/web_embedded (khong cookies)
+        # luon bi "Sign in to confirm you're not a bot", thu lan luot ton ~80s truoc khi toi 'mweb'.
+        first = _ytm_preferred or os.environ.get("YTM_FIRST", YT_RACE_FIRST).strip()
+        has_ck = os.path.exists(COOKIES_FILE)
+        attempts.sort(key=lambda a: (a[0] != first, (not a[2]) if has_ck else False))
         fmt = "bestaudio[abr<=96]/bestaudio/best"
         t0 = time.monotonic()
         errors = []
@@ -2150,7 +2154,8 @@ def _ytm_resolve_ytdlp(url, vid):
 # --- Duong truc tiep toi API noi bo cua YouTube (InnerTube /youtubei/v1/player) cho nhac: chi lay audio, ~vai giay ---
 # State RIENG (khong dung _dc_dead/_dc_pref/_yt_visitor/_direct_off_until cua YouTube video). Chi dung lai ham thuan:
 # _dc_cfg, _direct_opener, _dc_probe, _hls_pick, _df, _DirectFail, _DC_STATIC.
-YTM_DIRECT = os.environ.get("YTM_DIRECT", "1") == "1"
+# Mac dinh TAT: tren IP Render moi client InnerTube deu bi LOGIN_REQUIRED (not a bot), chi them ~30s cho moi bai. Dat YTM_DIRECT=1 de bat lai.
+YTM_DIRECT = os.environ.get("YTM_DIRECT", "0") == "1"
 YTM_DIRECT_MAX_FAILS = max(2, _env_int("YTM_DIRECT_MAX_FAILS", 3))
 YTM_DIRECT_COOLDOWN = float(os.environ.get("YTM_DIRECT_COOLDOWN", "600"))
 YTM_AUDIO_MAX_BPS = _env_int("YTM_AUDIO_MAX_BPS", 96000)
