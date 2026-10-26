@@ -278,8 +278,8 @@ BR_KILL_ON_LEAVE = os.environ.get("BR_KILL_ON_LEAVE", "0") == "1"  # thoat/back/
 PARK_SEC = float(os.environ.get("PARK_SEC", "120"))  # thoat video: giu ffmpeg chay nen toi da n giay (0 = tat ngay nhu cu)
 SESS_HOLD_SEC = float(os.environ.get("SESS_HOLD_SEC", "600"))  # mat ESP/WiFi: giu phien + ffmpeg toi da n giay roi giai phong
 SESS_CONVERT_SEC = float(os.environ.get("SESS_CONVERT_SEC", "180"))  # mat ESP: chi chuyen doi them n giay roi tam nghi (SIGSTOP) toi khi ESP gui lenh noi lai
-SESS_BUF_BYTES = int(float(os.environ.get("SESS_BUF_MB", "64")) * 1048576)  # tran bo dem cho 1 phien (day -> ffmpeg tam dung)
-SESS_BACK_BYTES = int(float(os.environ.get("SESS_BACK_KB", "2048")) * 1024)  # giu lai sau vi tri da gui de ESP noi lai lui duoc
+SESS_BUF_BYTES = int(float(os.environ.get("SESS_BUF_MB", "24")) * 1048576)  # tran bo dem cho 1 phien (day -> ffmpeg tam dung)
+SESS_BACK_BYTES = int(float(os.environ.get("SESS_BACK_KB", "1024")) * 1024)  # giu lai sau vi tri da gui de ESP noi lai lui duoc
 _reqbusy = 0
 _reqbusy_lock = threading.Lock()
 
@@ -3394,11 +3394,14 @@ def _enter_app(name):
     prev, _app_cur = _app_cur, name
     if not name:
         return
-    print(f"[app] {prev or '-'} -> {name}: tat 2 app con lai", flush=True)
-    if name != "video":
-        _sess_drop_all("doi sang app " + name)
-    if name != "music":
-        _ytm_kill_all()
+    # YouTube va YT Music KHONG duoc dap nhau: app dang chay nen chi bi tat khi RAM that su cao.
+    tight = _mem_frac() > float(os.environ.get("APP_SWITCH_KILL_FRAC", "0.72"))
+    print(f"[app] {prev or '-'} -> {name}: {'RAM cao, tat app khac' if tight else 'giu app nen'} | RAM {_mem_str()}", flush=True)
+    if name == "web" or tight:
+        if name != "video":
+            _sess_drop_all("doi sang app " + name + " (RAM cao)")
+        if name != "music":
+            _ytm_kill_all()
     if name != "web":
         _cr_close_async(resume=True)
         try:
