@@ -18,6 +18,7 @@ import socket
 import struct
 import ipaddress
 import gc
+import signal
 from flask import Flask, request, Response, jsonify, g
 from werkzeug.exceptions import HTTPException
 from werkzeug.serving import WSGIRequestHandler
@@ -275,6 +276,10 @@ _last_req = time.monotonic()
 KILL_ON_LEAVE = os.environ.get("KILL_ON_LEAVE", "1") == "1"  # video MOI se tat video cu
 BR_KILL_ON_LEAVE = os.environ.get("BR_KILL_ON_LEAVE", "0") == "1"  # thoat/back/tap trong trinh duyet: KHONG tat stream
 PARK_SEC = float(os.environ.get("PARK_SEC", "120"))  # thoat video: giu ffmpeg chay nen toi da n giay (0 = tat ngay nhu cu)
+SESS_HOLD_SEC = float(os.environ.get("SESS_HOLD_SEC", "600"))  # mat ESP/WiFi: giu phien + ffmpeg toi da n giay roi giai phong
+SESS_CONVERT_SEC = float(os.environ.get("SESS_CONVERT_SEC", "180"))  # mat ESP: chi chuyen doi them n giay roi tam nghi (SIGSTOP) toi khi ESP gui lenh noi lai
+SESS_BUF_BYTES = int(float(os.environ.get("SESS_BUF_MB", "64")) * 1048576)  # tran bo dem cho 1 phien (day -> ffmpeg tam dung)
+SESS_BACK_BYTES = int(float(os.environ.get("SESS_BACK_KB", "2048")) * 1024)  # giu lai sau vi tri da gui de ESP noi lai lui duoc
 _reqbusy = 0
 _reqbusy_lock = threading.Lock()
 
@@ -304,7 +309,8 @@ def _role_gate():
         return "disabled on this server (ROLE=video)", 404
     if ROLE == "browser" and p.startswith(("/stream", "/search", "/ytm")):
         return "disabled on this server (ROLE=browser)", 404
-    if p.startswith(("/stream", "/search", "/tr")):
+    _resume = p == "/stream" and bool(request.args.get("sid")) and request.args.get("sid") in _sessions
+    if p.startswith(("/stream", "/search", "/tr")) and not _resume:
         if not STREAM_TOKEN and not ALLOW_OPEN_STREAM:
             return "chua dat STREAM_TOKEN tren server - dat bien STREAM_TOKEN hoac ALLOW_OPEN_STREAM=1", 503
         if STREAM_TOKEN and not _tok_ok(request.args.get("tk", ""), STREAM_TOKEN):
@@ -314,6 +320,12 @@ def _role_gate():
         # Client ngat ket noi se duoc phat hien qua GeneratorExit / call_on_close (_reap).
         _br_last_activity = 0.0
         _cr_release_for_stream()
+    if p.startswith(("/stream", "/search")) or p == "/br/play":
+        _enter_app("video")
+    elif p.startswith("/ytm"):
+        _enter_app("music")
+    elif p.startswith("/br"):
+        _enter_app("web")
     return None
 
 
@@ -545,6 +557,7 @@ def _search_cache_put(ck, res):
 @app.route("/search")
 def search():
     query = request.args.get("q", "").strip()[:200]
+    print(f"[search] yeu cau q={query!r}", flush=True)
     try:
         n = max(1, min(25, int(request.args.get("n", 5))))
     except ValueError:
@@ -1653,6 +1666,9 @@ def _kill_quiet(p):
 
 def _kill_stream(why=""):
     global _cur_proc
+    if _cur_sess is not None:
+        _cur_sess.kill(why or "kill")
+        return
     with _cur_lock:
         p, _cur_proc = _cur_proc, None
     if p is not None and p.poll() is None:
@@ -1717,7 +1733,7 @@ def _stream_elsewhere(max_age=60):
 
 
 def _idle_for(sec):
-    return (_active_streams == 0 and _reqbusy == 0 and not _stream_elsewhere() and not _br_busy()
+    return (_active_streams == 0 and _reqbusy == 0 and not _stream_elsewhere() and not _br_busy() and not _ytm_busy()
             and time.monotonic() - _last_req >= sec)
 
 
@@ -1973,7 +1989,7 @@ def _warm_worker(video_ids, height_cap):
         print("[warm] RAM cao, bo qua lam nong", flush=True)
         return
     for vid in video_ids:
-        if _active_streams > 0:
+        if _active_streams > 0 or _ytm_busy():
             print("[warm] dang co luong phat, bo qua lam nong", flush=True)
             return
         if _br_busy() or _resolve_gate.locked() or time.monotonic() < _yt_block_until:
@@ -1994,6 +2010,13 @@ def warm_results(results):
 
 @app.route("/stream")
 def stream():
+    sid = (request.args.get("sid") or "").strip()
+    if sid:
+        try:
+            off = max(0, int(request.args.get("off", "0")))
+        except ValueError:
+            return Response("off sai", 400)
+        return _stream_resume(sid, off)
     return _stream_impl(request.args.get("url", ""))
 
 
@@ -2037,6 +2060,45 @@ YTM_BITRATE = os.environ.get("YTM_BITRATE", "64k")
 YTM_RATE = _env_int("YTM_RATE", 22050)
 YTM_MAX_STREAMS = max(1, _env_int("YTM_MAX_STREAMS", 2))
 _ytm_slots = threading.BoundedSemaphore(YTM_MAX_STREAMS)
+_ytm_active = 0
+_ytm_active_lock = threading.Lock()
+_ytm_procs = set()
+_ytm_procs_lock = threading.Lock()
+_YTM_MARK = "/tmp/relay_ytm_%d" % os.getpid()
+
+
+def _ytm_touch(on=True):
+    try:
+        if on:
+            with open(_YTM_MARK, "a"):
+                os.utime(_YTM_MARK, None)
+        elif os.path.exists(_YTM_MARK):
+            os.remove(_YTM_MARK)
+    except OSError:
+        pass
+
+
+def _ytm_active_add(d):
+    global _ytm_active
+    with _ytm_active_lock:
+        _ytm_active = max(0, _ytm_active + d)
+        now_n = _ytm_active
+    _ytm_touch(now_n > 0)
+
+
+def _ytm_busy(max_age=60):
+    """Co bai nhac dang phat (worker nay hoac worker gunicorn khac). Chi DOC, khong dung state cua video."""
+    if _ytm_active > 0:
+        return True
+    try:
+        import glob
+        now = time.time()
+        for f in glob.glob("/tmp/relay_ytm_*"):
+            if f != _YTM_MARK and now - os.path.getmtime(f) < max_age:
+                return True
+    except OSError:
+        pass
+    return False
 _ytm_titles = {}
 
 
@@ -2408,6 +2470,7 @@ def _ytm_search_ytdlp(query, n):
 @app.route("/ytm_search")
 def ytm_search():
     query = request.args.get("q", "").strip()[:200]
+    print(f"[ytm] tim kiem yeu cau q={query!r}", flush=True)
     try:
         n = max(1, min(25, int(request.args.get("n", 8))))
     except ValueError:
@@ -2586,6 +2649,8 @@ def ytm_audio():
             "-id3v2_version", "0", "-write_xing", "0", "-flush_packets", "1", "-f", "mp3", "pipe:1"]
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+        with _ytm_procs_lock:
+            _ytm_procs.add(proc)
     except Exception as e:
         _ytm_slots.release()
         print(f"[ytm] loi khoi dong ffmpeg: {type(e).__name__}: {e}", flush=True)
@@ -2595,14 +2660,23 @@ def ytm_audio():
 
     def gen():
         sent = 0
+        last_touch = time.monotonic()
         try:
+            _ytm_active_add(1)
             while True:
                 b = proc.stdout.read(8192)
                 if not b:
                     break
                 sent += len(b)
+                _t = time.monotonic()
+                if _t - last_touch > 15:
+                    last_touch = _t
+                    _ytm_touch(True)
                 yield b
         finally:
+            _ytm_active_add(-1)
+            with _ytm_procs_lock:
+                _ytm_procs.discard(proc)
             try:
                 proc.kill()
             except Exception:
@@ -3127,6 +3201,308 @@ def _terminate(proc):
             pass
 
 
+
+_sessions = {}
+_sess_lock = threading.Lock()
+_cur_sess = None
+_app_cur = ""
+
+
+def _free_ram():
+    gc.collect()
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+
+class _Sess:
+    """1 phien video: ffmpeg + bo dem RAM (dau ra AVI). Doc ffmpeg lien tuc o 1 luong rieng, nen mat WiFi/ESP thi ffmpeg
+    van chuyen doi (toi da SESS_BUF_BYTES), ESP noi lai bang sid + off (so byte da nhan) la nhan tiep dung cho do."""
+
+    def __init__(self, proc, sids, first, target_bps, burst, fps):
+        self.sid = secrets.token_hex(16)
+        self.proc, self.sids = proc, sids
+        self.target_bps, self.burst, self.fps = target_bps, burst, fps
+        self.buf = bytearray(first)
+        self.base = 0
+        self.end = len(first)
+        self.sent = 0
+        self.eof = False
+        self.dead = False
+        self.gen = 0
+        self.detached_at = None
+        self.paused = False
+        self.counted = True
+        self.cv = threading.Condition()
+        global _cur_sess
+        with _sess_lock:
+            old, _cur_sess = _cur_sess, self
+            _sessions[self.sid] = self
+        if old is not None and old is not self:
+            old.kill("co video moi")
+        _mark_stream()
+        self._rt = threading.Thread(target=self._reader, daemon=True)
+        self._rt.start()
+        _sess_start_reaper()
+
+    def _reader(self):
+        p = self.proc
+        try:
+            while True:
+                with self.cv:
+                    while not self.dead and len(self.buf) >= SESS_BUF_BYTES:
+                        self.cv.wait(1.0)
+                    if self.dead:
+                        break
+                data = p.stdout.read1(65536)
+                if not data:
+                    break
+                with self.cv:
+                    self.buf += data
+                    self.end += len(data)
+                    self.cv.notify_all()
+        except Exception:
+            pass
+        finally:
+            with self.cv:
+                self.eof = True
+                self.cv.notify_all()
+
+    def pause(self):
+        if self.paused or self.dead or self.eof or self.proc.poll() is not None:
+            return
+        try:
+            os.kill(self.proc.pid, signal.SIGSTOP)
+        except Exception:
+            return
+        self.paused = True
+        if self.counted:
+            self.counted = False
+            _streams_add(-1)
+            if _active_streams == 0:
+                _mark_stream(False)
+        print(f"[sess] {self.sid[:6]} nghi sau {SESS_CONVERT_SEC:.0f}s khong co ESP (ffmpeg tam dung, cho lenh noi lai)", flush=True)
+
+    def resume(self):
+        if not self.paused:
+            return
+        self.paused = False
+        try:
+            os.kill(self.proc.pid, signal.SIGCONT)
+        except Exception:
+            pass
+        if not self.counted:
+            self.counted = True
+            _streams_add(1)
+        print(f"[sess] {self.sid[:6]} ESP quay lai -> ffmpeg chay tiep", flush=True)
+
+    def kill(self, why=""):
+        with self.cv:
+            if self.dead:
+                return
+            self.dead = True
+            self.cv.notify_all()
+        with _sess_lock:
+            _sessions.pop(self.sid, None)
+            global _cur_sess
+            if _cur_sess is self:
+                _cur_sess = None
+        _kill_quiet(self.proc)
+        self._rt.join(timeout=3)
+        _terminate(self.proc)
+        try:
+            _drop_fetchers(self.sids)
+        except Exception:
+            pass
+        with self.cv:
+            self.buf = bytearray()
+        if self.counted:
+            self.counted = False
+            _streams_add(-1)
+        if _active_streams == 0:
+            _mark_stream(False)
+        print(f"[sess] {self.sid[:6]} giai phong ({why or '?'}) | RAM {_mem_str()}", flush=True)
+        _free_ram()
+
+    def _trim(self):
+        keep = max(self.base, self.sent - min(SESS_BACK_BYTES, SESS_BUF_BYTES // 2))
+        if keep - self.base >= min(1 << 20, max(4096, SESS_BUF_BYTES // 8)):
+            del self.buf[:keep - self.base]
+            self.base = keep
+            self.cv.notify_all()
+
+
+def _sess_drop(sid, why):
+    s_ = _sessions.get(sid)
+    if s_ is not None:
+        s_.kill(why)
+
+
+def _sess_drop_all(why):
+    for s_ in list(_sessions.values()):
+        s_.kill(why)
+
+
+_reaper_on = False
+
+
+def _sess_start_reaper():
+    global _reaper_on
+    if _reaper_on:
+        return
+    _reaper_on = True
+    threading.Thread(target=_sess_reaper, daemon=True).start()
+
+
+def _sess_reaper():
+    while True:
+        time.sleep(5)
+        try:
+            now = time.monotonic()
+            for s_ in list(_sessions.values()):
+                if s_.dead:
+                    continue
+                if s_.detached_at is None:
+                    _mark_stream()
+                    continue
+                if now - s_.detached_at > SESS_CONVERT_SEC:
+                    s_.pause()
+                hold = 60.0 if (s_.eof and s_.sent >= s_.end) else SESS_HOLD_SEC
+                if now - s_.detached_at > hold:
+                    s_.kill(f"khong con ESP sau {hold:.0f}s")
+        except Exception:
+            traceback.print_exc()
+
+
+def _ytm_kill_all():
+    with _ytm_procs_lock:
+        ps = list(_ytm_procs)
+    for p in ps:
+        _kill_quiet(p)
+    _ytm_search_cache.clear()
+    with _ytm_cover_lock:
+        _ytm_cover_cache.clear()
+
+
+def _enter_app(name):
+    """ESP dung app nao thi giu app do, tat 2 app con lai (video / nhac / trinh duyet) de nhuong RAM."""
+    global _app_cur
+    if name == _app_cur:
+        return
+    prev, _app_cur = _app_cur, name
+    if not name:
+        return
+    print(f"[app] {prev or '-'} -> {name}: tat 2 app con lai", flush=True)
+    if name != "video":
+        _sess_drop_all("doi sang app " + name)
+    if name != "music":
+        _ytm_kill_all()
+    if name != "web":
+        _cr_close_async(resume=True)
+        try:
+            _band_cache.clear()
+            _jpeg_cache.clear()
+            _S.pages.clear()
+        except Exception:
+            pass
+    _free_ram()
+
+
+def _sess_response(sess, off):
+    gen_id = None
+    with sess.cv:
+        sess.gen += 1
+        gen_id = sess.gen
+        sess.detached_at = None
+    sess.resume()
+    csock = request.environ.get("gunicorn.socket")
+
+    def generate():
+        t0 = time.monotonic()
+        pos = off
+        sent_here = 0
+        avi = _AviCounter() if off == 0 else None
+        reason = "ffmpeg het du lieu (EOF)"
+        last_mark = 0.0
+        try:
+            while True:
+                with sess.cv:
+                    while pos >= sess.end and not sess.eof and not sess.dead and sess.gen == gen_id:
+                        sess.cv.wait(1.0)
+                    if sess.gen != gen_id:
+                        reason = "ESP noi lai tren ket noi moi"
+                        return
+                    if sess.dead:
+                        reason = "phien da bi giai phong"
+                        return
+                    if pos >= sess.end:
+                        break
+                    n = min(65536, sess.end - pos)
+                    lo = pos - sess.base
+                    if lo < 0:
+                        reason = "offset da bi cat"
+                        return
+                    chunk = bytes(sess.buf[lo:lo + n])
+                if avi is not None:
+                    avi.feed(chunk)
+                    if STREAM_MAX_LEAD > 0 and avi.ok and avi.frames:
+                        over = avi.frames / sess.fps - (time.monotonic() - t0) - STREAM_MAX_LEAD
+                        if over > 0:
+                            time.sleep(min(over, 2.0))
+                sent_here += len(chunk)
+                expected = max(0, sent_here - sess.burst) / sess.target_bps
+                actual = time.monotonic() - t0
+                if expected > actual:
+                    time.sleep(expected - actual)
+                yield chunk
+                pos += len(chunk)
+                with sess.cv:
+                    if sess.gen == gen_id:
+                        sess.sent = max(sess.sent, pos)
+                        sess._trim()
+                t = time.monotonic()
+                if t - last_mark >= 5:
+                    last_mark = t
+                    _mark_stream()
+        except GeneratorExit:
+            reason = "THIET BI DONG KET NOI (client thoat/ngat WiFi/timeout phia ESP)"
+            raise
+        except BaseException as e:
+            reason = f"LOI {type(e).__name__}: {str(e)[:120]}"
+            raise
+        finally:
+            print(f"[stream] {sess.sid[:6]} ket noi dong sau {time.monotonic() - t0:.0f}s, gui {sent_here // 1024}KB "
+                  f"(off={off} -> {pos}) | ly do: {reason} | RAM {_mem_str()} | {_sock_diag(csock)}", flush=True)
+            with sess.cv:
+                if sess.gen == gen_id and not sess.dead:
+                    sess.detached_at = time.monotonic()
+            if not reason.startswith(("ESP noi lai", "phien da")):
+                print(f"[sess] {sess.sid[:6]} giu toi da {SESS_HOLD_SEC:.0f}s cho ESP noi lai", flush=True)
+
+    return Response(generate(), mimetype="video/avi",
+                    headers={"Cache-Control": "no-store", "X-Sid": sess.sid,
+                             "X-Relay-Purpose": "transcode-only-for-LilyGo-T-Display-S3"})
+
+
+def _stream_resume(sid, off):
+    sess = _sessions.get(sid)
+    if sess is None or sess.dead:
+        return jsonify({"error": "session_gone", "detail": "phien het han hoac da bi thay the"}), 410
+    with sess.cv:
+        if off < sess.base:
+            return jsonify({"error": "offset_trimmed", "detail": "offset nam ngoai bo dem"}), 410
+        if off > sess.end:
+            return jsonify({"error": "offset_ahead"}), 416
+        if off == sess.end and sess.eof:
+            sess.detached_at = time.monotonic()
+            sess.sent = max(sess.sent, off)
+            return Response("", 204)
+    print(f"[sess] {sid[:6]} ESP noi lai tai off={off} (server da co toi {sess.end})", flush=True)
+    return _sess_response(sess, off)
+
+
 def _stream_impl(video_url):
     global _last_height_cap, _cur_proc
     t_req = time.monotonic()
@@ -3239,111 +3615,13 @@ def _stream_impl(video_url):
     if proc is None:
         return jsonify({"error": "ffmpeg_no_output", "detail": "ffmpeg khong nhan duoc luong tu nguon"}), 502
 
-    released = [False]
-    parked = [False]
-
-    def _release(drop=True):
-        with _active_lock:
-            if released[0]:
-                return
-            released[0] = True
-        _streams_add(-1)
-        if _active_streams == 0:
-            _mark_stream(False)
-        if drop:
-            _drop_fetchers(sids)
-
-    _csock = request.environ.get("gunicorn.socket")
-
-    def generate():
-        t0 = time.monotonic()
-        max_gap = 0.0
-        last_t2 = t0
-        sent = 0
-        chunk = first
-        w_ff = w_cl = 0.0
-        last_log = t0
-        last_mark = 0.0
-        _mark_stream()
-        last_sent = 0
-        avi = _AviCounter()
-
-        def _lead():
-            return f"{avi.frames / fps - (time.monotonic() - t0):+.1f}s frames={avi.frames}" if avi.ok and avi.frames else "n/a"
-        reason = "ffmpeg het du lieu (EOF)"
-        try:
-            while chunk:
-                sent += len(chunk)
-                avi.feed(chunk)
-                if STREAM_MAX_LEAD > 0 and avi.ok and avi.frames:
-                    over = avi.frames / fps - (time.monotonic() - t0) - STREAM_MAX_LEAD
-                    if over > 0:
-                        time.sleep(min(over, 2.0))
-                expected_elapsed = max(0, sent - burst_bytes) / target_bps
-                actual_elapsed = time.monotonic() - t0
-                if expected_elapsed > actual_elapsed:
-                    time.sleep(expected_elapsed - actual_elapsed)
-                t1 = time.monotonic()
-                if t1 - last_t2 > max_gap:
-                    max_gap = t1 - last_t2
-                yield chunk
-                t2 = time.monotonic()
-                last_t2 = t2
-                chunk = proc.stdout.read1(65536)
-                t3 = time.monotonic()
-                w_cl += t2 - t1
-                w_ff += t3 - t2
-                if t3 - last_mark >= 5:
-                    last_mark = t3
-                    _mark_stream()
-                if t3 - last_log >= 10:
-                    span = t3 - last_log
-                    print(f"[stream-diag] {span:.0f}s: ffmpeg_wait={w_ff:.1f}s client_wait={w_cl:.1f}s "
-                          f"rate={(sent - last_sent) / span / 1000:.0f}KB/s fps={fps} q={q} lead={_lead()}", flush=True)
-                    last_log, last_sent, w_ff, w_cl = t3, sent, 0.0, 0.0
-        except GeneratorExit:
-            reason = "THIET BI DONG KET NOI (client thoat/ngat WiFi/timeout phia ESP)"
-            raise
-        except BaseException as e:
-            reason = f"LOI {type(e).__name__}: {str(e)[:120]}"
-            raise
-        finally:
-            try:
-                rc = proc.wait(timeout=1.5) if reason.startswith("ffmpeg") else proc.poll()
-            except Exception:
-                rc = proc.poll()
-            print(f"[stream] KET THUC sau {time.monotonic() - t0:.0f}s, gui {sent // 1024}KB | ly do: {reason} | "
-                  f"ffmpeg rc={rc} | lead={_lead()} | RAM {_mem_str()} | "
-                  f"max_gap={max_gap:.1f}s im_lang_cuoi={time.monotonic() - last_t2:.1f}s | {_sock_diag(_csock)}", flush=True)
-            if (reason.startswith("THIET BI") and PARK_SEC > 0 and proc.poll() is None
-                    and _cur_proc is proc):
-                parked[0] = True
-                _release(drop=False)
-                _park(proc, lambda: _drop_fetchers(sids))
-                print(f"[stream] thoat video -> giu ffmpeg chay nen toi da {PARK_SEC:.0f}s (video moi se thay the)", flush=True)
-            else:
-                _release()
-                _terminate(proc)
-
-    def _reap():
-        if parked[0]:
-            return
-        try:
-            if proc.poll() is None:
-                proc.kill()
-            proc.wait(timeout=3)
-        except Exception:
-            pass
-        _release()
-
+    sess = _Sess(proc, sids, first, target_bps, burst_bytes, fps)
     with _stat_lock:
         _stat["streams"] += 1
         _stat["last"] = time.time()
         _n = _stat["streams"]
-    print(f"[proof] giai ma cho LilyGo #{_n} | {_who()} | {w}x{h}@{fps}fps | khong luu o dia", flush=True)
-    resp = Response(generate(), mimetype="video/avi", headers={"Cache-Control": "no-store", "X-Relay-Purpose": "transcode-only-for-LilyGo-T-Display-S3"})
-    resp.call_on_close(_reap)
-    return resp
+    print(f"[proof] giai ma cho LilyGo #{_n} sid={sess.sid} | {_who()} | {w}x{h}@{fps}fps | khong luu o dia", flush=True)
+    return _sess_response(sess, 0)
 
 
 import io
@@ -4969,6 +5247,23 @@ def esp_exit_report():
         return "".join(ch if 32 <= ord(ch) < 127 else "_" for ch in v)
     print(f"[esp-exit] why={_c('why', 120)} res={_c('res', 4)} played={_c('ms', 10)}ms recv={_c('kb', 10)}KB "
                 f"rssi={_c('rssi', 6)} heap={_c('heap', 10)} wifi={_c('wst', 4)} | {_who()}", flush=True)
+    if request.args.get("end") == "1" and request.args.get("sid"):
+        _sess_drop(request.args.get("sid"), "ESP bao thoat han")
+    return Response("", 204)
+
+
+@app.route("/app")
+def app_switch():
+    """ESP bao dang vao app nao (video|music|web|none): tat 2 app con lai, tra RAM."""
+    n = (request.args.get("n") or "").strip().lower()
+    if n in ("none", "home"):
+        _enter_app("")
+        _sess_drop_all("ESP ve man hinh chinh")
+        _free_ram()
+    elif n in ("video", "music", "web"):
+        _enter_app(n)
+    else:
+        return Response("n=video|music|web|none", 400)
     return Response("", 204)
 
 
@@ -5044,7 +5339,7 @@ def _prewarm_browser():
 
 def _warmup_once():
     time.sleep(float(os.environ.get("YT_WARMUP_DELAY", "25")))
-    if _active_streams > 0 or _br_busy():
+    if _active_streams > 0 or _br_busy() or _ytm_busy():
         return
     vid = os.environ.get("YT_WARMUP_VIDEO", "dQw4w9WgXcQ")
     t0 = time.monotonic()
