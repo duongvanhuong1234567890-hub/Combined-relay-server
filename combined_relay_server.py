@@ -309,7 +309,7 @@ def _role_gate():
             return "chua dat STREAM_TOKEN tren server - dat bien STREAM_TOKEN hoac ALLOW_OPEN_STREAM=1", 503
         if STREAM_TOKEN and not _tok_ok(request.args.get("tk", ""), STREAM_TOKEN):
             return "forbidden - them &tk=STREAM_TOKEN vao URL", 403
-    if p.startswith(("/stream", "/search", "/ytm")):
+    if p.startswith(("/stream", "/search")):
         # Khong giet luong dang phat khi co /search: thiet bi van duyet menu trong luc video chay.
         # Client ngat ket noi se duoc phat hien qua GeneratorExit / call_on_close (_reap).
         _br_last_activity = 0.0
@@ -2035,10 +2035,451 @@ def _normalize_input_url(u):
 # Relay CHI phat nhac. Key kich hoat va chan MAC nam hoan toan o activation_server (firmware tu hoi o do).
 YTM_BITRATE = os.environ.get("YTM_BITRATE", "64k")
 YTM_RATE = _env_int("YTM_RATE", 22050)
-YTM_HEIGHT = 240
 YTM_MAX_STREAMS = max(1, _env_int("YTM_MAX_STREAMS", 2))
 _ytm_slots = threading.BoundedSemaphore(YTM_MAX_STREAMS)
 _ytm_titles = {}
+
+
+# ---- Resolver RIENG cho YT Music ----
+# Khong dung resolve_stream_urls cua YouTube video: khong cham vao _yt_preferred, _yt_block_until, _block_level,
+# _yt_fails, _nocookie_*, _resolve_gate, _resolve_cache, _rs_off_until, _yt_pace. YouTube bi chan thi nhac van chay
+# rieng (va nguoc lai); moi ben tu nghi theo bo dem chan IP cua minh. Chi dung lai cac ham thuan (_build_ydl_opts,
+# _extract_with) va cac hang so doc-only (_YT_ATTEMPTS, _NO_RETRY_*, _BLOCK_HINTS...). Khong dung RapidAPI cho nhac.
+# Thu tu: API truc tiep cua YouTube (InnerTube) -> yt-dlp.
+YTM_RESOLVE_TTL = _env_int("YTM_RESOLVE_TTL", 3600)
+YTM_GATE_WAIT = float(os.environ.get("YTM_GATE_WAIT", "40"))
+YTM_BUDGET = float(os.environ.get("YTM_RESOLVE_BUDGET", "40"))
+YTM_BLOCK_BACKOFF = float(os.environ.get("YTM_BLOCK_BACKOFF", "30"))
+YTM_BLOCK_MAX = float(os.environ.get("YTM_BLOCK_MAX", "900"))
+YTM_PACE = float(os.environ.get("YTM_PACE", "0.8"))
+_ytm_gate = threading.Semaphore(max(1, _env_int("YTM_RESOLVE_PAR", 2)))
+_ytm_cache = {}
+_ytm_inflight = {}
+_ytm_state_lock = threading.Lock()
+_ytm_preferred = None
+_ytm_block_until = 0.0
+_ytm_block_level = 0
+_ytm_blockfails = _RecentFails(YT_BLOCK_WINDOW)
+_ytm_pace_lock = threading.Lock()
+_ytm_pace_last = [0.0]
+
+
+def _ytm_pace():
+    with _ytm_pace_lock:
+        wait = _ytm_pace_last[0] + YTM_PACE - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        _ytm_pace_last[0] = time.monotonic()
+
+
+def _ytm_resolve_ytdlp(url, vid):
+    global _ytm_preferred, _ytm_block_until, _ytm_block_level
+    left = _ytm_block_until - time.monotonic()
+    if left > 0:
+        raise ResolveError(f"YT Music tam nghi them {left:.0f}s (YouTube dang chan IP)")
+    if not _ytm_gate.acquire(timeout=YTM_GATE_WAIT):
+        raise ResolveError(f"server nhac dang ban, cho qua {YTM_GATE_WAIT:.0f}s")
+    try:
+        attempts = list(_YT_ATTEMPTS)
+        if _ytm_preferred:
+            attempts.sort(key=lambda a: a[0] != _ytm_preferred)
+        fmt = "bestaudio[abr<=96]/bestaudio/best"
+        t0 = time.monotonic()
+        errors = []
+        permanent = False
+        weak_hits = 0
+        for name, client, use_cookies, runtimes in attempts:
+            if errors and time.monotonic() - t0 > YTM_BUDGET:
+                break
+            _ytm_pace()
+            ck = None
+            try:
+                opts = _build_ydl_opts(fmt, client, use_cookies, runtimes, YT_PROXY)
+                if opts.get("cookiefile"):
+                    # yt-dlp ghi lai cookiefile khi dong -> ban sao rieng, khong ghi de cookies ma YouTube video dang dung
+                    try:
+                        ck = "/tmp/ytmck_%d_%d.txt" % (os.getpid(), threading.get_ident())
+                        shutil.copyfile(opts["cookiefile"], ck)
+                        opts["cookiefile"] = ck
+                    except OSError:
+                        ck = None
+                v_url, a_url, v_hdr, a_hdr = _extract_with(url, opts)
+                src, hdr = (a_url, a_hdr) if a_url else (v_url, v_hdr)
+                if not src:
+                    raise RuntimeError("khong lay duoc URL audio")
+                if _ytm_preferred != name:
+                    print(f"[ytm] cach '{name}' thanh cong sau {time.monotonic() - t0:.1f}s", flush=True)
+                _ytm_preferred = name
+                _ytm_block_level = 0
+                _ytm_blockfails.clear()
+                return src, hdr
+            except Exception as e:
+                msg = str(e)
+                print(f"[ytm] cach '{name}' that bai: {msg[:140]}", flush=True)
+                errors.append(f"{name}: {msg[:110]}")
+                if _is_geo_error(e, msg) or any(h in msg for h in _NO_RETRY_STRONG):
+                    permanent = True
+                    break
+                if any(h in msg for h in _NO_RETRY_WEAK):
+                    weak_hits += 1
+                    if weak_hits >= 2:
+                        permanent = True
+                        break
+            finally:
+                if ck:
+                    try:
+                        os.remove(ck)
+                    except OSError:
+                        pass
+        joined = " | ".join(errors)
+        if not permanent:
+            _ytm_preferred = None
+            if any(h in joined for h in _BLOCK_HINTS) and not any(h in joined for h in _AGE_HINTS):
+                n_vids = _ytm_blockfails.add(vid)
+                need = YT_BLOCK_VIDEOS_HARD if any(h in joined for h in _HARD_BLOCK_HINTS) else YT_BLOCK_VIDEOS_SOFT
+                if n_vids >= need:
+                    wait = min(YTM_BLOCK_MAX, YTM_BLOCK_BACKOFF * 2 ** min(_ytm_block_level, 5)) * random.uniform(0.9, 1.3)
+                    _ytm_block_level += 1
+                    _ytm_block_until = time.monotonic() + wait
+                    print(f"[ytm] {n_vids} bai that bai lien tiep -> nhac nghi {wait:.0f}s", flush=True)
+        raise ResolveError(joined[:700] or "khong cach nao chay", permanent=permanent)
+    finally:
+        _ytm_gate.release()
+
+
+# --- Duong truc tiep toi API noi bo cua YouTube (InnerTube /youtubei/v1/player) cho nhac: chi lay audio, ~vai giay ---
+# State RIENG (khong dung _dc_dead/_dc_pref/_yt_visitor/_direct_off_until cua YouTube video). Chi dung lai ham thuan:
+# _dc_cfg, _direct_opener, _dc_probe, _hls_pick, _df, _DirectFail, _DC_STATIC.
+YTM_DIRECT = os.environ.get("YTM_DIRECT", "1") == "1"
+YTM_DIRECT_MAX_FAILS = max(2, _env_int("YTM_DIRECT_MAX_FAILS", 3))
+YTM_DIRECT_COOLDOWN = float(os.environ.get("YTM_DIRECT_COOLDOWN", "600"))
+YTM_AUDIO_MAX_BPS = _env_int("YTM_AUDIO_MAX_BPS", 96000)
+_ytm_dc_dead = {}
+_ytm_dc_pref = None
+_ytm_visitor = ""
+_ytm_visitor_t = 0.0
+_ytm_direct_vids = _RecentFails(900.0)
+_ytm_direct_off_until = 0.0
+
+
+def _ytm_pick_audio(data):
+    sd = (data or {}).get("streamingData") or {}
+
+    def mime(f):
+        return str(f.get("mimeType", ""))
+
+    def usable(lst):
+        return [f for f in (lst or []) if isinstance(f, dict) and isinstance(f.get("url"), str) and f["url"].startswith("http")]
+
+    def abr(f):
+        return f.get("averageBitrate") or f.get("bitrate") or 0
+
+    auds = [f for f in usable(sd.get("adaptiveFormats")) if mime(f).startswith("audio/")]
+    if auds:
+        low = [f for f in auds if abr(f) <= YTM_AUDIO_MAX_BPS]
+        a = max(low, key=lambda f: ("mp4a" in mime(f), abr(f))) if low else min(auds, key=abr)
+        return a["url"]
+    comb = [f for f in usable(sd.get("formats")) if mime(f).startswith("video/")]
+    if comb:
+        return min(comb, key=lambda f: f.get("height") or 99999)["url"]
+    return None
+
+
+def _ytm_dc_try(key, video_id, opener):
+    global _ytm_visitor, _ytm_visitor_t
+    cfg = _dc_cfg(key)
+    cl = dict(cfg["client"])
+    cl.setdefault("hl", "en")
+    cl.setdefault("gl", "US")
+    ua = cl.get("userAgent") or _GEN_UA
+    if _ytm_visitor and time.monotonic() - _ytm_visitor_t < 21600:
+        cl["visitorData"] = _ytm_visitor
+    body = {
+        "context": {"client": cl},
+        "videoId": video_id,
+        "contentCheckOk": True, "racyCheckOk": True,
+        "playbackContext": {"contentPlaybackContext": {"html5Preference": "HTML5_PREF_WANTS"}},
+    }
+    hd = {"Content-Type": "application/json", "User-Agent": ua, "Origin": "https://www.youtube.com",
+          "X-YouTube-Client-Name": str(cfg["cid"]), "X-YouTube-Client-Version": str(cl.get("clientVersion", ""))}
+    if cl.get("visitorData"):
+        hd["X-Goog-Visitor-Id"] = cl["visitorData"]
+    req = urllib.request.Request("https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
+                                 data=json.dumps(body).encode("utf-8"), method="POST", headers=hd)
+    try:
+        with opener.open(req, timeout=YT_DIRECT_TIMEOUT) as r:
+            data = json.loads(r.read(3_000_000).decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        raise _df(f"{key}: HTTP {e.code}", hard=True) from None
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        raise _df(f"{key}: loi mang/JSON: {str(e)[:60]}", hard=True) from None
+    if not isinstance(data, dict):
+        raise _df(f"{key}: phan hoi khong phai JSON object", hard=True)
+    vd = (data.get("responseContext") or {}).get("visitorData")
+    if isinstance(vd, str) and vd and (not _ytm_visitor or time.monotonic() - _ytm_visitor_t >= 21600):
+        _ytm_visitor, _ytm_visitor_t = vd, time.monotonic()
+    ps = data.get("playabilityStatus") or {}
+    if ps.get("status") != "OK":
+        why = f"{ps.get('status', '?')}: {str(ps.get('reason') or '')[:100]}"
+        if any(h in why for h in _NO_RETRY_STRONG):
+            raise ResolveError(why, permanent=True)
+        raise _df(f"{key}: {why}", hard=(ps.get("status") == "LOGIN_REQUIRED"))
+    hdr = f"User-Agent: {ua}\r\n"
+    src = _ytm_pick_audio(data)
+    if src:
+        if YT_DIRECT_PROBE:
+            _dc_probe(src, ua, opener, key)
+        return src, hdr
+    hls = (data.get("streamingData") or {}).get("hlsManifestUrl")
+    if isinstance(hls, str) and hls.startswith("http"):
+        return _hls_pick(hls, ua, opener, 240), hdr
+    raise _df(f"{key}: khong co luong audio co URL (can PO token / SABR?)")
+
+
+def _ytm_try_direct(video_id):
+    """Tra (src, hdr) hoac None neu duong truc tiep khong dung duoc (se roi xuong yt-dlp). ResolveError(permanent) thi nem ra."""
+    global _ytm_direct_off_until, _ytm_dc_pref
+    if not YTM_DIRECT or time.monotonic() < _ytm_direct_off_until:
+        return None
+    t0 = time.monotonic()
+    opener = _direct_opener()
+    keys = [k for k in YT_DIRECT_CLIENTS if k in _DC_STATIC]
+    live = [k for k in keys if time.monotonic() >= _ytm_dc_dead.get(k, 0.0)] or keys
+    if _ytm_dc_pref in live:
+        live.sort(key=lambda k: k != _ytm_dc_pref)
+    errs = []
+    for k in live:
+        try:
+            res = _ytm_dc_try(k, video_id, opener)
+            _ytm_dc_pref = k
+            _ytm_dc_dead.pop(k, None)
+            _ytm_direct_vids.clear()
+            print(f"[ytm] direct '{k}' OK sau {time.monotonic() - t0:.1f}s cho {video_id}", flush=True)
+            return res
+        except _DirectFail as e:
+            errs.append(str(e)[:90])
+            if getattr(e, "hard", False):
+                _ytm_dc_dead[k] = time.monotonic() + YT_DIRECT_CLIENT_DEAD
+        except ResolveError:
+            raise
+        except Exception as e:
+            errs.append(f"{k}: {type(e).__name__}: {str(e)[:60]}")
+    n = _ytm_direct_vids.add(video_id)
+    print(f"[ytm] direct {video_id} that bai: {' | '.join(errs)[:300]} ({n} bai lien tiep)", flush=True)
+    if n >= YTM_DIRECT_MAX_FAILS:
+        _ytm_direct_off_until = time.monotonic() + YTM_DIRECT_COOLDOWN
+        print(f"[ytm] direct that bai tren {n} bai -> tat {YTM_DIRECT_COOLDOWN:.0f}s (dung yt-dlp)", flush=True)
+    return None
+
+
+def _ytm_resolve_uncached(url, vid):
+    if _YT_ID_RE.search(url or ""):
+        res = _ytm_try_direct(vid)
+        if res:
+            return res
+    return _ytm_resolve_ytdlp(url, vid)
+
+
+def ytm_resolve_audio(url):
+    """Tra ve (src_url, ffmpeg_headers) cua luong audio. Cache + khoa theo video, hoan toan tach khoi YouTube video."""
+    m = _YT_ID_RE.search(url or "")
+    vid = m.group(1) if m else (url or "")
+    now = time.monotonic()
+    with _ytm_state_lock:
+        c = _ytm_cache.get(vid)
+        if c and c[0] > now:
+            return c[1], c[2]
+        if len(_ytm_cache) > 200:
+            for k in [k for k, v in _ytm_cache.items() if v[0] <= now]:
+                _ytm_cache.pop(k, None)
+        if len(_ytm_inflight) > 100:
+            for k in [k for k, l in _ytm_inflight.items() if not l.locked()]:
+                _ytm_inflight.pop(k, None)
+        lock = _ytm_inflight.setdefault(vid, threading.Lock())
+    with lock:
+        with _ytm_state_lock:
+            c = _ytm_cache.get(vid)
+            if c and c[0] > time.monotonic():
+                return c[1], c[2]
+        src, hdr = _ytm_resolve_uncached(_canon_url(url), vid)
+        with _ytm_state_lock:
+            _ytm_cache[vid] = (time.monotonic() + YTM_RESOLVE_TTL, src, hdr)
+        return src, hdr
+
+
+# ---- Tim kiem + anh bia RIENG cho YT Music (khong dung /search cua video, khong goi warm_results) ----
+# /ytm_search?q=<tu khoa>&n=<so ket qua>  -> [{id,title,channel,duration,thumb}] ; thumb = /ytm_cover?id=<id> (JPEG vuong, nho)
+# /ytm_cover?id=<videoId>&px=<canh vuong>  -> JPEG da cat vuong + thu nho (thiet bi khong can qua wsrv.nl nua)
+YTM_SEARCH_TTL = _env_int("YTM_SEARCH_TTL", 600)
+YTM_COVER_PX_DEFAULT = _env_int("YTM_COVER_PX", 96)
+_ytm_search_cache = {}
+_ytm_search_lock = threading.Lock()
+_ytm_api_block_until = 0.0
+_ytm_cover_cache = {}
+_ytm_cover_lock = threading.Lock()
+_YTM_ID_ONLY = re.compile(r"^[A-Za-z0-9_-]{11}$")
+
+
+def _ytm_search_api(query, n):
+    """YouTube Data API (cung YOUTUBE_API_KEY) nhung bo dem nghi RIENG de /search cua video khong bi anh huong."""
+    global _ytm_api_block_until
+    sp = {"part": "snippet", "type": "video", "maxResults": n, "q": query, "videoCategoryId": "10",
+          "safeSearch": "moderate", "fields": "items(id/videoId,snippet(title,channelTitle,liveBroadcastContent))"}
+    if YT_API_LANG:
+        sp["relevanceLanguage"] = YT_API_LANG
+    if YT_API_REGION:
+        sp["regionCode"] = YT_API_REGION
+    params = dict(sp, key=YT_API_KEY)
+    url = "https://www.googleapis.com/youtube/v3/search?" + urllib.parse.urlencode(params)
+    try:
+        with urllib.request.urlopen(url, timeout=10) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        ids = [it["id"]["videoId"] for it in data.get("items", []) if it.get("id", {}).get("videoId")]
+        durations = {}
+        if ids:
+            try:
+                vp = {"part": "contentDetails", "id": ",".join(ids), "key": YT_API_KEY,
+                      "fields": "items(id,contentDetails/duration)"}
+                with urllib.request.urlopen("https://www.googleapis.com/youtube/v3/videos?" + urllib.parse.urlencode(vp), timeout=10) as r2:
+                    for v in json.loads(r2.read().decode("utf-8")).get("items", []):
+                        durations[v["id"]] = _iso_duration_to_seconds(v["contentDetails"].get("duration"))
+            except Exception as e:
+                print(f"[ytm] bo qua thoi luong ({str(e)[:80]})", flush=True)
+        out = []
+        for it in data.get("items", []):
+            vid = (it.get("id") or {}).get("videoId")
+            if not vid:
+                continue
+            sn = it.get("snippet") or {}
+            out.append({"id": vid, "title": html.unescape(sn.get("title", "")),
+                        "channel": html.unescape(sn.get("channelTitle", "")),
+                        "duration": "LIVE" if sn.get("liveBroadcastContent") == "live" else format_duration(durations.get(vid))})
+        return out
+    except urllib.error.HTTPError as e:
+        reason = ""
+        try:
+            reason = (json.loads(e.read().decode("utf-8", "replace")).get("error", {}).get("errors") or [{}])[0].get("reason", "")
+        except Exception:
+            pass
+        cool = 60 if reason == "rateLimitExceeded" else YT_API_COOLDOWN
+        _ytm_api_block_until = time.monotonic() + min(cool, YT_API_COOLDOWN)
+        raise RuntimeError(f"HTTP {e.code} {reason}") from None
+
+
+def _ytm_search_ytdlp(query, n):
+    opts = {"quiet": True, "no_warnings": True, "extract_flat": "in_playlist", "skip_download": True, "socket_timeout": 10}
+    if YT_PROXY:
+        opts["proxy"] = YT_PROXY
+    if not _ytm_gate.acquire(timeout=20):
+        raise RuntimeError("server nhac dang ban")
+    ck = None
+    try:
+        if os.path.exists(COOKIES_FILE):
+            ck = "/tmp/ytmsk_%d_%d.txt" % (os.getpid(), threading.get_ident())
+            try:
+                shutil.copyfile(COOKIES_FILE, ck)
+                opts["cookiefile"] = ck
+            except OSError:
+                ck = None
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(f"ytsearch{n}:{query}", download=False)
+        out = []
+        for e in (info or {}).get("entries") or []:
+            if not e or not e.get("id"):
+                continue
+            out.append({"id": e["id"], "title": e.get("title") or "",
+                        "channel": e.get("channel") or e.get("uploader") or "",
+                        "duration": "LIVE" if e.get("live_status") == "is_live" else format_duration(e.get("duration"))})
+        return out
+    finally:
+        _ytm_gate.release()
+        if ck:
+            try:
+                os.remove(ck)
+            except OSError:
+                pass
+
+
+@app.route("/ytm_search")
+def ytm_search():
+    query = request.args.get("q", "").strip()[:200]
+    try:
+        n = max(1, min(25, int(request.args.get("n", 8))))
+    except ValueError:
+        n = 8
+    if not query:
+        return jsonify([])
+    ck = (query.lower(), n)
+    now = time.monotonic()
+    with _ytm_search_lock:
+        hit = _ytm_search_cache.get(ck)
+    if hit and now - hit[0] < YTM_SEARCH_TTL:
+        return jsonify(hit[1])
+    res = []
+    if YT_API_KEY and now >= _ytm_api_block_until:
+        try:
+            res = _ytm_search_api(query, n)
+        except Exception as e:
+            print(f"[ytm] tim kiem API loi ({e}) - roi ve yt-dlp", flush=True)
+    if not res and now >= _ytm_block_until:
+        try:
+            res = _ytm_search_ytdlp(query, n)
+        except Exception as e:
+            print(f"[ytm] tim kiem yt-dlp loi: {str(e)[:120]}", flush=True)
+    base = f"{request.headers.get('X-Forwarded-Proto', request.scheme).split(',')[0].strip() or 'http'}://{request.host}"
+    for r in res:
+        r["thumb"] = f"{base}/ytm_cover?id={r['id']}"
+    if res:
+        with _ytm_search_lock:
+            if len(_ytm_search_cache) > 100:
+                for k in sorted(_ytm_search_cache, key=lambda k: _ytm_search_cache[k][0])[:40]:
+                    _ytm_search_cache.pop(k, None)
+            _ytm_search_cache[ck] = (time.monotonic(), res)
+    return jsonify(res)
+
+
+@app.route("/ytm_cover")
+def ytm_cover():
+    vid = request.args.get("id", "").strip()
+    if not _YTM_ID_ONLY.match(vid):
+        return Response("id khong hop le", 400)
+    try:
+        px = max(32, min(240, int(request.args.get("px", YTM_COVER_PX_DEFAULT))))
+    except ValueError:
+        px = YTM_COVER_PX_DEFAULT
+    key = (vid, px)
+    with _ytm_cover_lock:
+        data = _ytm_cover_cache.get(key)
+    if data is None:
+        src = None
+        for name in ("mqdefault", "hqdefault", "default"):
+            try:
+                rq = urllib.request.Request(f"https://i.ytimg.com/vi/{vid}/{name}.jpg", headers={"User-Agent": UA})
+                with urllib.request.urlopen(rq, timeout=8) as r:
+                    src = r.read(600_000)
+                if src:
+                    break
+            except Exception:
+                continue
+        if not src:
+            return Response("khong lay duoc anh", 502)
+        try:
+            vf = f"scale={px}:{px}:force_original_aspect_ratio=increase,crop={px}:{px}"
+            pr = subprocess.run(_nice_prefix() + ["ffmpeg", "-nostdin", "-v", "error", "-i", "pipe:0", "-vf", vf,
+                                                  "-frames:v", "1", "-q:v", "5", "-f", "mjpeg", "pipe:1"],
+                                input=src, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=15)
+            data = pr.stdout
+        except Exception as e:
+            print(f"[ytm] loi cat anh bia: {type(e).__name__}", flush=True)
+            data = b""
+        if not data:
+            return Response("khong xu ly duoc anh", 502)
+        with _ytm_cover_lock:
+            if len(_ytm_cover_cache) > 150:
+                for k in list(_ytm_cover_cache)[:60]:
+                    _ytm_cover_cache.pop(k, None)
+            _ytm_cover_cache[key] = data
+    return Response(data, mimetype="image/jpeg", headers={"Cache-Control": "public, max-age=86400"})
 
 
 def _ytm_title(url, vid):
@@ -2066,14 +2507,14 @@ def ytm_info():
     m = _YT_ID_RE.search(url)
     vid = m.group(1) if m else ""
     try:
-        resolve_stream_urls(url, YTM_HEIGHT)
+        ytm_resolve_audio(url)
     except ResolveError as e:
         return jsonify(success=False, message=str(e)[:120]), 502
     scheme = request.headers.get("X-Forwarded-Proto", request.scheme).split(",")[0].strip() or "http"
     base = f"{scheme}://{request.host}"
     audio_url = f"{base}/ytm_audio?url={urllib.parse.quote(url, safe='')}"
     return jsonify(success=True, title=_ytm_title(url, vid or url), audio_url=audio_url,
-                   cover_url=(f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg" if vid else ""))
+                   cover_url=(f"{base}/ytm_cover?id={vid}" if vid else ""))
 
 
 def _ytm_clean_hdr(h):
@@ -2087,10 +2528,9 @@ def ytm_audio():
     if not url:
         return Response("URL khong hop le", 400)
     try:
-        v_url, a_url, v_hdr, a_hdr = resolve_stream_urls(url, YTM_HEIGHT)
+        src, hdr = ytm_resolve_audio(url)
     except ResolveError as e:
         return Response(str(e)[:120], 502)
-    src, hdr = (a_url, a_hdr) if a_url else (v_url, v_hdr)
     if not src or not _url_is_public(src):
         return Response("nguon audio khong hop le", 502)
     if not _ytm_slots.acquire(blocking=False):
