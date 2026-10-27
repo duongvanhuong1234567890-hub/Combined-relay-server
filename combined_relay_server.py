@@ -231,7 +231,9 @@ def _clip_pct(s, n):
     i = s.rfind("%")
     return s[:i] if i != -1 and i > len(s) - 3 else s
 
-RELAY_URL = os.environ.get("RELAY_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "https://tiktokcasio.onrender.com"
+RELAY_URL = os.environ.get("RELAY_URL") or os.environ.get("RENDER_EXTERNAL_URL") or ""
+_BOOT_MONO = time.monotonic()
+_real_req_seen = False  # da co request THAT (khong tinh /, /healthz, /dbg, bot quet) ke tu luc khoi dong
 
 ROLE = os.environ.get("ROLE", "all").strip().lower()
 ROLE = {"youtube": "video", "yt": "video", "google": "browser", "gg": "browser"}.get(ROLE, ROLE)
@@ -299,10 +301,12 @@ def _reqbusy_done(exc):
 
 @app.before_request
 def _role_gate():
-    global _br_last_activity, _last_req
+    global _br_last_activity, _last_req, _real_req_seen
     p = request.path
     if p not in ("/", "/healthz", "/dbg") and not p.startswith("/_src/"):
         _last_req = time.monotonic()
+        _real_req_seen = True
+        _maybe_update_on_use()
         g._reqbusy_on = True
         _reqbusy_add(1)
     if ROLE == "video" and p.startswith("/br"):
@@ -333,7 +337,7 @@ def _role_gate():
 def health_check():
 
     return (f"OK | role={ROLE} | {RELAY_URL} | AUDIO_RATE={AUDIO_RATE} MJPEG_Q={MJPEG_Q} FFMPEG_THREADS={FFMPEG_THREADS} "
-            f"cookies={'yes' if os.path.exists(COOKIES_FILE) else 'NO'} | browser={'token-ok' if os.environ.get('BR_TOKEN') else 'NO-TOKEN'} | engine={BR_ENGINE}{'(chromium dang chay)' if _cr is not None else ''} | build=gg3-yt3 | direct={'on' if YT_DIRECT and time.monotonic() >= _direct_off_until else 'off'} | mem={_mem_str()}"), 200
+            f"cookies={'yes' if os.path.exists(COOKIES_FILE) else 'NO'} | browser={'token-ok' if os.environ.get('BR_TOKEN') else 'NO-TOKEN'} | engine={BR_ENGINE}{'(chromium dang chay)' if _cr is not None else ''} | build=gg3-yt3 | direct={'on' if YT_DIRECT and time.monotonic() >= _direct_off_until else 'off'} | mem={_mem_str()} | up={(time.monotonic() - _BOOT_MONO) / 60:.0f}m | last_real_req={'none' if not _real_req_seen else str(int((time.monotonic() - _last_req) / 60)) + 'm ago'}"), 200
 
 PORT = int(os.environ.get("PORT", "8000"))
 
@@ -1738,7 +1742,7 @@ def _idle_for(sec):
 
 
 AUTO_UPDATE = os.environ.get("YTDLP_AUTO_UPDATE", "1") == "1"
-UPDATE_HOURS = float(os.environ.get("YTDLP_UPDATE_HOURS", "6"))
+UPDATE_HOURS = float(os.environ.get("YTDLP_UPDATE_HOURS", "12"))
 YTDLP_CHANNEL = os.environ.get("YTDLP_CHANNEL", "nightly").strip().lower()
 _update_lock = threading.Lock()
 _last_update_try = 0.0
@@ -1833,14 +1837,6 @@ def _update_and_maybe_restart(min_gap=600):
         _restart_when_idle()
 
 
-def _update_loop():
-    time.sleep(float(os.environ.get("YTDLP_FIRST_UPDATE_DELAY", "300")))
-    _update_and_maybe_restart(min_gap=0)
-    while True:
-        time.sleep(UPDATE_HOURS * 3600)
-        _update_and_maybe_restart(min_gap=0)
-
-
 _update_pending = threading.Event()
 
 
@@ -1854,6 +1850,16 @@ def trigger_update_async():
             finally:
                 _update_pending.clear()
         threading.Thread(target=_run, daemon=True).start()
+
+
+def _maybe_update_on_use():
+    """Kiem tra/cap nhat yt-dlp khi DANG DUNG: request that dau tien sau khi khoi dong, roi toi da moi UPDATE_HOURS gio.
+    Khong con luong nen chay lien tuc; server ngu thi khong ton gi."""
+    if not AUTO_UPDATE or ROLE == "browser":
+        return
+    if _last_update_try and time.monotonic() - _last_update_try < UPDATE_HOURS * 3600:
+        return
+    trigger_update_async()
 
 
 def _res_expiry(res):
@@ -5616,18 +5622,6 @@ def _warmup_once():
         print(f"[warmup] loi: {str(e)[:120]}", flush=True)
 
 
-def _keepalive_loop():
-    url = RELAY_URL.rstrip("/") + "/healthz"
-    gap = max(60.0, float(os.environ.get("KEEPALIVE_SEC", "540")))
-    time.sleep(60)
-    while True:
-        try:
-            urllib.request.urlopen(url, timeout=15).read(16)
-        except Exception as e:
-            print(f"[keepalive] loi: {str(e)[:80]}", flush=True)
-        time.sleep(gap)
-
-
 def _pot_selfcheck():
     home = os.environ.get("HOME") or os.path.expanduser("~")
     server = os.path.join(home, "bgutil-ytdlp-pot-provider", "server")
@@ -5668,16 +5662,14 @@ def _start_background_tasks():
         if _bg_started:
             return
         _bg_started = True
-    if os.environ.get("KEEPALIVE", "") == "1":
-        threading.Thread(target=_keepalive_loop, daemon=True).start()
     if ROLE != "video" and os.environ.get("BR_PREWARM", "1" if __name__ == "__main__" else "0") == "1":
         threading.Thread(target=_prewarm_browser, daemon=True).start()
-    if os.environ.get("YT_WARMUP", "1") == "1" and ROLE != "browser":
+    if os.environ.get("YT_WARMUP", "0") == "1" and ROLE != "browser":
         threading.Thread(target=_warmup_once, daemon=True).start()
-    threading.Thread(target=_pot_selfcheck, daemon=True).start()
-    print(f"[update] yt-dlp hien tai: {_ytdlp_version()} | auto_update={AUTO_UPDATE} moi {UPDATE_HOURS}h", flush=True)
-    if AUTO_UPDATE and ROLE != "browser":
-        threading.Thread(target=_update_loop, daemon=True).start()
+    if os.environ.get("POT_SELFCHECK", "0") == "1":
+        threading.Thread(target=_pot_selfcheck, daemon=True).start()
+    print(f"[power] keepalive=OFF warmup={os.environ.get('YT_WARMUP', '0')} pot_check={os.environ.get('POT_SELFCHECK', '0')} relay_url={RELAY_URL or '-'}", flush=True)
+    print(f"[update] yt-dlp hien tai: {_ytdlp_version()} | auto_update={AUTO_UPDATE} kiem tra khi dang dung, toi da moi {UPDATE_HOURS}h", flush=True)
 
 
 if __name__ == "__main__":
