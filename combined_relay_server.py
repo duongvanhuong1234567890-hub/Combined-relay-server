@@ -3173,7 +3173,7 @@ class _AviCounter:
                     self.frames += 1
                 elif fcc[2:] == b"wb" and fcc[:2].isdigit():
                     self.audio += size
-                elif not (fcc[:2] == b"ix" or fcc == b"JUNK"):
+                elif not (fcc[:2] == b"ix" or fcc == b"JUNK" or fcc[2:] == b"tx"):
                     self.ok = False
                     return
                 self.skip = size + (size & 1)
@@ -3217,14 +3217,225 @@ def _free_ram():
         pass
 
 
+# ==================== PHU DE NHUNG TRONG LUONG (chunk AVI '99tx') ====================
+SUBS_ON = os.environ.get("SUBS", "1") == "1"
+SUB_AHEAD_MS = max(2, int(os.environ.get("SUB_AHEAD_SEC", "15"))) * 1000
+SUBS_TTL = float(os.environ.get("SUBS_TTL", "1800"))
+SUBS_MAX_CUES = int(os.environ.get("SUBS_MAX_CUES", "6000"))
+
+
+class _AviInject:
+    """Di theo luong AVI cua ffmpeg, chen chunk '99tx' (phu de) ngay sau moi chunk khung hinh."""
+
+    def __init__(self, sess):
+        self.s = sess
+        self.pre = b""
+        self.state = 0          # 0: tim 'movi' | 1: di theo chunk | 2: ngung chen, chuyen thang
+        self.hdr = b""
+        self.skip = 0
+        self.vid = False
+        self.frames = 0
+
+    def process(self, data):
+        if self.state == 2:
+            return data
+        out = []
+        if self.state == 0:
+            self.pre += data
+            i = self.pre.find(b"movi")
+            if i < 0:
+                if len(self.pre) > 400000:
+                    self.state = 2
+                    d, self.pre = self.pre, b""
+                    return d
+                return b""
+            out.append(self.pre[:i + 4])
+            data, self.pre, self.state = self.pre[i + 4:], b"", 1
+        pos, n, last = 0, len(data), 0
+        while pos < n:
+            if self.skip:
+                t = min(self.skip, n - pos)
+                self.skip -= t
+                pos += t
+                if self.skip == 0 and self.vid:
+                    self.vid = False
+                    out.append(data[last:pos])
+                    last = pos
+                    t_ms = self.s.ss_ms + int(self.frames * 1000 / self.s.fps)
+                    out.append(self.s.take_cues(t_ms))
+                continue
+            take = data[pos:pos + 8 - len(self.hdr)]
+            self.hdr += take
+            pos += len(take)
+            if len(self.hdr) < 8:
+                break
+            fcc, size = self.hdr[:4], int.from_bytes(self.hdr[4:8], "little")
+            self.hdr = b""
+            if fcc[2:] == b"dc" and fcc[:2].isdigit():
+                self.vid = True
+                self.frames += 1
+            elif not (fcc[2:] in (b"wb", b"tx") and fcc[:2].isdigit()) and fcc != b"JUNK" and fcc[:2] != b"ix":
+                self.state = 2
+                break
+            self.skip = size + (size & 1)
+        out.append(data[last:])
+        return b"".join(out)
+
+    def flush(self):
+        d, self.pre = self.pre, b""
+        return d
+
+
+# ---- Phu de ----
+_subs_cache = {}
+_subs_lock = threading.Lock()
+
+
+def _ts_ms(s):
+    s = s.strip().replace(",", ".")
+    parts = s.split(":")
+    sec = float(parts[-1])
+    mn = int(parts[-2]) if len(parts) > 1 else 0
+    hr = int(parts[-3]) if len(parts) > 2 else 0
+    return int(round(((hr * 60 + mn) * 60 + sec) * 1000))
+
+
+_VTT_TAG = re.compile(r"<[^>]+>")
+
+
+def _parse_vtt(text, lb):
+    out = []
+    for blk in re.split(r"\n\s*\n", text.replace("\r\n", "\n")):
+        lines = [l for l in blk.split("\n") if l.strip()]
+        for i, l in enumerate(lines):
+            if "-->" in l:
+                try:
+                    a, b = l.split("-->", 1)
+                    st, en = _ts_ms(a), _ts_ms(b.split()[0])
+                except Exception:
+                    break
+                body = " ".join(_VTT_TAG.sub("", x).strip() for x in lines[i + 1:])
+                body = html.unescape(re.sub(r"\s+", " ", body)).strip()
+                if body:
+                    out.append((lb, st, max(en, st + 300), body))
+                break
+    return out
+
+
+def _parse_json3(text, lb):
+    out = []
+    for ev in (json.loads(text).get("events") or []):
+        segs = ev.get("segs")
+        if not segs:
+            continue
+        body = re.sub(r"\s+", " ", "".join(s.get("utf8", "") for s in segs)).strip()
+        if not body:
+            continue
+        st = int(ev.get("tStartMs", 0))
+        out.append((lb, st, st + max(300, int(ev.get("dDurationMs", 2000))), body))
+    return out
+
+
+def _dedupe_cues(cues):
+    res = []
+    for c in sorted(cues, key=lambda c: (c[0], c[1])):
+        if res and res[-1][0] == c[0] and res[-1][3] == c[3] and c[1] <= res[-1][2] + 200:
+            res[-1] = (c[0], res[-1][1], max(res[-1][2], c[2]), c[3])
+        else:
+            res.append(c)
+    return res
+
+
+def _pick_track(info, code):
+    for key in ("subtitles", "automatic_captions"):
+        d = info.get(key) or {}
+        for k in [code, code + "-orig"] + [k for k in d if k.startswith(code + "-") and k != code + "-orig"]:
+            fm = d.get(k)
+            if not fm:
+                continue
+            for ext in ("json3", "vtt"):
+                for f in fm:
+                    if f.get("ext") == ext and f.get("url"):
+                        return f["url"], ext
+    return None
+
+
+def _subs_load(video_url, langs):
+    m = _YT_ID_RE.search(video_url or "")
+    key = ((m.group(1) if m else video_url), tuple(langs))
+    now = time.monotonic()
+    with _subs_lock:
+        c = _subs_cache.get(key)
+        if c and c[0] > now:
+            return c[1], c[2]
+    opts = _build_ydl_opts("best", proxy=YT_PROXY)
+    ea = opts.setdefault("extractor_args", {}).setdefault("youtube", {})
+    ea["skip"] = ["dash", "hls"]
+    opts["ignore_no_formats_error"] = True
+    opts["socket_timeout"] = 12
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(video_url, download=False)
+    if info and "entries" in info:
+        info = next((e for e in (info.get("entries") or []) if e), {})
+    info = info or {}
+    cues, avail = [], []
+    opener = _direct_opener()
+    for code in langs:
+        tr = _pick_track(info, code)
+        if not tr:
+            continue
+        url, ext = tr
+        try:
+            rq = urllib.request.Request(url, headers={"User-Agent": UA})
+            with opener.open(rq, timeout=12) as r:
+                raw = r.read(3_000_000).decode("utf-8", "replace")
+            part = (_parse_json3 if ext == "json3" else _parse_vtt)(raw, ord(code[0]))
+        except Exception as e:
+            print(f"[subs] {code} tai/doc loi: {type(e).__name__}: {str(e)[:100]}", flush=True)
+            continue
+        if part:
+            cues += part
+            avail.append(code)
+    cues = _dedupe_cues(cues)[:SUBS_MAX_CUES]
+    res = (cues, ",".join(avail))
+    with _subs_lock:
+        if len(_subs_cache) > 20:
+            _subs_cache.clear()
+        _subs_cache[key] = (now + SUBS_TTL, res[0], res[1])
+    return res
+
+
+def _subs_worker(sess, video_url, langs):
+    t = time.monotonic()
+    try:
+        cues, avail = _subs_load(video_url, langs)
+        if sess.dead:
+            return
+        sess.set_cues(cues, avail)
+        print(f"[subs] {sess.sid}: {len(cues)} cau ({avail or 'khong co'}) sau {time.monotonic() - t:.1f}s", flush=True)
+    except Exception as e:
+        print(f"[subs] loi {type(e).__name__}: {str(e)[:150]}", flush=True)
+        if not sess.dead:
+            sess.set_cues([], "")
+
+
+
 class _Sess:
     """1 phien video: ffmpeg + bo dem RAM (dau ra AVI). Doc ffmpeg lien tuc o 1 luong rieng, nen mat WiFi/ESP thi ffmpeg
     van chuyen doi (toi da SESS_BUF_BYTES), ESP noi lai bang sid + off (so byte da nhan) la nhan tiep dung cho do."""
 
-    def __init__(self, proc, sids, first, target_bps, burst, fps):
+    def __init__(self, proc, sids, first, target_bps, burst, fps, langs=()):
         self.sid = secrets.token_hex(16)
         self.proc, self.sids = proc, sids
         self.target_bps, self.burst, self.fps = target_bps, burst, fps
+        self.ss_ms = 0
+        self.cue_lock = threading.Lock()
+        self.cues = []
+        self.cue_i = 0
+        self.info_pending = None
+        self.inj = _AviInject(self) if langs else None
+        if self.inj:
+            first = self.inj.process(first)
         self.buf = bytearray(first)
         self.base = 0
         self.end = len(first)
@@ -3259,6 +3470,10 @@ class _Sess:
                 data = p.stdout.read1(65536)
                 if not data:
                     break
+                if self.inj:
+                    data = self.inj.process(data)
+                    if not data:
+                        continue
                 with self.cv:
                     self.buf += data
                     self.end += len(data)
@@ -3267,8 +3482,47 @@ class _Sess:
             pass
         finally:
             with self.cv:
+                if self.inj:
+                    tail = self.inj.flush()
+                    if tail:
+                        self.buf += tail
+                        self.end += len(tail)
                 self.eof = True
                 self.cv.notify_all()
+
+    # ---- phu de ----
+    def set_cues(self, cues, avail):
+        with self.cue_lock:
+            self.cues = sorted(cues, key=lambda c: c[1])
+            self.cue_i = 0
+            self.info_pending = avail
+
+    def take_cues(self, t_ms):
+        if not self.cues and self.info_pending is None:
+            return b""
+        with self.cue_lock:
+            recs, size = [], 0
+            if self.info_pending is not None:
+                txt = self.info_pending.encode("ascii", "ignore")[:60]
+                recs.append(struct.pack("<BIIH", 0, 0, 0, len(txt)) + txt)
+                size += len(recs[0])
+                self.info_pending = None
+            cues, horizon = self.cues, t_ms + SUB_AHEAD_MS
+            while self.cue_i < len(cues) and cues[self.cue_i][1] <= horizon and size < 3400:
+                lb, st, en, text = cues[self.cue_i]
+                self.cue_i += 1
+                if en < t_ms - 500:
+                    continue
+                tb = text.encode("utf-8")
+                if len(tb) > 180:
+                    tb = tb[:180].decode("utf-8", "ignore").encode("utf-8")
+                rec = struct.pack("<BIIH", lb, st, en, len(tb)) + tb
+                recs.append(rec)
+                size += len(rec)
+        if not recs:
+            return b""
+        payload = b"".join(recs)
+        return b"99tx" + struct.pack("<I", len(payload)) + payload + (b"\0" if len(payload) & 1 else b"")
 
     def pause(self):
         if self.paused or self.dead or self.eof or self.proc.poll() is not None:
@@ -3399,7 +3653,11 @@ def _enter_app(name):
     print(f"[app] {prev or '-'} -> {name}: {'RAM cao, tat app khac' if tight else 'giu app nen'} | RAM {_mem_str()}", flush=True)
     if name == "web" or tight:
         if name != "video":
-            _sess_drop_all("doi sang app " + name + " (RAM cao)")
+            # Khong giet phien dang duoc ESP doc (detached_at is None): request phu nhu /ytm_cover,
+            # /ytm_search luc dang xem YouTube se lam _enter_app("music") + RAM cao -> cat video sau vai giay.
+            for s_ in list(_sessions.values()):
+                if getattr(s_, "detached_at", 1) is not None:
+                    s_.kill("doi sang app " + name + " (RAM cao)")
         if name != "music":
             _ytm_kill_all()
     if name != "web":
@@ -3618,7 +3876,11 @@ def _stream_impl(video_url):
     if proc is None:
         return jsonify({"error": "ffmpeg_no_output", "detail": "ffmpeg khong nhan duoc luong tu nguon"}), 502
 
-    sess = _Sess(proc, sids, first, target_bps, burst_bytes, fps)
+    langs = ([c for c in re.split(r"[,\s]+", request.args.get("subs", "")) if re.fullmatch(r"[a-z]{2,3}", c)][:3]
+             if (SUBS_ON and is_yt) else [])
+    sess = _Sess(proc, sids, first, target_bps, burst_bytes, fps, langs)
+    if langs:
+        threading.Thread(target=_subs_worker, args=(sess, video_url, langs), daemon=True).start()
     with _stat_lock:
         _stat["streams"] += 1
         _stat["last"] = time.time()
