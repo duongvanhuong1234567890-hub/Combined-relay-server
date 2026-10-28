@@ -1438,7 +1438,7 @@ def _try_direct(video_id, height_cap):
     _yt_fails.clear()
     _yt_block_until = 0.0
     _block_level = 0
-    print(f"[direct] {video_id} OK sau {time.monotonic() - t0:.1f}s", flush=True)
+    print(f"[direct] {video_id} OK sau {time.monotonic() - t0:.1f}s (client {_dc_pref})", flush=True)
     return res
 
 
@@ -2045,10 +2045,27 @@ def _cache_drop(video_url, height_cap):
         _resolve_cache.pop((_canon_url(video_url), str(height_cap)), None)
 
 
+TURBO_REFRESH_YTDLP = os.environ.get("TURBO_REFRESH_YTDLP", "0") == "1"  # yt-dlp+deno tren free 0.1 CPU: ~60s, 300MB+ RAM -> mac dinh tat
+
+
 def _resolve_stream_urls_refresh(video_url, height_cap):
-    """Lay lai link giua luong khi googlevideo tra 403: bo qua duong direct (khong co PO token), dung yt-dlp.
-    Tra (v_url, a_url, v_hdr, a_hdr). Tuan thu cong gate de khong chay 2 yt-dlp cung luc (tranh OOM 512MB)."""
+    """Lay lai link giua luong khi googlevideo tra 403. Tra (v_url, a_url, v_hdr, a_hdr).
+    1) Duong direct nhung DOI client InnerTube khac client vua bi 403 (0.4s, ~0MB RAM).
+    2) (tuy chon TURBO_REFRESH_YTDLP=1) yt-dlp qua cong gate, co kiem tra RAM."""
     video_url = _canon_url(video_url)
+    m = _YT_ID_RE.search(video_url or "")
+    if m:
+        bad = _dc_pref
+        if bad:
+            _dc_dead[bad] = time.monotonic() + YT_DIRECT_CLIENT_DEAD
+        try:
+            r = _direct_streams(m.group(1), height_cap)
+            print(f"[turbo] lay lai link direct bang client '{_dc_pref}' (client loi: '{bad}')", flush=True)
+            return r
+        except Exception as e:
+            print(f"[turbo] direct doi client that bai: {str(e)[:100]}", flush=True)
+    if not TURBO_REFRESH_YTDLP:
+        raise RuntimeError("khong lay duoc link moi (yt-dlp tat cho refresh)")
     if not _resolve_gate.acquire(timeout=20):
         raise RuntimeError("dang co resolve khac")
     try:
