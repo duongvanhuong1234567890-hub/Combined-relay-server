@@ -2045,6 +2045,22 @@ def _cache_drop(video_url, height_cap):
         _resolve_cache.pop((_canon_url(video_url), str(height_cap)), None)
 
 
+def _resolve_stream_urls_refresh(video_url, height_cap):
+    """Lay lai link giua luong khi googlevideo tra 403: bo qua duong direct (khong co PO token), dung yt-dlp.
+    Tra (v_url, a_url, v_hdr, a_hdr). Tuan thu cong gate de khong chay 2 yt-dlp cung luc (tranh OOM 512MB)."""
+    video_url = _canon_url(video_url)
+    if not _resolve_gate.acquire(timeout=20):
+        raise RuntimeError("dang co resolve khac")
+    try:
+        _ram_guard_before_ydl()
+        t0 = time.monotonic()
+        res = _resolve_stream_urls_inner(video_url, height_cap, max(YT_FIRST_BUDGET, 25.0), False)
+        print(f"[turbo] lay lai link bang yt-dlp sau {time.monotonic() - t0:.1f}s", flush=True)
+        return res
+    finally:
+        _resolve_gate.release()
+
+
 def resolve_stream_urls(video_url, height_cap, background=False, force=False):
     video_url = _canon_url(video_url)
     key = (video_url, str(height_cap))
@@ -2906,9 +2922,11 @@ class _ChunkError(RuntimeError):
 
 
 class _Fetcher:
-    def __init__(self, url, hdr, proxy=""):
+    def __init__(self, url, hdr, proxy="", refresh=None):
         self.hdr = hdr
         self.proxy = proxy
+        self.refresh = refresh  # () -> (url_moi, hdr_dict_moi) | None ; goi khi googlevideo tra 403 giua chung
+        self._refreshing, self._last_refresh, self.refreshes = False, 0.0, 0
         self.size, self.url = self._probe(url)
         self.starts = [0]
         while self.starts[-1] < self.size:
@@ -2923,8 +2941,8 @@ class _Fetcher:
         for _ in range(TURBO_WORKERS):
             threading.Thread(target=self._work, daemon=True).start()
 
-    def _probe(self, url):
-        h = dict(self.hdr)
+    def _probe(self, url, hdr=None):
+        h = dict(self.hdr if hdr is None else hdr)
         h["Range"] = "bytes=0-0"
         px = {"http": self.proxy, "https": self.proxy} if self.proxy else {}
         opener = urllib.request.build_opener(urllib.request.ProxyHandler(px))
@@ -2937,6 +2955,39 @@ class _Fetcher:
         if not _url_is_public(final):
             raise RuntimeError("nguon tro toi dia chi noi bo")
         return int(m.group(1)), final
+
+    def _try_refresh(self):
+        """403 giua chung (link khong co PO token bi YouTube cat sau vai tram KB) -> lay link moi qua yt-dlp va doi nguon tai cho,
+        ffmpeg/ESP khong bi cat. Chi doi neu kich thuoc file nhu cu (cung dinh dang) de byte offset van khop."""
+        if not self.refresh:
+            return False
+        with self.cond:
+            if self._refreshing or self.closed or self.refreshes >= 3 or time.monotonic() - self._last_refresh < 15:
+                return False
+            self._refreshing = True
+        ok = False
+        try:
+            res = self.refresh()
+            if res and res[0]:
+                nu, nh = res
+                sz, final = self._probe(nu, nh)
+                if sz == self.size:
+                    self.url, self.hdr = final, nh
+                    ok = True
+                    print(f"[turbo] 403 giua chung -> da doi sang link moi ({urllib.parse.urlsplit(final).hostname}), tiep tuc tu byte hien tai", flush=True)
+                else:
+                    print(f"[turbo] link moi khac dinh dang ({sz} != {self.size}) -> khong doi", flush=True)
+        except Exception as e:
+            print(f"[turbo] lay link moi that bai: {str(e)[:100]}", flush=True)
+        finally:
+            with self.cond:
+                self._refreshing = False
+                self._last_refresh = time.monotonic()
+                self.refreshes += 1
+                if ok:
+                    self.fails.clear()
+                self.cond.notify_all()
+        return ok
 
     def _conn(self):
         u = urllib.parse.urlsplit(self.url)
@@ -3042,6 +3093,8 @@ class _Fetcher:
                     except Exception:
                         pass
                     c = None
+                    if getattr(e, "status", 0) == 403 and self.refresh and self.refreshes < 3:
+                        break  # lay link moi ngay, khong cho 3 lan thu lai
                     _slow = getattr(e, "status", 0) in (403, 429, 503)
                     time.sleep((1.0 if _slow else 0.2) * (attempt + 1))
             with self.cond:
@@ -3055,6 +3108,8 @@ class _Fetcher:
                     n = self.fails.get(idx, (0, None))[0] + 1
                     self.fails[idx] = (n, last)
                 self.cond.notify_all()
+            if data is None and getattr(last, "status", 0) == 403:
+                self._try_refresh()
             if data is None:
                 # chunk loi -> _next() se tu xep hang lai; lui dan de khong don dap googlevideo
                 time.sleep(min(3.0, 0.4 * self.fails.get(idx, (1, None))[0]))
@@ -3115,12 +3170,12 @@ def _src_server_port():
         return _src_port
 
 
-def _turbo(url, hdr, proxy):
+def _turbo(url, hdr, proxy, refresh=None):
     if not (TURBO and url and url.startswith(("http://", "https://"))) or re.search(r"\.m3u8|\.mpd|/manifest|/playlist", url, re.I):
         return None
     try:
         port = _src_server_port()
-        f = _Fetcher(url, _hdr_dict(hdr), proxy)
+        f = _Fetcher(url, _hdr_dict(hdr), proxy, refresh)
     except Exception as e:
         print(f"[turbo] bo qua ({str(e)[:100]}) -> doc truc tiep", flush=True)
         return None
@@ -3129,11 +3184,20 @@ def _turbo(url, hdr, proxy):
     return f"http://127.0.0.1:{port}/_src/{sid}", sid
 
 
-def _inputs(v_url, a_url, v_hdr, a_hdr, is_yt):
+def _inputs(v_url, a_url, v_hdr, a_hdr, is_yt, rsrc=None):
     proxy = YT_PROXY if (YT_PROXY and is_yt) else ""
+    def _mk(i):
+        if not rsrc:
+            return None
+        def _r():
+            # lay lai link bang yt-dlp (YT_DIRECT_FIRST bi bo qua) - co PO token nen khong bi cat giua chung
+            r = _resolve_stream_urls_refresh(rsrc[0], rsrc[1])
+            u, hh = (r[0], r[2]) if i == 0 else (r[1], r[3])
+            return (u, _hdr_dict(hh)) if u else None
+        return _r
     with concurrent.futures.ThreadPoolExecutor(2) as ex:
-        fv = ex.submit(_turbo, v_url, v_hdr, proxy)
-        fa = ex.submit(_turbo, a_url, a_hdr, proxy) if a_url else None
+        fv = ex.submit(_turbo, v_url, v_hdr, proxy, _mk(0))
+        fa = ex.submit(_turbo, a_url, a_hdr, proxy, _mk(1)) if a_url else None
         tv, ta = fv.result(), (fa.result() if fa else None)
     sids = [t[1] for t in (tv, ta) if t]
     vi = (tv[0], "", True) if tv else (v_url, v_hdr, False)
@@ -3215,6 +3279,8 @@ def _turbo_fallback(f, pos, end):
                 if pos <= end:
                     raise RuntimeError("nguon cat ngang")
             except Exception as e:
+                if getattr(e, "status", 0) == 403:
+                    f._try_refresh()
                 try:
                     c and c.close()
                 except Exception:
@@ -4134,7 +4200,7 @@ def _stream_impl(video_url):
             _cache_drop(video_url, height_cap)
             return jsonify({"error": "blocked_host", "detail": "nguon tro toi dia chi noi bo"}), 403
 
-        vi, ai, sids = _inputs(v_url, a_url, v_hdr, a_hdr, is_yt)
+        vi, ai, sids = _inputs(v_url, a_url, v_hdr, a_hdr, is_yt, (video_url, height_cap) if is_yt else None)
         cmd = _ffmpeg_cmd(vi[0], ai[0] if ai else None, vi[1], ai[1] if ai else "", is_yt, w, h, fps, q, ar, vi[2], ai[2] if ai else False)
         with _cur_lock:
             _old = _cur_proc
