@@ -280,8 +280,8 @@ BR_KILL_ON_LEAVE = os.environ.get("BR_KILL_ON_LEAVE", "0") == "1"  # thoat/back/
 PARK_SEC = float(os.environ.get("PARK_SEC", "120"))  # thoat video: giu ffmpeg chay nen toi da n giay (0 = tat ngay nhu cu)
 SESS_HOLD_SEC = float(os.environ.get("SESS_HOLD_SEC", "600"))  # mat ESP/WiFi: giu phien + ffmpeg toi da n giay roi giai phong
 SESS_CONVERT_SEC = float(os.environ.get("SESS_CONVERT_SEC", "180"))  # mat ESP: chi chuyen doi them n giay roi tam nghi (SIGSTOP) toi khi ESP gui lenh noi lai
-SESS_BUF_BYTES = int(float(os.environ.get("SESS_BUF_MB", "24")) * 1048576)  # tran bo dem cho 1 phien (day -> ffmpeg tam dung)
-SESS_BACK_BYTES = int(float(os.environ.get("SESS_BACK_KB", "1024")) * 1024)  # giu lai sau vi tri da gui de ESP noi lai lui duoc
+SESS_BUF_BYTES = int(float(os.environ.get("SESS_BUF_MB", "16")) * 1048576)  # tran bo dem cho 1 phien (day -> ffmpeg tam dung)
+SESS_BACK_BYTES = int(float(os.environ.get("SESS_BACK_KB", "6144")) * 1024)  # giu lai sau vi tri da gui de ESP noi lai lui duoc
 _reqbusy = 0
 _reqbusy_lock = threading.Lock()
 
@@ -607,8 +607,8 @@ def search():
         print("[search] yt-dlp dang ban (resolve khac), bo qua tim kiem du phong", flush=True)
         return jsonify([])
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(f"ytsearch{n}:{query}", download=False)
+        if True:
+            info = _ydl_info(f"ytsearch{n}:{query}", ydl_opts, slim=True)
             for entry in (info or {}).get("entries") or []:
                 if not entry or not entry.get("id"):
                     continue
@@ -786,9 +786,89 @@ def _build_ydl_opts(fmt, client=None, use_cookies=True, runtimes=False, proxy=""
     return opts
 
 
+
+# ==================== YT-DLP TRONG TIEN TRINH CON (tra RAM sau moi lan lay link) ====================
+# Nap het extractor + deno/node cua yt-dlp ngay trong tien trinh chinh lam RAM nhay vot len ~400MB va khong tra lai
+# -> gioi han 512MB bi OOM-kill giua luc xem. Chay trong tien trinh con: xong la HDH thu hoi toan bo.
+YT_SUBPROC = os.environ.get("YT_SUBPROC", "1") == "1"
+YT_SUBPROC_TIMEOUT = float(os.environ.get("YT_SUBPROC_TIMEOUT", "150"))
+_YDL_WORKER = r"""
+import sys, json
+def _out(o):
+    sys.stdout.write("\n@@YDL@@" + json.dumps(o, default=str) + "\n")
+    sys.stdout.flush()
+_DROP = ("formats", "thumbnails", "storyboards", "heatmap", "chapters")
+try:
+    req = json.loads(sys.stdin.read())
+    import yt_dlp
+    with yt_dlp.YoutubeDL(req["opts"]) as ydl:
+        info = ydl.extract_info(req["url"], download=False)
+        info = ydl.sanitize_info(info)
+    if req.get("slim") and isinstance(info, dict):
+        if info.get("requested_formats") or info.get("url"):
+            for k in _DROP:
+                info.pop(k, None)
+        for e in (info.get("entries") or []):
+            if isinstance(e, dict):
+                for k in _DROP:
+                    e.pop(k, None)
+    _out({"ok": True, "info": info})
+except BaseException as e:
+    ei = getattr(e, "exc_info", None)
+    cls = type(e).__name__
+    if ei and ei[0] is not None and getattr(ei[0], "__name__", "") == "GeoRestrictedError":
+        cls = "GeoRestrictedError"
+    _out({"ok": False, "err": str(e), "cls": cls})
+"""
+
+
+def _ydl_info(url, opts, slim=False):
+    if not YT_SUBPROC:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, download=False)
+    payload = json.dumps({"url": url, "opts": opts, "slim": slim})
+    try:
+        proc = subprocess.Popen(_oom_prefix() + [sys.executable, "-c", _YDL_WORKER], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, start_new_session=True)
+    except OSError as e:
+        print(f"[ydl] khong chay duoc tien trinh con ({e}) -> dung trong tien trinh chinh", flush=True)
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, download=False)
+    try:
+        out, err = proc.communicate(payload, timeout=YT_SUBPROC_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except Exception:
+            pass
+        try:
+            proc.communicate(timeout=5)
+        except Exception:
+            pass
+        raise RuntimeError(f"yt-dlp qua {YT_SUBPROC_TIMEOUT:.0f}s, da dung")
+    finally:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)  # don deno/node con sot lai
+        except Exception:
+            pass
+    _i = (out or "").rfind("@@YDL@@")
+    if _i < 0:
+        tail = (err or "").strip()[-300:]
+        raise RuntimeError(f"yt-dlp tien trinh con loi rc={proc.returncode}: {tail}")
+    try:
+        res = json.loads(out[_i + 7:].strip())
+    except ValueError:
+        raise RuntimeError("yt-dlp tra ket qua hong")
+    if not res.get("ok"):
+        raise type(str(res.get("cls") or "YtDlpError"), (Exception,), {})(res.get("err") or "yt-dlp loi")
+    return res.get("info")
+
+
 def _extract_with(video_url, ydl_opts):
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(video_url, download=False)
+    if True:
+        info = _ydl_info(video_url, ydl_opts, slim=True)
+        if info is None:
+            raise RuntimeError("yt-dlp khong tra thong tin")
         if "entries" in info:
             _ents = [e for e in (info.get("entries") or []) if e]
             if not _ents:
@@ -2454,8 +2534,7 @@ def _ytm_search_ytdlp(query, n):
                 opts["cookiefile"] = ck
             except OSError:
                 ck = None
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(f"ytsearch{n}:{query}", download=False)
+        info = _ydl_info(f"ytsearch{n}:{query}", opts, slim=True)
         out = []
         for e in (info or {}).get("entries") or []:
             if not e or not e.get("id"):
@@ -2650,6 +2729,9 @@ def ytm_audio():
     hdr = _ytm_clean_hdr(hdr)
     if hdr:
         cmd += ["-headers", hdr]
+    _ss = _int_arg("ss", 0, 0, 36000)
+    if _ss > 0:
+        cmd += ["-ss", str(_ss)]
     cmd += ["-threads", str(FFMPEG_THREADS), "-i", src, "-vn", "-map", "0:a:0",
             "-ac", "1", "-ar", str(YTM_RATE), "-c:a", "libmp3lame", "-b:a", YTM_BITRATE,
             "-id3v2_version", "0", "-write_xing", "0", "-flush_packets", "1", "-f", "mp3", "pipe:1"]
@@ -2703,12 +2785,12 @@ import base64
 import bisect
 
 TURBO = os.environ.get("TURBO", "1") == "1"
-TURBO_WORKERS = max(1, _env_int("TURBO_WORKERS", 5))
+TURBO_WORKERS = max(1, _env_int("TURBO_WORKERS", 3))
 TURBO_CHUNK = max(64, _env_int("TURBO_CHUNK_KB", 512)) * 1024
 TURBO_HEAD = 128 * 1024
 TURBO_MAX_FAIL = max(2, _env_int("TURBO_MAX_FAIL", 12))
 TURBO_HEAD_N = 8
-TURBO_AHEAD = max(4, _env_int("TURBO_AHEAD_MB", 8) * 1024 * 1024 // TURBO_CHUNK + TURBO_HEAD_N)
+TURBO_AHEAD = max(4, _env_int("TURBO_AHEAD_MB", 4) * 1024 * 1024 // TURBO_CHUNK + TURBO_HEAD_N)
 _LOCAL_IPS = ("127.0.0.1", "::1", "::ffff:127.0.0.1")
 _fetchers = {}
 
@@ -3109,10 +3191,22 @@ def _ffmpeg_cmd(v_url, a_url, v_hdr, a_hdr, is_yt, w, h, fps, q, ar, v_local=Fal
     return cmd
 
 
-def _nice_prefix():
-    if STREAM_NICE > 0 and shutil.which("nice"):
-        return ["nice", "-n", str(STREAM_NICE)]
+_OOM_CHILD = os.environ.get("OOM_CHILD_FIRST", "1") == "1"
+_OOM_PREFIX = ["sh", "-c", 'echo 1000 > /proc/self/oom_score_adj 2>/dev/null; exec "$@"', "sh"]
+
+
+def _oom_prefix():
+    """Khi het RAM, nhân Linux giet tien trinh con (ffmpeg/deno/yt-dlp) truoc, KHONG giet server chinh (tranh restart ~30s)."""
+    if _OOM_CHILD and os.path.exists("/proc/self/oom_score_adj") and shutil.which("sh"):
+        return list(_OOM_PREFIX)
     return []
+
+
+def _nice_prefix():
+    pre = _oom_prefix()
+    if STREAM_NICE > 0 and shutil.which("nice"):
+        return pre + ["nice", "-n", str(STREAM_NICE)]
+    return pre
 
 
 def _sock_diag(sock):
@@ -3379,8 +3473,7 @@ def _subs_load(video_url, langs):
     ea["skip"] = ["dash", "hls"]
     opts["ignore_no_formats_error"] = True
     opts["socket_timeout"] = 12
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(video_url, download=False)
+    info = _ydl_info(video_url, opts)
     if info and "entries" in info:
         info = next((e for e in (info.get("entries") or []) if e), {})
     info = info or {}
@@ -3426,6 +3519,95 @@ def _subs_worker(sess, video_url, langs):
 
 
 
+
+import bisect
+import array
+
+
+class _AviMap:
+    """Ghi lai vi tri (byte tuyet doi) cua TUNG chunk AVI de khi ESP xin noi lai o vi tri da bi cat khoi bo dem,
+    server bu phan con thieu cua chunk do bang du lieu rong roi nhay toi chunk ke tiep -> ESP KHONG bi 410/thoat video
+    (chi mat 1 khung hinh va vai giay hinh)."""
+
+    def __init__(self):
+        self.ok = True
+        self.state = 0
+        self.buf = b""
+        self.hdr = b""
+        self.hdr_start = 0
+        self.skip = 0
+        self.pos = 0
+        self.starts = array.array("Q")
+        self.sizes = array.array("I")
+        self.fcc = bytearray()
+
+    def feed(self, data):
+        if not data:
+            return
+        base_abs = self.pos
+        self.pos += len(data)
+        if not self.ok:
+            return
+        try:
+            if self.state == 0:
+                self.buf += data
+                i = self.buf.find(b"movi")
+                if i < 0:
+                    if len(self.buf) > 300000:
+                        self.ok = False
+                    return
+                base_abs = (self.pos - len(self.buf)) + i + 4
+                data, self.buf, self.state = self.buf[i + 4:], b"", 1
+            p, n = 0, len(data)
+            while p < n:
+                if self.skip:
+                    t = min(self.skip, n - p)
+                    self.skip -= t
+                    p += t
+                    continue
+                if not self.hdr:
+                    self.hdr_start = base_abs + p
+                take = data[p:p + 8 - len(self.hdr)]
+                self.hdr += take
+                p += len(take)
+                if len(self.hdr) < 8:
+                    break
+                fcc, size = self.hdr[:4], int.from_bytes(self.hdr[4:8], "little")
+                self.hdr = b""
+                if not ((fcc[:2].isdigit() and fcc[2:] in (b"dc", b"wb")) or fcc[:2] == b"ix" or fcc == b"JUNK"
+                        or fcc[2:] == b"tx"):
+                    self.ok = False
+                    return
+                self.starts.append(self.hdr_start)
+                self.sizes.append(size)
+                self.fcc += fcc
+                self.skip = size + (size & 1)
+        except Exception:
+            self.ok = False
+
+    def realign(self, internal, base):
+        """Tra (du_lieu_bu, vi_tri_moi) hoac None. du_lieu_bu hoan tat chunk ma ESP dang do dang; vi_tri_moi = chunk dau tien con trong bo dem."""
+        if not self.ok or len(self.starts) < 2:
+            return None
+        i = bisect.bisect_right(self.starts, internal) - 1
+        if i < 0 or i + 1 >= len(self.starts):
+            return None
+        st, en = self.starts[i], self.starts[i + 1]
+        if not (st <= internal < en):
+            return None
+        size = self.sizes[i]
+        fcc = bytes(self.fcc[4 * i:4 * i + 4])
+        full = bytearray(fcc + size.to_bytes(4, "little") + bytes(size + (size & 1)))
+        if len(full) != en - st:
+            return None
+        if fcc[2:] == b"dc" and size >= 2:
+            full[8 + size - 2:8 + size] = b"\xff\xd9"
+        j = bisect.bisect_left(self.starts, max(base, en))
+        if j >= len(self.starts):
+            return None
+        return bytes(full[internal - st:]), int(self.starts[j])
+
+
 class _Sess:
     """1 phien video: ffmpeg + bo dem RAM (dau ra AVI). Doc ffmpeg lien tuc o 1 luong rieng, nen mat WiFi/ESP thi ffmpeg
     van chuyen doi (toi da SESS_BUF_BYTES), ESP noi lai bang sid + off (so byte da nhan) la nhan tiep dung cho do."""
@@ -3443,6 +3625,9 @@ class _Sess:
         if self.inj:
             first = self.inj.process(first)
         self.buf = bytearray(first)
+        self.skew = 0
+        self.amap = _AviMap()
+        self.amap.feed(bytes(first))
         self.base = 0
         self.end = len(first)
         self.sent = 0
@@ -3483,6 +3668,7 @@ class _Sess:
                 with self.cv:
                     self.buf += data
                     self.end += len(data)
+                    self.amap.feed(data)
                     self.cv.notify_all()
         except Exception:
             pass
@@ -3493,6 +3679,7 @@ class _Sess:
                     if tail:
                         self.buf += tail
                         self.end += len(tail)
+                        self.amap.feed(tail)
                 self.eof = True
                 self.cv.notify_all()
 
@@ -3585,6 +3772,7 @@ class _Sess:
             _mark_stream(False)
         print(f"[sess] {self.sid[:6]} giai phong ({why or '?'}) | RAM {_mem_str()}", flush=True)
         _free_ram()
+        _ram_report("sau giai phong phien")
 
     def _trim(self):
         keep = max(self.base, self.sent - min(SESS_BACK_BYTES, SESS_BUF_BYTES // 2))
@@ -3630,6 +3818,8 @@ def _sess_reaper():
                 if now - s_.detached_at > SESS_CONVERT_SEC:
                     s_.pause()
                 hold = 60.0 if (s_.eof and s_.sent >= s_.end) else SESS_HOLD_SEC
+                if _mem_frac() > 0.70:
+                    hold = min(hold, 90.0)
                 if now - s_.detached_at > hold:
                     s_.kill(f"khong con ESP sau {hold:.0f}s")
         except Exception:
@@ -3646,26 +3836,36 @@ def _ytm_kill_all():
         _ytm_cover_cache.clear()
 
 
-def _enter_app(name):
-    """ESP dung app nao thi giu app do, tat 2 app con lai (video / nhac / trinh duyet) de nhuong RAM."""
-    global _app_cur
-    if name == _app_cur:
+_app_hard = ""
+
+
+def _enter_app(name, hard=False):
+    """ESP dung app nao thi giu app do, tat 2 app con lai (video / nhac / trinh duyet) de nhuong RAM.
+    hard=True: ESP bao THAT SU da doi app (/app?n=...) -> tat han app cu, khong cho RAM cao moi tat."""
+    global _app_cur, _app_hard
+    if name == _app_cur and not (hard and _app_hard != name):
         return
+    if hard:
+        _app_hard = name
     prev, _app_cur = _app_cur, name
     if not name:
         return
     # YouTube va YT Music KHONG duoc dap nhau: app dang chay nen chi bi tat khi RAM that su cao.
     tight = _mem_frac() > float(os.environ.get("APP_SWITCH_KILL_FRAC", "0.72"))
     print(f"[app] {prev or '-'} -> {name}: {'RAM cao, tat app khac' if tight else 'giu app nen'} | RAM {_mem_str()}", flush=True)
-    if name == "web" or tight:
+    if name == "web" or tight or hard:
         if name != "video":
             # Khong giet phien dang duoc ESP doc (detached_at is None): request phu nhu /ytm_cover,
             # /ytm_search luc dang xem YouTube se lam _enter_app("music") + RAM cao -> cat video sau vai giay.
             for s_ in list(_sessions.values()):
-                if getattr(s_, "detached_at", 1) is not None:
-                    s_.kill("doi sang app " + name + " (RAM cao)")
+                if hard or getattr(s_, "detached_at", 1) is not None:
+                    s_.kill("ESP da doi sang app " + name if hard else "doi sang app " + name + " (RAM cao)")
         if name != "music":
-            _ytm_kill_all()
+            if (not hard) and _ytm_busy() and _mem_frac() < 0.92:
+                print("[app] giu nhac dang phat (RAM chua toi muc nguy hiem)", flush=True)
+                _ytm_search_cache.clear()
+            else:
+                _ytm_kill_all()
     if name != "web":
         _cr_close_async(resume=True)
         try:
@@ -3677,7 +3877,7 @@ def _enter_app(name):
     _free_ram()
 
 
-def _sess_response(sess, off):
+def _sess_response(sess, off, prefix=b""):
     gen_id = None
     with sess.cv:
         sess.gen += 1
@@ -3694,6 +3894,8 @@ def _sess_response(sess, off):
         reason = "ffmpeg het du lieu (EOF)"
         last_mark = 0.0
         try:
+            if prefix:
+                yield prefix
             while True:
                 with sess.cv:
                     while pos >= sess.end and not sess.eof and not sess.dead and sess.gen == gen_id:
@@ -3753,21 +3955,36 @@ def _sess_response(sess, off):
                              "X-Relay-Purpose": "transcode-only-for-LilyGo-T-Display-S3"})
 
 
+RESUME_REALIGN = os.environ.get("RESUME_REALIGN", "1") == "1"
+
+
 def _stream_resume(sid, off):
     sess = _sessions.get(sid)
     if sess is None or sess.dead:
         return jsonify({"error": "session_gone", "detail": "phien het han hoac da bi thay the"}), 410
+    prefix = b""
     with sess.cv:
-        if off < sess.base:
-            return jsonify({"error": "offset_trimmed", "detail": "offset nam ngoai bo dem"}), 410
-        if off > sess.end:
+        internal = off + sess.skew
+        if internal < sess.base:
+            fix = sess.amap.realign(internal, sess.base) if RESUME_REALIGN else None
+            if fix is None:
+                print(f"[sess] {sid[:6]} 410 offset_trimmed: ESP xin off={off} (noi bo {internal}) nhung bo dem chi con tu "
+                      f"{sess.base} (da gui {sess.sent}, cua so lui {SESS_BACK_BYTES // 1024}KB)", flush=True)
+                return jsonify({"error": "offset_trimmed", "detail": "offset nam ngoai bo dem"}), 410
+            prefix, newpos = fix
+            gap = newpos - (internal + len(prefix))
+            sess.skew += gap
+            print(f"[sess] {sid[:6]} ESP xin off={off} da roi khoi bo dem ({sess.base}) -> bu {len(prefix)}B va nhay qua {gap}B "
+                  f"toi {newpos} (khong tra 410, ESP khong bi da)", flush=True)
+            internal = newpos
+        if internal > sess.end:
             return jsonify({"error": "offset_ahead"}), 416
-        if off == sess.end and sess.eof:
+        if internal == sess.end and sess.eof and not prefix:
             sess.detached_at = time.monotonic()
-            sess.sent = max(sess.sent, off)
+            sess.sent = max(sess.sent, internal)
             return Response("", 204)
-    print(f"[sess] {sid[:6]} ESP noi lai tai off={off} (server da co toi {sess.end})", flush=True)
-    return _sess_response(sess, off)
+    print(f"[sess] {sid[:6]} ESP noi lai tai off={off} (noi bo {internal}, server da co toi {sess.end})", flush=True)
+    return _sess_response(sess, internal, prefix)
 
 
 def _stream_impl(video_url):
@@ -3825,6 +4042,8 @@ def _stream_impl(video_url):
             return jsonify({"error": "resolve_failed", "detail": msg[:300],
                             "permanent": bool(getattr(e, "permanent", False))}), 502
 
+        _free_ram()
+        _ram_report("sau resolve")
         if not all(_url_is_public(u) for u in (v_url, a_url) if u):
             print("[stream] URL luong tro vao host noi bo -> chan", flush=True)
             _cache_drop(video_url, height_cap)
@@ -5533,7 +5752,7 @@ def app_switch():
         _sess_drop_all("ESP ve man hinh chinh")
         _free_ram()
     elif n in ("video", "music", "web"):
-        _enter_app(n)
+        _enter_app(n, hard=True)
     else:
         return Response("n=video|music|web|none", 400)
     return Response("", 204)
@@ -5652,6 +5871,91 @@ def _pot_selfcheck():
         print(f"[pot] LOI: khong chay duoc deno: {type(e).__name__}: {str(e)[:200]}", flush=True)
 
 
+
+# ==================== GIAM SAT RAM ====================
+RAM_WATCH = os.environ.get("RAM_WATCH", "1") == "1"
+RAM_SHED_FRAC = float(os.environ.get("RAM_SHED_FRAC", "0.78"))
+RAM_PANIC_FRAC = float(os.environ.get("RAM_PANIC_FRAC", "0.88"))
+RAM_IDLE_SEC = float(os.environ.get("RAM_IDLE_SEC", "75"))
+
+
+def _proc_rss_list():
+    out = []
+    try:
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            try:
+                with open(f"/proc/{pid}/status") as fh:
+                    txt = fh.read()
+                nm = re.search(r"^Name:\s*(\S+)", txt, re.M)
+                rs = re.search(r"^VmRSS:\s*(\d+)", txt, re.M)
+                if nm and rs:
+                    out.append((int(rs.group(1)) // 1024, nm.group(1), int(pid)))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    out.sort(reverse=True)
+    return out
+
+
+def _ram_report(tag):
+    try:
+        top = _proc_rss_list()[:6]
+        print(f"[ram] {tag} | {_mem_str()} | " + ", ".join(f"{n}({p})={mb}MB" for mb, n, p in top), flush=True)
+    except Exception:
+        pass
+
+
+def _ram_watchdog():
+    last_rep = 0.0
+    last_shed = 0.0
+    idle_done = None
+    while True:
+        time.sleep(2)
+        try:
+            f = _mem_frac()
+            now = time.monotonic()
+            if f > RAM_SHED_FRAC and now - last_shed > 5:
+                last_shed = now
+                _trim_caches()
+                try:
+                    _ytm_search_cache.clear()
+                    with _ytm_cover_lock:
+                        _ytm_cover_cache.clear()
+                except Exception:
+                    pass
+                _free_ram()
+                if f > RAM_PANIC_FRAC:
+                    for s_ in list(_sessions.values()):
+                        if not s_.dead and s_.detached_at is not None:
+                            s_.kill("RAM cao, giai phong phien dang cho")
+                _ram_report(f"RAM {f * 100:.0f}% -> don cache")
+            elif now - last_rep > 20 and (f > 0.55 or _active_streams > 0 or _ytm_busy()):
+                last_rep = now
+                _ram_report("dinh ky")
+            # Khong ai dung (khong luong, khong nhac, khong trinh duyet, khong phien) -> tat het, tra RAM
+            _idle = now - _last_req
+            _live = any(not s_.dead for s_ in list(_sessions.values()))
+            if (_idle > RAM_IDLE_SEC and not _live and _active_streams <= 0 and not _ytm_busy()
+                    and not _br_busy() and idle_done != _last_req):
+                idle_done = _last_req
+                _trim_caches()
+                try:
+                    _ytm_search_cache.clear()
+                    with _ytm_cover_lock:
+                        _ytm_cover_cache.clear()
+                except Exception:
+                    pass
+                if _cr is not None:
+                    _cr_close_async(resume=False)
+                _free_ram()
+                _ram_report(f"nhan roi {_idle:.0f}s -> don sach")
+        except Exception:
+            traceback.print_exc()
+
+
 _bg_started = False
 _bg_lock = threading.Lock()
 
@@ -5668,6 +5972,8 @@ def _start_background_tasks():
         threading.Thread(target=_warmup_once, daemon=True).start()
     if os.environ.get("POT_SELFCHECK", "0") == "1":
         threading.Thread(target=_pot_selfcheck, daemon=True).start()
+    if RAM_WATCH:
+        threading.Thread(target=_ram_watchdog, daemon=True).start()
     print(f"[power] keepalive=OFF warmup={os.environ.get('YT_WARMUP', '0')} pot_check={os.environ.get('POT_SELFCHECK', '0')} relay_url={RELAY_URL or '-'}", flush=True)
     print(f"[update] yt-dlp hien tai: {_ytdlp_version()} | auto_update={AUTO_UPDATE} kiem tra khi dang dung, toi da moi {UPDATE_HOURS}h", flush=True)
 
