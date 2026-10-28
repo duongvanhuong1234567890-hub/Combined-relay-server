@@ -822,14 +822,48 @@ except BaseException as e:
 """
 
 
+YT_DENO_HEAP_MB = int(os.environ.get("YT_DENO_HEAP_MB", "128"))  # 0 = tat gioi han
+YT_SPAWN_RAM_MB = float(os.environ.get("YT_SPAWN_RAM_MB", "250"))  # RAM dang dung vuot muc nay -> don dep/cho truoc khi mo yt-dlp (0 = tat)
+
+
+def _ram_guard_before_ydl():
+    """Dang xem video (ffmpeg+wireproxy+gunicorn ~220MB) ma mo them yt-dlp+deno la vuot 512MB -> OOM, chet ca server."""
+    if YT_SPAWN_RAM_MB <= 0:
+        return
+    mi = _mem_info()
+    if not mi or mi[0] < YT_SPAWN_RAM_MB:
+        return
+    try:
+        _trim_caches()
+        _free_ram()
+        for s_ in list(_sessions.values()):
+            if not s_.dead and s_.detached_at is not None:
+                s_.kill("RAM cao, nhuong cho resolve moi")
+    except Exception:
+        pass
+    end = time.monotonic() + 15
+    while time.monotonic() < end:
+        mi = _mem_info()
+        if not mi or mi[0] < YT_SPAWN_RAM_MB:
+            return
+        time.sleep(1)
+    mi = _mem_info()
+    if mi and mi[0] >= YT_SPAWN_RAM_MB + 60:
+        raise RuntimeError(f"RAM cao {mi[0]:.0f}MB, khong mo yt-dlp de tranh OOM")
+
+
 def _ydl_info(url, opts, slim=False):
     if not YT_SUBPROC:
         with yt_dlp.YoutubeDL(opts) as ydl:
             return ydl.extract_info(url, download=False)
     payload = json.dumps({"url": url, "opts": opts, "slim": slim})
+    _ram_guard_before_ydl()
+    _env = dict(os.environ)
+    if YT_DENO_HEAP_MB > 0 and "DENO_V8_FLAGS" not in _env:
+        _env["DENO_V8_FLAGS"] = f"--max-old-space-size={YT_DENO_HEAP_MB}"  # deno hay phinh 250MB -> OOM 512MB
     try:
         proc = subprocess.Popen(_oom_prefix() + [sys.executable, "-c", _YDL_WORKER], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, text=True, start_new_session=True)
+                                stderr=subprocess.PIPE, text=True, start_new_session=True, env=_env)
     except OSError as e:
         print(f"[ydl] khong chay duoc tien trinh con ({e}) -> dung trong tien trinh chinh", flush=True)
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -1348,6 +1382,7 @@ def _try_direct(video_id, height_cap):
     return res
 
 
+YT_DIRECT_FIRST = os.environ.get("YT_DIRECT_FIRST", "1") == "1"  # 0 = ve thu tu cu (yt-dlp truoc)
 WARM_RAPID = os.environ.get("WARM_RAPID", "0") == "1"
 
 
@@ -1469,6 +1504,13 @@ def _resolve_stream_urls_uncached(video_url, height_cap, background=False):
     yt_first_err = None
     race_ran = False
     race_rapid_err = None
+    direct_tried = False
+    if is_yt and YT_DIRECT_FIRST and not _geo_known(m.group(1)):
+        # Duong truc tiep (innertube) khong mo yt-dlp/deno: ~0MB RAM, vai giay. That bai 3 video lien tiep thi tu tat 10 phut.
+        direct_tried = True
+        _d0 = _try_direct(m.group(1), height_cap)
+        if _d0:
+            return _d0
     if is_yt and _geo_known(m.group(1)):
         # Da biet video bi chan theo vung: khong ton ~30s thu yt-dlp nua, di thang RapidAPI/Piped
         print(f"[resolve] {m.group(1)} bi chan theo vung (da biet) -> bo qua yt-dlp", flush=True)
@@ -1503,7 +1545,7 @@ def _resolve_stream_urls_uncached(video_url, height_cap, background=False):
                 _resolve_gate.release()
         else:
             print("[resolve] yt-dlp (thu truoc) bo qua: dang co resolve khac", flush=True)
-    if is_yt:
+    if is_yt and not direct_tried:
         _d = _try_direct(m.group(1), height_cap)
         if _d:
             return _d
