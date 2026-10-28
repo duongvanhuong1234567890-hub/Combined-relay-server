@@ -49,13 +49,42 @@ def _warp_fetch(url, dest, timeout=40):
         shutil.copyfileobj(r, f)
 
 
-def _warp_check(port):
-    """True neu proxy HTTP tren port that su di qua WARP."""
+def _wg_custom_conf():
+    """Cau hinh WireGuard cua VPN tu chon (bien WG_CONF: noi dung file .conf, hoac base64 cua no). Rong = dung WARP."""
+    raw = os.environ.get("WG_CONF", "").strip()
+    if not raw:
+        return ""
+    if "[Interface]" not in raw:
+        try:
+            import base64
+            raw = base64.b64decode(raw).decode("utf-8", "replace")
+        except Exception:
+            return ""
+    if "[Interface]" not in raw or "[Peer]" not in raw:
+        return ""
+    # wireproxy khong hieu PostUp/PreUp/Table/SaveConfig... -> bo cac dong do
+    drop = ("postup", "postdown", "preup", "predown", "table", "saveconfig", "fwmark")
+    out = []
+    for ln in raw.replace("\r", "").split("\n"):
+        k = ln.split("=", 1)[0].strip().lower()
+        if k in drop:
+            continue
+        out.append(ln)
+    return "\n".join(out).strip() + "\n"
+
+
+def _warp_check(port, need_warp=True):
+    """True neu proxy HTTP tren port chay duoc (need_warp: phai thuc su di qua WARP)."""
     try:
         px = f"http://127.0.0.1:{port}"
         op = urllib.request.build_opener(urllib.request.ProxyHandler({"http": px, "https": px}))
         with op.open("https://www.cloudflare.com/cdn-cgi/trace", timeout=12) as r:
             txt = r.read(4000).decode("utf-8", "replace")
+        if not need_warp:
+            m = re.search(r"^ip=(\S+)", txt, re.M)
+            if m:
+                _warp_log(f"IP ra ngoai: {m.group(1)}")
+            return bool(m)
         return "warp=on" in txt or "warp=plus" in txt
     except Exception:
         return False
@@ -70,7 +99,10 @@ def _warp_start():
         import platform
         import tarfile
         px = f"http://127.0.0.1:{WARP_PORT}"
-        if _warp_check(WARP_PORT):  # worker khoi dong lai (HUP): proxy cu van dang chay
+        custom = _wg_custom_conf()
+        if os.environ.get("WG_CONF", "").strip() and not custom:
+            _warp_log("canh bao: WG_CONF khong hop le (thieu [Interface]/[Peer]) -> dung WARP")
+        if _warp_check(WARP_PORT, need_warp=not custom):  # worker khoi dong lai (HUP): proxy cu van dang chay
             os.environ["YT_PROXY"] = px
             _warp_log(f"OK (dung lai proxy dang chay) -> YT_PROXY={px}")
             return
@@ -93,7 +125,7 @@ def _warp_start():
                 with t.extractfile(mem) as src, open(wp, "wb") as dst:
                     shutil.copyfileobj(src, dst)
             os.chmod(wp, 0o755)
-        if not os.path.exists(wg):
+        if not os.path.exists(wg) and not custom:
             # Khong dung api.github.com (hay bi "rate limit exceeded" tren IP Render).
             # /releases/latest se redirect sang .../tag/vX.Y.Z -> lay so phien ban tu URL cuoi.
             tags = []
@@ -124,6 +156,10 @@ def _warp_start():
                 return
             os.chmod(wg, 0o755)
         prof = os.path.join(_WARP_DIR, "wgcf-profile.conf")
+        if custom:
+            with open(prof, "w", encoding="utf-8") as fh:
+                fh.write(custom)
+            _warp_log("dung VPN WireGuard tu WG_CONF (khong dung WARP)")
         if not os.path.exists(prof):
             for args in (["register", "--accept-tos"], ["generate"]):
                 subprocess.run([wg] + args, cwd=_WARP_DIR, capture_output=True, timeout=45, stdin=subprocess.DEVNULL)
@@ -145,7 +181,7 @@ def _warp_start():
                 break
             try:
                 socket.create_connection(("127.0.0.1", WARP_PORT), timeout=1).close()
-                ok = _warp_check(WARP_PORT)
+                ok = _warp_check(WARP_PORT, need_warp=not custom)
                 break
             except OSError:
                 continue
