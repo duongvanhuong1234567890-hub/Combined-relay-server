@@ -207,7 +207,7 @@ _warp_start()
 # ==================== het khoi WARP ====================
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 1_000_000
+app.config["MAX_CONTENT_LENGTH"] = 700_000
 
 
 @app.errorhandler(Exception)
@@ -248,7 +248,7 @@ def _host_public(host):
     except Exception:
         ok = False
     with _host_lock:
-        if len(_host_cache) > 500:
+        if len(_host_cache) > 150:
             _host_cache.clear()
         _host_cache[host] = (now + (300 if ok else 10), ok)
     return ok
@@ -298,15 +298,15 @@ def _tok_ok(given, expected):
         return False
 
 
-RELAY_PURPOSE = "chi tai ve va giai ma (ffmpeg -> MJPEG/AVI) cho thiet bi LilyGo T-Display S3 cua chu server"
 _stat = {"since": time.time(), "streams": 0, "last": 0.0}
 _stat_lock = threading.Lock()
 
 
 @app.after_request
-def _purpose_headers(resp):
-    resp.headers["X-Relay-Purpose"] = "transcode-only-for-LilyGo-T-Display-S3"
-    resp.headers["X-Relay-Media-Storage"] = "none"
+def _security_headers(resp):
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers.setdefault("Cache-Control", "no-store")
     return resp
 
 
@@ -335,29 +335,37 @@ def _reqbusy_done(exc):
         _reqbusy_add(-1)
 
 
+_GATED = ("/stream", "/search", "/tr", "/ytm", "/app")
+_KNOWN = _GATED + ("/br", "/cookies")
+
+
 @app.before_request
 def _role_gate():
     global _br_last_activity, _last_req, _real_req_seen
     p = request.path
-    if p not in ("/", "/healthz", "/dbg") and not p.startswith("/_src/"):
+    if not p.startswith(_KNOWN) and not p.startswith("/_src/"):
+        return None
+    if ROLE == "video" and p.startswith("/br"):
+        return "disabled", 404
+    if ROLE == "browser" and p.startswith(("/stream", "/search", "/ytm")):
+        return "disabled", 404
+    _resume = p == "/stream" and bool(request.args.get("sid")) and request.args.get("sid") in _sessions
+    if p.startswith(_GATED) and not _resume:
+        if not STREAM_TOKEN and not ALLOW_OPEN_STREAM:
+            return "chua dat STREAM_TOKEN", 503
+        if STREAM_TOKEN and not _tok_ok(request.args.get("tk", ""), STREAM_TOKEN):
+            return "forbidden", 403
+    elif p.startswith("/br") and not _tok_ok(request.args.get("k", ""), BR_TOKEN):
+        return "forbidden", 403
+    elif p.startswith("/cookies") and not _tok_ok(request.args.get("k", ""), BR_TOKEN):
+        return "forbidden", 403
+    if not p.startswith("/_src/"):
         _last_req = time.monotonic()
         _real_req_seen = True
         _maybe_update_on_use()
         g._reqbusy_on = True
         _reqbusy_add(1)
-    if ROLE == "video" and p.startswith("/br"):
-        return "disabled on this server (ROLE=video)", 404
-    if ROLE == "browser" and p.startswith(("/stream", "/search", "/ytm")):
-        return "disabled on this server (ROLE=browser)", 404
-    _resume = p == "/stream" and bool(request.args.get("sid")) and request.args.get("sid") in _sessions
-    if p.startswith(("/stream", "/search", "/tr")) and not _resume:
-        if not STREAM_TOKEN and not ALLOW_OPEN_STREAM:
-            return "chua dat STREAM_TOKEN tren server - dat bien STREAM_TOKEN hoac ALLOW_OPEN_STREAM=1", 503
-        if STREAM_TOKEN and not _tok_ok(request.args.get("tk", ""), STREAM_TOKEN):
-            return "forbidden - them &tk=STREAM_TOKEN vao URL", 403
     if p.startswith(("/stream", "/search")):
-        # Khong giet luong dang phat khi co /search: thiet bi van duyet menu trong luc video chay.
-        # Client ngat ket noi se duoc phat hien qua GeneratorExit / call_on_close (_reap).
         _br_last_activity = 0.0
         _cr_release_for_stream()
     if p.startswith(("/stream", "/search")) or p == "/br/play":
@@ -369,11 +377,27 @@ def _role_gate():
     return None
 
 
-@app.route("/")
-def health_check():
+_NOT_ALLOWED = ("<!doctype html>\n<html lang=en>\n<title>405 Method Not Allowed</title>\n"
+                "<h1>Method Not Allowed</h1>\n<p>The method is not allowed for the requested URL.</p>\n")
 
-    return (f"OK | role={ROLE} | {RELAY_URL} | AUDIO_RATE={AUDIO_RATE} MJPEG_Q={MJPEG_Q} FFMPEG_THREADS={FFMPEG_THREADS} "
-            f"cookies={'yes' if os.path.exists(COOKIES_FILE) else 'NO'} | browser={'token-ok' if os.environ.get('BR_TOKEN') else 'NO-TOKEN'} | engine={BR_ENGINE}{'(chromium dang chay)' if _cr is not None else ''} | build=gg3-yt3 | direct={'on' if YT_DIRECT and time.monotonic() >= _direct_off_until else 'off'} | mem={_mem_str()} | up={(time.monotonic() - _BOOT_MONO) / 60:.0f}m | last_real_req={'none' if not _real_req_seen else str(int((time.monotonic() - _last_req) / 60)) + 'm ago'}"), 200
+
+def _405():
+    return Response(_NOT_ALLOWED, status=405, mimetype="text/html", headers={"Allow": "POST"})
+
+
+@app.route("/")
+def root_hidden():
+    return _405()
+
+
+@app.route("/status")
+def health_check():
+    if not _tok_ok(request.args.get("k", ""), BR_TOKEN):
+        return _405()
+    return (f"OK | role={ROLE} | mem={_mem_str()} | up={(time.monotonic() - _BOOT_MONO) / 60:.0f}m | "
+            f"cookies={'yes' if os.path.exists(COOKIES_FILE) else 'NO'} | engine={BR_ENGINE}"
+            f"{'(chromium dang chay)' if _cr is not None else ''} | direct={'on' if YT_DIRECT and time.monotonic() >= _direct_off_until else 'off'} | "
+            f"last_real_req={'none' if not _real_req_seen else str(int((time.monotonic() - _last_req) / 60)) + 'm ago'}"), 200
 
 PORT = int(os.environ.get("PORT", "8000"))
 
@@ -1841,31 +1865,6 @@ def _kill_stream(why=""):
             pass
 
 
-def _park(proc, cleanup):
-    """Thiet bi thoat video: giu ffmpeg song, van nhan du lieu nguon (hut bo).
-    Tat khi: co video moi (_cur_proc bi kill) hoac het PARK_SEC."""
-    tm = threading.Timer(PARK_SEC, _kill_quiet, (proc,))
-    tm.daemon = True
-    tm.start()
-
-    def run():
-        try:
-            while proc.poll() is None:
-                if not proc.stdout.read1(65536):
-                    break
-        except Exception:
-            pass
-        finally:
-            tm.cancel()
-            _terminate(proc)
-            try:
-                cleanup()
-            except Exception:
-                pass
-            print("[stream] ffmpeg chay nen da dung (het gio hoac co video moi)", flush=True)
-
-    threading.Thread(target=run, daemon=True).start()
-
 
 _STREAM_MARK = "/tmp/relay_stream_%d" % os.getpid()
 
@@ -2124,9 +2123,9 @@ _last_height_cap = ""
 def _warm_height():
     try:
         floor = int(os.environ.get("MIN_HEIGHT", "240"))
-        return str(max(int(_last_height_cap or os.environ.get("WARM_HEIGHT_CAP", "360")), floor))
+        return str(max(int(_last_height_cap or os.environ.get("WARM_HEIGHT_CAP", "240")), floor))
     except ValueError:
-        return "360"
+        return "240"
 
 
 YT_WARM_MAX_COST = float(os.environ.get("YT_WARM_MAX_COST", "25"))
@@ -2222,7 +2221,7 @@ def _normalize_input_url(u):
 # Relay CHI phat nhac. Key kich hoat va chan MAC nam hoan toan o activation_server (firmware tu hoi o do).
 YTM_BITRATE = os.environ.get("YTM_BITRATE", "64k")
 YTM_RATE = _env_int("YTM_RATE", 22050)
-YTM_MAX_STREAMS = max(1, _env_int("YTM_MAX_STREAMS", 2))
+YTM_MAX_STREAMS = max(1, _env_int("YTM_MAX_STREAMS", 3))
 _ytm_slots = threading.BoundedSemaphore(YTM_MAX_STREAMS)
 _ytm_active = 0
 _ytm_active_lock = threading.Lock()
@@ -2659,7 +2658,7 @@ def ytm_search():
             print(f"[ytm] tim kiem yt-dlp loi: {str(e)[:120]}", flush=True)
     base = f"{request.headers.get('X-Forwarded-Proto', request.scheme).split(',')[0].strip() or 'http'}://{request.host}"
     for r in res:
-        r["thumb"] = f"{base}/ytm_cover?id={r['id']}"
+        r["thumb"] = f"{base}/ytm_cover?id={r['id']}{_tk_q()}"
     if res:
         threading.Thread(target=_ytm_prefetch_list, args=([r["id"] for r in res if _YTM_ID_ONLY.match(str(r.get("id", "")))], 32), daemon=True).start()
     if res:
@@ -2760,6 +2759,11 @@ def _ytm_title(url, vid):
     return t
 
 
+def _tk_q():
+    """&tk=... de audio_url/cover_url/thumb tra ve cho thiet bi van qua duoc cong token (khi server dat STREAM_TOKEN)."""
+    return ("&tk=" + urllib.parse.quote(STREAM_TOKEN, safe="")) if STREAM_TOKEN else ""
+
+
 @app.route("/ytm")
 def ytm_info():
     url = _normalize_input_url(request.args.get("url", ""))
@@ -2775,9 +2779,9 @@ def ytm_info():
         threading.Thread(target=_ytm_cover_get, args=(vid, YTM_COVER_PREFETCH_PX), daemon=True).start()
     scheme = request.headers.get("X-Forwarded-Proto", request.scheme).split(",")[0].strip() or "http"
     base = f"{scheme}://{request.host}"
-    audio_url = f"{base}/ytm_audio?url={urllib.parse.quote(url, safe='')}"
+    audio_url = f"{base}/ytm_audio?url={urllib.parse.quote(url, safe='')}{_tk_q()}"
     return jsonify(success=True, title=_ytm_title(url, vid or url), audio_url=audio_url,
-                   cover_url=(f"{base}/ytm_cover?id={vid}" if vid else ""))
+                   cover_url=(f"{base}/ytm_cover?id={vid}{_tk_q()}" if vid else ""))
 
 
 def _ytm_clean_hdr(h):
@@ -2797,7 +2801,10 @@ def ytm_audio():
     if not src or not _url_is_public(src):
         return Response("nguon audio khong hop le", 502)
     if not _ytm_slots.acquire(blocking=False):
-        return Response("server dang phat nhieu bai, thu lai sau", 503)
+        # Bai cu con giu slot (may thoat dot ngot) -> giet ffmpeg cu roi cho toi da 4s de nhuong cho bai moi
+        _ytm_kill_all()
+        if not _ytm_slots.acquire(timeout=4):
+            return Response("server dang phat nhieu bai, thu lai sau", 503)
     cmd = _nice_prefix() + ["ffmpeg", "-nostdin", "-v", "error",
                             "-protocol_whitelist", "http,https,tcp,tls,crypto,data,httpproxy",
                             "-reconnect", "1", "-reconnect_streamed", "1",
@@ -5843,7 +5850,7 @@ def _log(*a):
 _TR_URL = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=vi&dt=t&q="
 _tr_cache = {}
 _tr_lock = threading.Lock()
-_tr_pool = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+_tr_pool = concurrent.futures.ThreadPoolExecutor(max_workers=3)
 
 
 def _tr_one(text):
@@ -5860,7 +5867,7 @@ def _tr_one(text):
     res = (first, rest)
     if first:
         with _tr_lock:
-            if len(_tr_cache) >= 300:
+            if len(_tr_cache) >= 120:
                 _tr_cache.pop(next(iter(_tr_cache)), None)
             _tr_cache[text] = res
     return res
