@@ -1319,7 +1319,7 @@ def _abr(f):
     return f.get("averageBitrate") or f.get("bitrate") or 0
 
 
-def pick_video_formats(data, height_cap):
+def pick_video_formats(data, height_cap, want=("", "")):
     sd = (data or {}).get("streamingData") or {}
     cap = int(height_cap)
     ada = _usable(sd.get("adaptiveFormats"))
@@ -1343,6 +1343,14 @@ def pick_video_formats(data, height_cap):
         if auds:
             low = [f for f in auds if _abr(f) <= YT_AUDIO_MAX_BPS]
             a = (max(low, key=lambda f: ("mp4a" in _mime(f), _abr(f))) if low else min(auds, key=_abr))
+        if want and want[0]:
+            _w = [f for f in vids if str(f.get("itag")) == want[0]]
+            if _w:
+                v = _w[0]
+        if want and len(want) > 1 and want[1]:
+            _w = [f for f in auds if str(f.get("itag")) == want[1]]
+            if _w:
+                a = _w[0]
         return v["url"], (a["url"] if a else None)
     comb = [f for f in _usable(sd.get("formats")) if _mime(f).startswith("video/")]
     comb = [f for f in comb if (f.get("height") or 0) <= cap] or comb
@@ -1466,10 +1474,17 @@ def innertube_player(base, key, video_id, opener, visitor, px="", timeout=None):
     return data, ua, pot
 
 
-def direct_resolve_video(base, key, video_id, cap, opener, visitor, px=""):
+def _url_itag(u):
+    try:
+        return urllib.parse.parse_qs(urllib.parse.urlparse(u or "").query).get("itag", [""])[0]
+    except Exception:
+        return ""
+
+
+def direct_resolve_video(base, key, video_id, cap, opener, visitor, px="", want=("", "")):
     data, ua, pot = innertube_player(base, key, video_id, opener, visitor, px)
     hdr = f"User-Agent: {ua}\r\n"
-    pick = pick_video_formats(data, cap)
+    pick = pick_video_formats(data, cap, want)
     if pick:
         v, a = _add_pot(pick[0], pot), (_add_pot(pick[1], pot) if pick[1] else None)
         if YT_DIRECT_PROBE:
@@ -2357,7 +2372,7 @@ class Resolver:
                   flush=True)
         return None
 
-    def refresh(self, url, cap, px, bad_cl=""):
+    def refresh(self, url, cap, px, bad_cl="", want=("", "")):
         url = _canon_url(url)
         m = _YT_ID_RE.search(url or "")
         if m and self.direct_on:
@@ -2367,6 +2382,7 @@ class Resolver:
                 self.dboard.kill(self.dboard.last_ok)
             keys = [k for k in YT_DIRECT_CLIENTS if dc_cfg(k)]
             opener = _proxy_opener(px)
+            _alt = None
             for k in self.dboard.order(keys):
                 GOV.pace(self.name + "_direct", jitter=(1.0, 1.2))
                 try:
@@ -2374,15 +2390,19 @@ class Resolver:
                         src, hdr = direct_resolve_audio(self.itb, k, m.group(1), opener, self.visitor, px)
                         r = Streams(src, None, hdr, "", px, "direct:" + k)
                     else:
-                        v, a, vh, ah = direct_resolve_video(self.itb, k, m.group(1), cap, opener, self.visitor, px)
+                        v, a, vh, ah = direct_resolve_video(self.itb, k, m.group(1), cap, opener, self.visitor, px, want)
                         r = Streams(v, a, vh, ah, px, "direct:" + k)
                 except Exception as e:
                     self.dboard.fail(k, hard=getattr(e, "hard", False))
                     continue
+                if not self.audio and ((want[0] and _url_itag(r.v) != want[0]) or (want[1] and r.a and _url_itag(r.a) != want[1])):
+                    print(f"[turbo] client '{k}' khong co dung itag {want} (v={_url_itag(r.v)} a={_url_itag(r.a)}) -> thu client khac", flush=True)
+                    _alt = _alt or r
+                    continue
                 self.dboard.ok(k)
                 print(f"[turbo] lay lai link direct bang client '{k}' (client loi: '{bad_cl or '?'}')", flush=True)
                 return r
-            print("[turbo] direct doi client that bai", flush=True)
+            print("[turbo] direct doi client that bai (khong client nao co dung itag)", flush=True)
         if not (TURBO_REFRESH_YTDLP and m):
             raise RuntimeError("khong lay duoc link moi (yt-dlp tat cho refresh)")
         if not self.gate.acquire(timeout=20):
@@ -2878,6 +2898,7 @@ TURBO_CHUNK = max(64, _env_int("TURBO_CHUNK_KB", 512)) * 1024
 TURBO_HEAD = 128 * 1024
 TURBO_MAX_FAIL = max(2, _env_int("TURBO_MAX_FAIL", 12))
 TURBO_HEAD_N = 8
+TURBO_REFRESH_MAX = max(3, _env_int("TURBO_REFRESH_MAX", 10))
 TURBO_AHEAD = max(4, _env_int("TURBO_AHEAD_MB", 4) * 1024 * 1024 // TURBO_CHUNK + TURBO_HEAD_N)
 _LOCAL_IPS = ("127.0.0.1", "::1", "::ffff:127.0.0.1")
 _fetchers = {}
@@ -2943,7 +2964,7 @@ class _Fetcher:
         if not self.refresh:
             return False
         with self.cond:
-            if self._refreshing or self.closed or self.refreshes >= 3 or time.monotonic() - self._last_refresh < 15:
+            if self._refreshing or self.closed or self.refreshes >= TURBO_REFRESH_MAX or time.monotonic() - self._last_refresh < 4:
                 return False
             self._refreshing = True
         ok = False
@@ -2967,6 +2988,7 @@ class _Fetcher:
                 self.refreshes += 1
                 if ok:
                     self.fails.clear()
+                    self.refreshes = max(0, self.refreshes - 2)
                 self.cond.notify_all()
         return ok
 
@@ -3072,7 +3094,7 @@ class _Fetcher:
                     except Exception:
                         pass
                     c = None
-                    if getattr(e, "status", 0) == 403 and self.refresh and self.refreshes < 3:
+                    if getattr(e, "status", 0) == 403 and self.refresh and self.refreshes < TURBO_REFRESH_MAX:
                         break
                     _slow = getattr(e, "status", 0) in (403, 429, 503)
                     time.sleep((1.0 if _slow else 0.2) * (attempt + 1))
@@ -3111,7 +3133,7 @@ class _Fetcher:
                 if self.closed:
                     raise RuntimeError("fetcher da dong")
                 nf, le = self.fails.get(idx, (0, None))
-                if nf >= TURBO_MAX_FAIL:
+                if nf >= TURBO_MAX_FAIL and not self._refreshing and not (self.refresh and self.refreshes < TURBO_REFRESH_MAX and time.monotonic() - self._last_refresh < 20):
                     raise RuntimeError(f"tai loi chunk {idx} {nf} lan: {le}")
                 if time.monotonic() > deadline:
                     raise TimeoutError("het gio cho chunk")
@@ -3211,7 +3233,7 @@ def turbo_src(sid):
 def _turbo_fallback(f, pos, end):
     c, tries = None, 0
     try:
-        while pos <= end and not f.closed and tries < 4:
+        while pos <= end and not f.closed and tries < 6:
             start = pos
             try:
                 c, r = f._request(c, pos, end)
@@ -3689,13 +3711,24 @@ def _stream_resume(sid, off):
 
 def _inputs(res, url, cap, is_yt):
     px = res.px if is_yt else ""
+    _want = (_url_itag(res.v), _url_itag(res.a) if res.a else "") if is_yt else ("", "")
+    _sh = {"t": 0.0, "r": None, "cl": res.cl}
+    _shl = threading.Lock()
+
+    def _shared():
+        with _shl:
+            if _sh["r"] is not None and time.monotonic() - _sh["t"] < 20:
+                return _sh["r"]
+            r = VIDEO.refresh(url, cap, px, _sh["cl"], _want)
+            _sh["r"], _sh["t"], _sh["cl"] = r, time.monotonic(), (r.cl or _sh["cl"])
+            return r
 
     def _mk(i):
         if not is_yt:
             return None
 
         def _r():
-            r = VIDEO.refresh(url, cap, px, res.cl)
+            r = _shared()
             u, hh = (r.v, r.vh) if i == 0 else (r.a, r.ah)
             return (u, _hdr_dict(hh)) if u else None
         return _r
