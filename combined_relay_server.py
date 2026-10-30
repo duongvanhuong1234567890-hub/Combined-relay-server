@@ -130,8 +130,8 @@ def _warp_fetch(url, dest, timeout=40):
     with urllib.request.urlopen(req, timeout=timeout) as r, open(dest, "wb") as f:
         shutil.copyfileobj(r, f)
 
-def _wg_custom_conf():
-    raw = os.environ.get("WG_CONF", "").strip()
+def _wg_parse(raw):
+    raw = (raw or "").strip()
     if not raw:
         return ""
     if "[Interface]" not in raw:
@@ -152,6 +152,23 @@ def _wg_custom_conf():
         out.append(ln)
     return "\n".join(out).strip() + "\n"
 
+def _wg_custom_confs():
+    """Doc WG_CONF, WG_CONF_2 ... WG_CONF_7 -> [(ten_bien, noi_dung_conf)]."""
+    res, seen = [], set()
+    for key in ["WG_CONF"] + [f"WG_CONF_{n}" for n in range(2, 8)]:
+        raw = os.environ.get(key, "").strip()
+        if not raw:
+            continue
+        conf = _wg_parse(raw)
+        if not conf:
+            _warp_log(f"canh bao: {key} khong hop le (thieu [Interface]/[Peer]) -> bo qua")
+            continue
+        if conf in seen:
+            continue
+        seen.add(conf)
+        res.append((key, conf))
+    return res
+
 def _warp_check(port, need_warp=True):
     try:
         px = f"http://127.0.0.1:{port}"
@@ -161,11 +178,48 @@ def _warp_check(port, need_warp=True):
         if not need_warp:
             m = re.search(r"^ip=(\S+)", txt, re.M)
             if m:
-                _warp_log(f"IP ra ngoai: {m.group(1)}")
+                _warp_log(f"IP ra ngoai (cong {port}): {m.group(1)}")
             return bool(m)
         return "warp=on" in txt or "warp=plus" in txt
     except Exception:
         return False
+
+def _wg_run(wp, conf, port, need_warp, label):
+    """Chay 1 wireproxy tren 127.0.0.1:port. True neu proxy len va ra duoc internet."""
+    os.makedirs(_WARP_DIR, exist_ok=True)
+    cpath = os.path.join(_WARP_DIR, f"wireproxy_{port}.conf")
+    lpath = os.path.join(_WARP_DIR, f"wireproxy_{port}.log")
+    with open(cpath, "w", encoding="utf-8") as fh:
+        fh.write(conf.rstrip() + f"\n\n[http]\nBindAddress = 127.0.0.1:{port}\n")
+    logf = open(lpath, "wb")
+    proc = subprocess.Popen([wp, "-c", cpath], stdout=logf, stderr=logf, stdin=subprocess.DEVNULL)
+    ok = False
+    for _ in range(10):
+        time.sleep(1)
+        if proc.poll() is not None:
+            break
+        try:
+            socket.create_connection(("127.0.0.1", port), timeout=1).close()
+        except OSError:
+            continue
+        for attempt in range(2):
+            ok = _warp_check(port, need_warp=need_warp)
+            if ok:
+                break
+            time.sleep(2)
+        break
+    if not ok:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            with open(lpath, "rb") as fh:
+                tail = fh.read()[-200:].decode("utf-8", "replace").replace("\n", " ")
+        except Exception:
+            tail = ""
+        _warp_log(f"loi: {label} (cong {port}) khong len | {tail}")
+    return ok
 
 def _warp_start():
     if not WARP_ON or os.environ.get("YT_PROXY", "").strip():
@@ -175,14 +229,7 @@ def _warp_start():
     try:
         import platform
         import tarfile
-        px = f"http://127.0.0.1:{WARP_PORT}"
-        custom = _wg_custom_conf()
-        if os.environ.get("WG_CONF", "").strip() and not custom:
-            _warp_log("canh bao: WG_CONF khong hop le (thieu [Interface]/[Peer]) -> dung WARP")
-        if _warp_check(WARP_PORT, need_warp=not custom):
-            os.environ["YT_PROXY"] = px
-            _warp_log(f"OK (dung lai proxy dang chay) -> YT_PROXY={px}")
-            return
+        confs = _wg_custom_confs()
         os.makedirs(_WARP_DIR, exist_ok=True)
         arch = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}.get(platform.machine().lower())
         if not arch:
@@ -190,7 +237,6 @@ def _warp_start():
             return
 
         wp = shutil.which("wireproxy") or os.path.join(_WARP_DIR, "wireproxy")
-        wg = shutil.which("wgcf") or os.path.join(_WARP_DIR, "wgcf")
         if not os.path.exists(wp):
             tgz = wp + ".tgz"
             _warp_fetch(f"https://github.com/pufferffish/wireproxy/releases/latest/download/wireproxy_linux_{arch}.tar.gz", tgz)
@@ -202,8 +248,37 @@ def _warp_start():
                 with t.extractfile(mem) as src, open(wp, "wb") as dst:
                     shutil.copyfileobj(src, dst)
             os.chmod(wp, 0o755)
-        if not os.path.exists(wg) and not custom:
 
+        # ---- VPN WireGuard tu bien moi truong: moi cai 1 wireproxy / 1 cong rieng ----
+        if confs:
+            ups = []
+            for idx, (key, conf) in enumerate(confs):
+                port = WARP_PORT + idx
+                px = f"http://127.0.0.1:{port}"
+                if _warp_check(port, need_warp=False):
+                    _warp_log(f"{key}: dung lai proxy dang chay {px}")
+                    ups.append(px)
+                    continue
+                if _wg_run(wp, conf, port, False, key):
+                    _warp_log(f"{key}: OK -> {px}")
+                    ups.append(px)
+            if ups:
+                os.environ["YT_PROXY"] = ups[0]
+                rest = ups[1:] + [p for p in _env_list("YT_PROXIES") if p not in ups]
+                if rest:
+                    os.environ["YT_PROXIES"] = ",".join(rest)
+                _warp_log(f"{len(ups)}/{len(confs)} VPN san sang (bi chan se tu doi sang cai khac)")
+                return
+            _warp_log("canh bao: khong VPN WG nao len -> thu WARP")
+
+        # ---- WARP (Cloudflare) khi khong co/khong chay duoc VPN WG ----
+        px = f"http://127.0.0.1:{WARP_PORT}"
+        if _warp_check(WARP_PORT, need_warp=True):
+            os.environ["YT_PROXY"] = px
+            _warp_log(f"OK (dung lai proxy dang chay) -> YT_PROXY={px}")
+            return
+        wg = shutil.which("wgcf") or os.path.join(_WARP_DIR, "wgcf")
+        if not os.path.exists(wg):
             tags = []
             try:
                 req = urllib.request.Request("https://github.com/ViRb3/wgcf/releases/latest", headers={"User-Agent": "Mozilla/5.0"})
@@ -232,10 +307,6 @@ def _warp_start():
                 return
             os.chmod(wg, 0o755)
         prof = os.path.join(_WARP_DIR, "wgcf-profile.conf")
-        if custom:
-            with open(prof, "w", encoding="utf-8") as fh:
-                fh.write(custom)
-            _warp_log("dung VPN WireGuard tu WG_CONF (khong dung WARP)")
         if not os.path.exists(prof):
             for args in (["register", "--accept-tos"], ["generate"]):
                 subprocess.run([wg] + args, cwd=_WARP_DIR, capture_output=True, timeout=45, stdin=subprocess.DEVNULL)
@@ -244,41 +315,20 @@ def _warp_start():
             return
         with open(prof, "r", encoding="utf-8") as fh:
             conf = fh.read()
-        conf += f"\n[http]\nBindAddress = 127.0.0.1:{WARP_PORT}\n"
-        cpath = os.path.join(_WARP_DIR, "wireproxy.conf")
-        with open(cpath, "w", encoding="utf-8") as fh:
-            fh.write(conf)
-        logf = open(os.path.join(_WARP_DIR, "wireproxy.log"), "ab")
-        proc = subprocess.Popen([wp, "-c", cpath], stdout=logf, stderr=logf, stdin=subprocess.DEVNULL)
-        ok = False
-        for _ in range(8):
-            time.sleep(1)
-            if proc.poll() is not None:
-                break
-            try:
-                socket.create_connection(("127.0.0.1", WARP_PORT), timeout=1).close()
-                ok = _warp_check(WARP_PORT, need_warp=not custom)
-                break
-            except OSError:
-                continue
-        if ok:
+        if _wg_run(wp, conf, WARP_PORT, True, "WARP"):
             os.environ["YT_PROXY"] = px
             _warp_log(f"OK -> YT_PROXY={px}")
         else:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-            try:
-                with open(os.path.join(_WARP_DIR, "wireproxy.log"), "rb") as fh:
-                    tail = fh.read()[-300:].decode("utf-8", "replace")
-            except Exception:
-                tail = ""
-            _warp_log(f"loi: proxy khong len, chay khong proxy | {tail}")
+            _warp_log("loi: proxy khong len, chay khong proxy")
     except Exception as e:
         _warp_log(f"loi: {type(e).__name__}: {str(e)[:200]}")
 
-_warp_start()
+# Khoi dong VPN o luong nen: khong bao gio chan viec mo cong cua server (Render "Port scan timeout").
+_WARP_THREAD = threading.Thread(target=_warp_start, name="warp-boot", daemon=True)
+_WARP_THREAD.start()
+_WARP_THREAD.join(_env_float("WARP_WAIT", 45))
+if _WARP_THREAD.is_alive():
+    _warp_log("VPN con dang khoi dong ngam, server chay truoc (se tu nap proxy khi xong)")
 
 ALLOW_PRIVATE_HOSTS = os.environ.get("ALLOW_PRIVATE_HOSTS", "") == "1"
 _SAFE_HOST_SUFFIX = (".googlevideo.com", ".youtube.com", ".ytimg.com", ".googleusercontent.com")
@@ -395,6 +445,14 @@ PROXIES = ProxyPool()
 PROXIES.load()
 
 
+def _reload_proxies_after_warp():
+    _WARP_THREAD.join()
+    PROXIES.load()
+
+if _WARP_THREAD.is_alive():
+    threading.Thread(target=_reload_proxies_after_warp, name="warp-reload", daemon=True).start()
+
+
 def _proxy_opener(px=""):
     if px:
         return urllib.request.build_opener(urllib.request.ProxyHandler({"http": px, "https": px}))
@@ -457,12 +515,12 @@ def _reqbusy_done(exc):
         _reqbusy_add(-1)
 
 
-_TOKEN_GATED = ("/stream", "/search", "/tr", "/ytm", "/app")
+_TOKEN_GATED = ("/stream", "/search", "/tr", "/gs", "/ytm", "/app", "/yt/")
 _BR_GATED = ("/br", "/cookies")
 
 
 def _svc_of(path):
-    if path.startswith(("/stream", "/search", "/_src/")):
+    if path.startswith(("/stream", "/search", "/_src/", "/yt/")):
         return "video"
     if path.startswith("/ytm"):
         return "music"
@@ -495,7 +553,7 @@ def _gate():
         _real_req_seen = True
         if svc:
             LAST_SVC_REQ[svc] = _last_req
-        elif p.startswith("/tr"):
+        elif p.startswith(("/tr", "/gs")):
             LAST_SVC_REQ["browser"] = _last_req
         if HAS_YT:
             _maybe_update_on_use()
@@ -3742,7 +3800,7 @@ def _inputs(res, url, cap, is_yt):
     return vi, ai, sids
 
 
-def _ffmpeg_cmd(v_url, a_url, v_hdr, a_hdr, px, w, h, fps, q, ar, v_local=False, a_local=False):
+def _ffmpeg_cmd(v_url, a_url, v_hdr, a_hdr, px, w, h, fps, q, ar, v_local=False, a_local=False, ss=0):
     def inp(url, hdr, vid=False, local=False):
         a = ["-protocol_whitelist", "http,https,tcp,tls,crypto,data,httpproxy",
              "-reconnect", "1", "-reconnect_at_eof", "1", "-reconnect_streamed", "1",
@@ -3765,6 +3823,8 @@ def _ffmpeg_cmd(v_url, a_url, v_hdr, a_hdr, px, w, h, fps, q, ar, v_local=False,
                     a += ["-readrate_initial_burst", str(STREAM_READ_BURST)]
             else:
                 a += ["-re"]
+        if ss > 0:
+            a += ["-ss", str(int(ss))]
         a += ["-i", url]
         return a
 
@@ -3801,6 +3861,7 @@ def _stream_impl(video_url):
         _cap = min(_cap, max(h, int(w * 9 / 16)))
     height_cap = str(max(_cap, _env_int("MIN_HEIGHT", 240)))
     _last_height_cap = height_cap
+    _start_ss = _int_arg("ss", 0, 0, 86400)
     fps = _int_arg("fps", 15, 1, 30)
     _fmin = _env_int("STREAM_FPS_MIN", 10)
     if _fmin:
@@ -3849,7 +3910,7 @@ def _stream_impl(video_url):
 
         vi, ai, sids = _inputs(res, video_url, height_cap, is_yt)
         cmd = _ffmpeg_cmd(vi[0], ai[0] if ai else None, vi[1], ai[1] if ai else "", res.px if is_yt else "",
-                          w, h, fps, q, ar, vi[2], ai[2] if ai else False)
+                          w, h, fps, q, ar, vi[2], ai[2] if ai else False, ss=_start_ss)
         with _cur_lock:
             _old = _cur_proc
             if _old is not None and _old.poll() is None:
@@ -3970,6 +4031,233 @@ def search():
     if res:
         warm_results(res)
     return jsonify(res)
+
+
+# ---------------- YouTube: lich su / yeu thich / vi tri xem do / lien quan / phu de ----------------
+# Server chi co 1 nguoi dung -> luu chung 1 ho so trong 1 file JSON (YT_STORE).
+YT_STORE_PATH = os.environ.get("YT_STORE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "yt_store.json"))
+YT_HIST_MAX = _env_int("YT_HIST_MAX", 100)
+YT_FAV_MAX = _env_int("YT_FAV_MAX", 200)
+_yt_lock = threading.Lock()
+_yt_store = None
+_YT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+
+
+def _yt_load():
+    global _yt_store
+    if _yt_store is None:
+        try:
+            with open(YT_STORE_PATH, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            if not isinstance(d, dict):
+                d = {}
+        except Exception:
+            d = {}
+        d.setdefault("hist", [])
+        d.setdefault("fav", [])
+        d.setdefault("pos", {})
+        _yt_store = d
+    return _yt_store
+
+
+def _yt_save():
+    tmp = YT_STORE_PATH + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_yt_store, f, ensure_ascii=False)
+        os.replace(tmp, YT_STORE_PATH)
+    except Exception as e:
+        print(f"[yt] khong luu duoc {YT_STORE_PATH}: {e}", flush=True)
+
+
+def _yt_item(vid):
+    return {"id": vid,
+            "title": (request.args.get("t") or "")[:120],
+            "channel": (request.args.get("c") or "")[:60],
+            "duration": (request.args.get("d") or "")[:10]}
+
+
+def _yt_id():
+    vid = (request.args.get("id") or "").strip()
+    return vid if _YT_ID_RE.match(vid) else ""
+
+
+def _yt_find(d, vid):
+    for key in ("hist", "fav"):
+        for it in d[key]:
+            if it.get("id") == vid:
+                return it
+    return None
+
+
+@app.route("/yt/progress")
+def yt_progress():
+    """Goi luc bat dau xem va luc thoat: dua video len dau lich su + luu vi tri (giay)."""
+    vid = _yt_id()
+    if not vid:
+        return jsonify({"error": "bad_id"}), 400
+    pos = _int_arg("pos", 0, 0, 86400 * 3)
+    dur = _int_arg("dur", 0, 0, 86400 * 3)
+    with _yt_lock:
+        d = _yt_load()
+        old = next((it for it in d["hist"] if it.get("id") == vid), None)
+        it = _yt_item(vid)
+        if old:
+            for k in ("title", "channel", "duration"):
+                if not it[k]:
+                    it[k] = old.get(k, "")
+        d["hist"] = [it] + [x for x in d["hist"] if x.get("id") != vid][:YT_HIST_MAX - 1]
+        if dur > 0 and pos >= dur - 15:
+            d["pos"].pop(vid, None)
+        elif pos >= 5:
+            d["pos"][vid] = pos
+        elif request.args.get("keep") != "1":
+            d["pos"].pop(vid, None)
+        if len(d["pos"]) > YT_HIST_MAX * 2:
+            keep = {x["id"] for x in d["hist"]}
+            d["pos"] = {k: v for k, v in d["pos"].items() if k in keep}
+        _yt_save()
+    return jsonify({"ok": True})
+
+
+@app.route("/yt/list")
+def yt_list():
+    kind = "fav" if request.args.get("kind") == "fav" else "hist"
+    n = _int_arg("n", 30, 1, 200)
+    with _yt_lock:
+        d = _yt_load()
+        out = []
+        for it in d[kind][:n]:
+            o = dict(it)
+            o["pos"] = int(d["pos"].get(it["id"], 0))
+            out.append(o)
+    return jsonify(out)
+
+
+@app.route("/yt/fav")
+def yt_fav():
+    vid = _yt_id()
+    if not vid:
+        return jsonify({"error": "bad_id"}), 400
+    op = request.args.get("op", "toggle")
+    with _yt_lock:
+        d = _yt_load()
+        has = any(x.get("id") == vid for x in d["fav"])
+        want = (not has) if op == "toggle" else (op == "add")
+        if want and not has:
+            it = _yt_item(vid)
+            src = _yt_find(d, vid)
+            if src:
+                for k in ("title", "channel", "duration"):
+                    if not it[k]:
+                        it[k] = src.get(k, "")
+            d["fav"] = [it] + d["fav"][:YT_FAV_MAX - 1]
+        elif not want and has:
+            d["fav"] = [x for x in d["fav"] if x.get("id") != vid]
+        _yt_save()
+    return jsonify({"fav": want})
+
+
+@app.route("/yt/pos")
+def yt_pos():
+    vid = _yt_id()
+    if not vid:
+        return jsonify({"pos": 0, "fav": False})
+    with _yt_lock:
+        d = _yt_load()
+        return jsonify({"pos": int(d["pos"].get(vid, 0)),
+                        "fav": any(x.get("id") == vid for x in d["fav"])})
+
+
+@app.route("/yt/related")
+def yt_related():
+    vid = _yt_id()
+    n = _int_arg("n", 8, 1, 20)
+    title = (request.args.get("t") or "").strip()
+    chan = (request.args.get("c") or "").strip()
+    if vid and not title:
+        with _yt_lock:
+            src = _yt_find(_yt_load(), vid)
+        if src:
+            title, chan = src.get("title", ""), src.get("channel", "")
+    q = re.sub(r"[\[\](){}|#]+", " ", title)
+    q = " ".join(q.split()[:8]).strip()
+    if not q:
+        q = chan
+    if not q:
+        return jsonify([])
+    try:
+        res = VIDEO_SEARCH.search(q, n + 4) or []
+    except Exception as e:
+        print(f"[yt/related] loi: {str(e)[:100]}", flush=True)
+        return jsonify([])
+    out = [r for r in res if r.get("id") and r.get("id") != vid][:n]
+    if out:
+        warm_results(out)
+    return jsonify(out)
+
+
+_yt_subs_cache = {}
+_yt_subs_lock = threading.Lock()
+
+
+def _yt_pick_sub(info, lang):
+    order = [x for x in (lang, "vi", "en") if x]
+    for table in ("subtitles", "automatic_captions"):
+        tab = info.get(table) or {}
+        for lg in order:
+            for key in tab:
+                if key == lg or key.startswith(lg + "-"):
+                    for f in tab[key]:
+                        if f.get("ext") == "json3" and f.get("url"):
+                            return f["url"]
+    return ""
+
+
+@app.route("/yt/subs")
+def yt_subs():
+    """Phu de dang text gon: moi dong 'startMs<TAB>endMs<TAB>noi dung'."""
+    vid = _yt_id()
+    lang = (request.args.get("lang") or "vi").strip()[:8]
+    if not vid:
+        return Response("", 200, mimetype="text/plain")
+    ck = (vid, lang)
+    now = time.monotonic()
+    with _yt_subs_lock:
+        hit = _yt_subs_cache.get(ck)
+        if hit and now - hit[0] < 1800:
+            return Response(hit[1], 200, mimetype="text/plain; charset=utf-8")
+    text = ""
+    try:
+        opts = {"quiet": True, "no_warnings": True, "skip_download": True, "socket_timeout": 10}
+        px = PROXIES.current()
+        if px:
+            opts["proxy"] = px
+        info = _ydl_info("https://www.youtube.com/watch?v=" + vid, opts) or {}
+        u = _yt_pick_sub(info, lang)
+        if u:
+            req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                data = json.loads(r.read(3 * 1024 * 1024).decode("utf-8", "replace"))
+            lines = []
+            for ev in data.get("events") or []:
+                segs = ev.get("segs") or []
+                t = "".join(sg.get("utf8", "") for sg in segs).replace("\n", " ").replace("\t", " ").strip()
+                if not t:
+                    continue
+                s0 = int(ev.get("tStartMs", 0))
+                e0 = s0 + int(ev.get("dDurationMs", 2000))
+                lines.append(f"{s0}\t{e0}\t{t[:90]}")
+                if len(lines) >= 700:
+                    break
+            text = "\n".join(lines)
+    except Exception as e:
+        print(f"[yt/subs] loi: {str(e)[:120]}", flush=True)
+    with _yt_subs_lock:
+        if len(_yt_subs_cache) > 20:
+            _yt_subs_cache.clear()
+        _yt_subs_cache[ck] = (now, text)
+    return Response(text, 200, mimetype="text/plain; charset=utf-8")
 
 
 YTM_BITRATE = os.environ.get("YTM_BITRATE", "64k")
@@ -6080,6 +6368,127 @@ def translate_batch():
             t, sn = "", ""
         out.append({"t": t, "s": sn})
     return jsonify({"r": out})
+
+
+# ===== /gs: relay goi Tavily thay thiet bi (cache + dich san sang tieng Viet) =====
+TAVILY_KEY = _env_str("TAVILY_API_KEY")
+_GS_TTL = max(0, _env_int("GS_CACHE_TTL", 600))
+_GS_MAX = max(8, _env_int("GS_CACHE_MAX", 64))
+_gs_cache = collections.OrderedDict()
+_gs_lock = threading.Lock()
+_gs_fast_ok = True
+
+
+def _gs_clean(s, mx):
+    s = " ".join(str(s or "").split())
+    b = s.encode("utf-8")
+    if len(b) <= mx:
+        return s
+    return b[:mx].decode("utf-8", "ignore").rstrip()
+
+
+def _gs_clip_words(s, mx):
+    if len(s) <= mx:
+        return s
+    cut = s.rfind(" ", 0, mx)
+    return s[:cut if cut > mx // 2 else mx]
+
+
+def _gs_call(query, n, depth):
+    body = json.dumps({"query": query, "max_results": n, "search_depth": depth, "include_answer": False,
+                       "include_images": True, "include_raw_content": False}).encode("utf-8")
+    req = urllib.request.Request("https://api.tavily.com/search", data=body,
+                                 headers={"Content-Type": "application/json",
+                                          "Authorization": "Bearer " + TAVILY_KEY})
+    try:
+        with urllib.request.urlopen(req, timeout=12) as r:
+            return 200, json.loads(r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        return e.code, None
+    except Exception:
+        return 0, None
+
+
+def _gs_fetch(query, n):
+    """Thu toi da 1 lan lai (loi mang/5xx). Chi ha cap ultra-fast khi Tavily bao 400/422."""
+    global _gs_fast_ok
+    retried = False
+    for _ in range(3):
+        code, data = _gs_call(query, n, "ultra-fast" if _gs_fast_ok else "basic")
+        if code == 200:
+            return 200, data
+        if _gs_fast_ok and code in (400, 422):
+            _gs_fast_ok = False
+            continue
+        if 400 <= code < 500 and code != 408:
+            return code, None
+        if retried:
+            return code, None
+        retried = True
+        time.sleep(0.15)
+    return 0, None
+
+
+@app.route("/gs")
+def google_search():
+    if not TAVILY_KEY:
+        return jsonify({"e": "no_key"}), 501
+    q = " ".join((request.args.get("q") or "").split())[:200]
+    if not q:
+        return jsonify({"r": [], "i": [], "tv": 0})
+    try:
+        n = max(1, min(12, int(request.args.get("n", 8))))
+    except ValueError:
+        n = 8
+    vi = request.args.get("vi") == "1"
+    key = (q.lower(), n, vi)
+    if _GS_TTL:
+        with _gs_lock:
+            hit = _gs_cache.get(key)
+            if hit and time.monotonic() - hit[0] < _GS_TTL:
+                _gs_cache.move_to_end(key)
+                return Response(hit[1], mimetype="application/json")
+    code, data = _gs_fetch(q, n)
+    if code != 200 or not isinstance(data, dict):
+        return jsonify({"e": code}), 502
+    rows = []
+    for it in (data.get("results") or []):
+        u = str(it.get("url") or "")
+        if not u:
+            continue
+        rows.append({"u": u[:300], "t": _gs_clean(it.get("title"), 160), "s": _gs_clean(it.get("content"), 900)})
+        if len(rows) >= n:
+            break
+    imgs = []
+    for v in (data.get("images") or []):
+        u = v if isinstance(v, str) else (v.get("url") if isinstance(v, dict) else "")
+        imgs.append(u if isinstance(u, str) and u.startswith("http") and len(u) < 330 else "")
+        if len(imgs) >= len(rows):
+            break
+    tv = 0
+    if vi and rows:
+        futs = [_tr_pool.submit(_tr_one, r["t"] + "\n" + _gs_clip_words(r["s"], 400)) for r in rows]
+        concurrent.futures.wait(futs, timeout=8)
+        for r, f in zip(rows, futs):
+            if not f.done():
+                f.cancel()
+                continue
+            try:
+                t, sn = f.result(timeout=0)
+            except Exception:
+                continue
+            if t:
+                r["t"] = _gs_clean(t, 160)
+                if sn:
+                    r["s"] = _gs_clean(sn, 900)
+                tv = 1
+    body = json.dumps({"r": rows, "i": imgs, "tv": tv}, ensure_ascii=False, separators=(",", ":"))
+    if rows and _GS_TTL and (tv or not vi):
+        with _gs_lock:
+            _gs_cache[key] = (time.monotonic(), body)
+            while len(_gs_cache) > _GS_MAX:
+                _gs_cache.popitem(last=False)
+    return Response(body, mimetype="application/json")
 
 
 def _prewarm_browser():
