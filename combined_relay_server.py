@@ -4040,7 +4040,7 @@ YT_HIST_MAX = _env_int("YT_HIST_MAX", 100)
 YT_FAV_MAX = _env_int("YT_FAV_MAX", 200)
 _yt_lock = threading.Lock()
 _yt_store = None
-_YT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+_YT_VID_ONLY_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
 
 def _yt_load():
@@ -4079,7 +4079,7 @@ def _yt_item(vid):
 
 def _yt_id():
     vid = (request.args.get("id") or "").strip()
-    return vid if _YT_ID_RE.match(vid) else ""
+    return vid if _YT_VID_ONLY_RE.match(vid) else ""
 
 
 def _yt_find(d, vid):
