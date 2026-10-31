@@ -36,7 +36,13 @@ COPY --from=potbuild /src/server /root/bgutil-ytdlp-pot-provider/server
 
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt && pip install --no-cache-dir -U --pre "yt-dlp[default]" && playwright install --with-deps chromium
+RUN pip install --no-cache-dir -r requirements.txt && playwright install --with-deps chromium
+
+# yt-dlp nightly: layer rieng + ARG doi moi lan -> khong bi cache giu ban cu (log cu: 2026.10.26).
+# Doi YTDLP_BUILD (vd. ngay hom nay) moi khi muon ep build lai ban moi nhat.
+ARG YTDLP_BUILD=2026-10-31-1
+RUN echo "yt-dlp build ${YTDLP_BUILD}" && pip install --no-cache-dir -U --pre "yt-dlp[default]" \
+    && python -c "import yt_dlp.version as v; print('[build] yt-dlp', v.__version__)"
 
 COPY combined_relay_server.py ./
 
