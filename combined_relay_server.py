@@ -1586,7 +1586,8 @@ def _res_expiry(urls):
 
 Streams = collections.namedtuple("Streams", "v a vh ah px cl", defaults=("", ""))
 
-RAPID_KEY = _env_str("RAPIDAPI_KEY")
+RAPID_ENABLED = _env_bool("RAPID_ENABLED", False)  # RapidAPI tat mac dinh; bat bang RAPID_ENABLED=1
+RAPID_KEY = _env_str("RAPIDAPI_KEY") if RAPID_ENABLED else ""
 RAPID_URL = _env_str("RAPID_URL", "https://youtube-media-downloader.p.rapidapi.com/v2/video/details")
 RAPID_HOST = urllib.parse.urlparse(RAPID_URL).netloc
 RAPID_ONLY = _env_bool("RAPID_ONLY", False)
