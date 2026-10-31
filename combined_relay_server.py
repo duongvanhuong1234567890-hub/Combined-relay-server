@@ -2581,12 +2581,17 @@ def search_via_api(query, n, music=False):
     items = data.get("items", [])
     ids = [it["id"]["videoId"] for it in items if it.get("id", {}).get("videoId")]
     durations = {}
+    view_counts = {}
     if ids:
         try:
-            vids = _api_get("videos", {"part": "contentDetails", "id": ",".join(ids),
-                                       "fields": "items(id,contentDetails/duration)"})
+            vids = _api_get("videos", {"part": "contentDetails,statistics", "id": ",".join(ids),
+                                       "fields": "items(id,contentDetails/duration,statistics/viewCount)"})
             for v in vids.get("items", []):
                 durations[v["id"]] = _iso_duration_to_seconds(v["contentDetails"].get("duration"))
+                try:
+                    view_counts[v["id"]] = int((v.get("statistics") or {}).get("viewCount") or 0)
+                except (TypeError, ValueError):
+                    pass
         except Exception as e:
             print(f"[search] bo qua thoi luong ({str(e)[:80]})", flush=True)
     out = []
@@ -2597,7 +2602,8 @@ def search_via_api(query, n, music=False):
         sn = it.get("snippet") or {}
         out.append({"id": vid, "title": html.unescape(sn.get("title", "")),
                     "channel": html.unescape(sn.get("channelTitle", "")),
-                    "duration": ("LIVE" if sn.get("liveBroadcastContent") == "live" else format_duration(durations.get(vid)))})
+                    "duration": ("LIVE" if sn.get("liveBroadcastContent") == "live" else format_duration(durations.get(vid))),
+                    "views": view_counts.get(vid, 0)})
     return out
 
 
@@ -2623,6 +2629,14 @@ def _txt(x):
 _DUR_RE = re.compile(r"^\d{1,2}(:\d{2}){1,2}$")
 
 
+def _views_from_text(x):
+    t = _txt(x)
+    d = re.sub(r"\D", "", t or "")
+    if not d or len(d) > 10:
+        return 0
+    return int(d)
+
+
 def parse_video_search(data, n):
     out, seen = [], set()
     for d in _walk(data):
@@ -2640,7 +2654,8 @@ def parse_video_search(data, n):
         dur = _txt(vr.get("lengthText"))
         out.append({"id": vid, "title": _txt(vr.get("title")),
                     "channel": _txt(vr.get("ownerText")) or _txt(vr.get("longBylineText")),
-                    "duration": "LIVE" if (live and not dur) else dur})
+                    "duration": "LIVE" if (live and not dur) else dur,
+                    "views": _views_from_text(vr.get("viewCountText"))})
         if len(out) >= n:
             break
     return out
@@ -2794,7 +2809,8 @@ class SearchEngine:
                 continue
             out.append({"id": e["id"], "title": e.get("title") or "",
                         "channel": e.get("channel") or e.get("uploader") or "",
-                        "duration": "LIVE" if e.get("live_status") == "is_live" else format_duration(e.get("duration"))})
+                        "duration": "LIVE" if e.get("live_status") == "is_live" else format_duration(e.get("duration")),
+                        "views": int(e.get("view_count") or 0)})
         return out
 
     def search(self, query, n):
@@ -4033,140 +4049,13 @@ def search():
     return jsonify(res)
 
 
-# ---------------- YouTube: lich su / yeu thich / vi tri xem do / lien quan / phu de ----------------
-# Server chi co 1 nguoi dung -> luu chung 1 ho so trong 1 file JSON (YT_STORE).
-YT_STORE_PATH = os.environ.get("YT_STORE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "yt_store.json"))
-YT_HIST_MAX = _env_int("YT_HIST_MAX", 100)
-YT_FAV_MAX = _env_int("YT_FAV_MAX", 200)
-_yt_lock = threading.Lock()
-_yt_store = None
-_YT_VID_ONLY_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
-
-
-def _yt_load():
-    global _yt_store
-    if _yt_store is None:
-        try:
-            with open(YT_STORE_PATH, "r", encoding="utf-8") as f:
-                d = json.load(f)
-            if not isinstance(d, dict):
-                d = {}
-        except Exception:
-            d = {}
-        d.setdefault("hist", [])
-        d.setdefault("fav", [])
-        d.setdefault("pos", {})
-        _yt_store = d
-    return _yt_store
-
-
-def _yt_save():
-    tmp = YT_STORE_PATH + ".tmp"
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(_yt_store, f, ensure_ascii=False)
-        os.replace(tmp, YT_STORE_PATH)
-    except Exception as e:
-        print(f"[yt] khong luu duoc {YT_STORE_PATH}: {e}", flush=True)
-
-
-def _yt_item(vid):
-    return {"id": vid,
-            "title": (request.args.get("t") or "")[:120],
-            "channel": (request.args.get("c") or "")[:60],
-            "duration": (request.args.get("d") or "")[:10]}
+# ---------------- YouTube: lien quan / phu de ----------------
+_YT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
 
 def _yt_id():
     vid = (request.args.get("id") or "").strip()
-    return vid if _YT_VID_ONLY_RE.match(vid) else ""
-
-
-def _yt_find(d, vid):
-    for key in ("hist", "fav"):
-        for it in d[key]:
-            if it.get("id") == vid:
-                return it
-    return None
-
-
-@app.route("/yt/progress")
-def yt_progress():
-    """Goi luc bat dau xem va luc thoat: dua video len dau lich su + luu vi tri (giay)."""
-    vid = _yt_id()
-    if not vid:
-        return jsonify({"error": "bad_id"}), 400
-    pos = _int_arg("pos", 0, 0, 86400 * 3)
-    dur = _int_arg("dur", 0, 0, 86400 * 3)
-    with _yt_lock:
-        d = _yt_load()
-        old = next((it for it in d["hist"] if it.get("id") == vid), None)
-        it = _yt_item(vid)
-        if old:
-            for k in ("title", "channel", "duration"):
-                if not it[k]:
-                    it[k] = old.get(k, "")
-        d["hist"] = [it] + [x for x in d["hist"] if x.get("id") != vid][:YT_HIST_MAX - 1]
-        if dur > 0 and pos >= dur - 15:
-            d["pos"].pop(vid, None)
-        elif pos >= 5:
-            d["pos"][vid] = pos
-        elif request.args.get("keep") != "1":
-            d["pos"].pop(vid, None)
-        if len(d["pos"]) > YT_HIST_MAX * 2:
-            keep = {x["id"] for x in d["hist"]}
-            d["pos"] = {k: v for k, v in d["pos"].items() if k in keep}
-        _yt_save()
-    return jsonify({"ok": True})
-
-
-@app.route("/yt/list")
-def yt_list():
-    kind = "fav" if request.args.get("kind") == "fav" else "hist"
-    n = _int_arg("n", 30, 1, 200)
-    with _yt_lock:
-        d = _yt_load()
-        out = []
-        for it in d[kind][:n]:
-            o = dict(it)
-            o["pos"] = int(d["pos"].get(it["id"], 0))
-            out.append(o)
-    return jsonify(out)
-
-
-@app.route("/yt/fav")
-def yt_fav():
-    vid = _yt_id()
-    if not vid:
-        return jsonify({"error": "bad_id"}), 400
-    op = request.args.get("op", "toggle")
-    with _yt_lock:
-        d = _yt_load()
-        has = any(x.get("id") == vid for x in d["fav"])
-        want = (not has) if op == "toggle" else (op == "add")
-        if want and not has:
-            it = _yt_item(vid)
-            src = _yt_find(d, vid)
-            if src:
-                for k in ("title", "channel", "duration"):
-                    if not it[k]:
-                        it[k] = src.get(k, "")
-            d["fav"] = [it] + d["fav"][:YT_FAV_MAX - 1]
-        elif not want and has:
-            d["fav"] = [x for x in d["fav"] if x.get("id") != vid]
-        _yt_save()
-    return jsonify({"fav": want})
-
-
-@app.route("/yt/pos")
-def yt_pos():
-    vid = _yt_id()
-    if not vid:
-        return jsonify({"pos": 0, "fav": False})
-    with _yt_lock:
-        d = _yt_load()
-        return jsonify({"pos": int(d["pos"].get(vid, 0)),
-                        "fav": any(x.get("id") == vid for x in d["fav"])})
+    return vid if _YT_ID_RE.match(vid) else ""
 
 
 @app.route("/yt/related")
@@ -4175,11 +4064,6 @@ def yt_related():
     n = _int_arg("n", 8, 1, 20)
     title = (request.args.get("t") or "").strip()
     chan = (request.args.get("c") or "").strip()
-    if vid and not title:
-        with _yt_lock:
-            src = _yt_find(_yt_load(), vid)
-        if src:
-            title, chan = src.get("title", ""), src.get("channel", "")
     q = re.sub(r"[\[\](){}|#]+", " ", title)
     q = " ".join(q.split()[:8]).strip()
     if not q:
@@ -4195,6 +4079,131 @@ def yt_related():
     if out:
         warm_results(out)
     return jsonify(out)
+
+
+# ---------------- YouTube: xu huong + thumbnail 16:9 cho man Home ----------------
+_yt_trend_cache = {}
+_yt_trend_lock = threading.Lock()
+_YT_TREND_TTL = 900
+
+
+@app.route("/yt/trending")
+def yt_trending():
+    n = _int_arg("n", 6, 1, 12)
+    vi = (request.args.get("lang") or "vi").lower().startswith("vi")
+    key = "vi" if vi else "en"
+    now = time.time()
+    with _yt_trend_lock:
+        hit = _yt_trend_cache.get(key)
+    if hit and now - hit[0] < _YT_TREND_TTL and len(hit[1]) >= n:
+        return jsonify(hit[1][:n])
+    queries = ["video xu huong hom nay", "nhac moi hot"] if vi else ["trending videos today", "popular now"]
+    out, seen = [], set()
+    for q in queries:
+        try:
+            res = VIDEO_SEARCH.search(q, 12) or []
+        except Exception as e:
+            print(f"[yt/trending] loi: {str(e)[:100]}", flush=True)
+            res = []
+        for r in res:
+            vid = r.get("id")
+            if vid and vid not in seen and r.get("duration") != "LIVE":
+                seen.add(vid)
+                out.append(r)
+        if len(out) >= 12:
+            break
+    if out:
+        with _yt_trend_lock:
+            _yt_trend_cache[key] = (now, out)
+        threading.Thread(target=_yt_thumb_prefetch, args=([r["id"] for r in out[:12]], 150, 70), daemon=True).start()
+        return jsonify(out[:n])
+    if hit:
+        return jsonify(hit[1][:n])
+    return jsonify([])
+
+
+_yt_thumb_cache = {}
+_yt_thumb_lock = threading.Lock()
+_yt_thumb_gen_lock = threading.Lock()
+
+
+def _yt_thumb_get(vid, w, h):
+    key = (vid, w, h)
+    with _yt_thumb_lock:
+        data = _yt_thumb_cache.get(key)
+    if data:
+        return data
+    with _yt_thumb_gen_lock:
+        with _yt_thumb_lock:
+            data = _yt_thumb_cache.get(key)
+        if data:
+            return data
+        src = None
+        for name in ("mqdefault", "hqdefault", "default"):
+            try:
+                rq = urllib.request.Request(f"https://i.ytimg.com/vi/{vid}/{name}.jpg", headers={"User-Agent": UA})
+                with urllib.request.urlopen(rq, timeout=8) as r:
+                    src = r.read(600_000)
+                if src:
+                    break
+            except Exception as e:
+                print(f"[yt/thumb] {name} loi: {type(e).__name__}", flush=True)
+        if not src:
+            return None
+        data = b""
+        try:
+            from PIL import Image
+            im = Image.open(io.BytesIO(src))
+            im.draft("RGB", (w * 2, h * 2))
+            im = im.convert("RGB")
+            s = max(w / im.width, h / im.height)
+            nw, nh = max(w, int(round(im.width * s))), max(h, int(round(im.height * s)))
+            im = im.resize((nw, nh), Image.BILINEAR)
+            l, t = (nw - w) // 2, (nh - h) // 2
+            im = im.crop((l, t, l + w, t + h))
+            buf = io.BytesIO()
+            im.save(buf, "JPEG", quality=68, optimize=True)
+            data = buf.getvalue()
+        except Exception:
+            data = b""
+        if not data:
+            try:
+                vf = f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}"
+                pr = subprocess.run(_nice_prefix() + ["ffmpeg", "-nostdin", "-v", "error", "-i", "pipe:0", "-vf", vf,
+                                                      "-frames:v", "1", "-q:v", "6", "-f", "mjpeg", "pipe:1"],
+                                    input=src, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=40)
+                data = pr.stdout
+            except Exception as e:
+                print(f"[yt/thumb] loi cat anh: {type(e).__name__}", flush=True)
+        if not data:
+            return None
+        with _yt_thumb_lock:
+            if len(_yt_thumb_cache) > 300:
+                for k in list(_yt_thumb_cache)[:120]:
+                    _yt_thumb_cache.pop(k, None)
+            _yt_thumb_cache[key] = data
+        return data
+
+
+def _yt_thumb_prefetch(ids, w, h):
+    for v in ids:
+        try:
+            _yt_thumb_get(v, w, h)
+        except Exception:
+            pass
+
+
+@app.route("/yt/thumb")
+def yt_thumb():
+    vid = _yt_id()
+    if not vid:
+        return Response("id khong hop le", 400)
+    w = _int_arg("w", 150, 32, 320)
+    h = _int_arg("h", 84, 18, 180)
+    data = _yt_thumb_get(vid, w, h)
+    if not data:
+        return Response("khong lay duoc anh", 502)
+    return Response(data, mimetype="image/jpeg", headers={"Cache-Control": "public, max-age=86400"})
 
 
 _yt_subs_cache = {}
@@ -4574,7 +4583,22 @@ OUT_H = 170
 BR_TOKEN = os.environ.get("BR_TOKEN", "")
 BR_SS = max(1, min(3, int(os.environ.get("BR_SS", "2"))))
 BR_JPEG_Q = int(os.environ.get("BR_JPEG_Q", "65"))
-MAX_JPEG = int(os.environ.get("BR_MAX_JPEG", "45000"))
+MAX_JPEG = int(os.environ.get("BR_MAX_JPEG", "56000"))
+BR_JPEG_Q_HI = int(os.environ.get("BR_JPEG_Q_HI", "82"))
+BR_JPEG_Q_SCROLL = int(os.environ.get("BR_JPEG_Q_SCROLL", "74"))
+BR_JPEG_444 = _env_bool("BR_JPEG_444", True)
+
+
+def _enc_jpeg(im, q0):
+    """JPEG baseline 4:4:4 (chu nao hon, het vo khoi mau), ha chat luong dan cho toi khi <= MAX_JPEG."""
+    kw = {"subsampling": 0} if BR_JPEG_444 else {}
+    q = max(30, min(95, q0))
+    while True:
+        buf = io.BytesIO()
+        im.save(buf, "JPEG", quality=q, **kw)
+        if buf.tell() <= MAX_JPEG or q <= 30:
+            return buf.getvalue()
+        q -= 8
 BR_IMAGES = os.environ.get("BR_IMAGES", "1") == "1"
 BR_MAX_IMG = int(os.environ.get("BR_MAX_IMG", "8"))
 BR_TIMEOUT = int(os.environ.get("BR_FETCH_TIMEOUT", "12"))
@@ -5364,14 +5388,7 @@ def _jpeg(page, scroll):
         bh = max(10, int(page.vh * page.vh / page.total))
         by = int(scroll / (page.total - page.vh) * (page.vh - bh))
         d.rectangle((page.vw - 2, by, page.vw - 1, by + bh), fill=(110, 110, 110))
-    q = BR_JPEG_Q
-    while True:
-        buf = io.BytesIO()
-        v.save(buf, "JPEG", quality=q)
-        if buf.tell() <= MAX_JPEG or q <= 25:
-            break
-        q -= 10
-    out = buf.getvalue()
+    out = _enc_jpeg(v, BR_JPEG_Q_HI)
     if len(_jpeg_cache) >= 16:
         _jpeg_cache.pop(next(iter(_jpeg_cache)))
     _jpeg_cache[key] = out
@@ -5751,26 +5768,18 @@ class _Chromium:
         except Exception:
             return None
 
-    def shot(self, portrait):
+    def shot(self, portrait, fast=False):
         W, VH = (OUT_H, OUT_W) if portrait else (OUT_W, OUT_H)
         pg = self.page
         try:
             pg.evaluate(_CR_SB_JS, BR_CR_ZOOM)
         except Exception:
             pass
-        raw = pg.screenshot(type="jpeg", quality=BR_JPEG_Q, caret="hide", animations="disabled")
-        if len(raw) <= MAX_JPEG and _jpeg_dims(raw) == (W, VH):
-            return raw
+        raw = pg.screenshot(type="png", caret="hide", animations="disabled")
         im = Image.open(io.BytesIO(raw)).convert("RGB")
         if im.size != (W, VH):
             im = im.resize((W, VH), Image.LANCZOS)
-        q = BR_JPEG_Q
-        while True:
-            buf = io.BytesIO()
-            im.save(buf, "JPEG", quality=q)
-            if buf.tell() <= MAX_JPEG or q <= 25:
-                return buf.getvalue()
-            q -= 10
+        return _enc_jpeg(im, BR_JPEG_Q_SCROLL if fast else BR_JPEG_Q_HI)
 
     def act(self, action, a, portrait, resume=""):
         self.last_used = time.monotonic()
@@ -5840,7 +5849,7 @@ class _Chromium:
                 except Exception:
                     self._halt()
                 self.settle()
-        jpg = self.shot(portrait)
+        jpg = self.shot(portrait, fast=(action == "scroll"))
         play, self.play = self.play, None
         return jpg, self.focus is not None and action in ("tap", "type"), play, self.cur_url()
 
