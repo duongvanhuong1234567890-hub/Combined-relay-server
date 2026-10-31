@@ -1900,7 +1900,7 @@ YTM_RESOLVE_TTL = _env_int("YTM_RESOLVE_TTL", 3600)
 YT_NOCOOKIE_MAX_FAILS = _env_int("YT_NOCOOKIE_MAX_FAILS", 2)
 YT_NOCOOKIE_COOLDOWN = _env_float("YT_NOCOOKIE_COOLDOWN", 1800)
 YT_FMT_LEAN = _env_bool("YT_FMT_LEAN", True)
-YT_LIGHT = _env_bool("YT_LIGHT", True)
+YT_LIGHT = _env_bool("YT_LIGHT", False)  # True = bo DASH -> de mat het dinh dang ("Requested format is not available")
 YT_FORCE_IPV4 = _env_bool("YT_FORCE_IPV4", False)
 YT_RACE_FIRST = _env_str("YT_RACE_FIRST", "mweb")
 YT_FIRST_BUDGET = _env_float("YT_FIRST_BUDGET", 25)
@@ -6666,7 +6666,7 @@ def _start_background_tasks():
         threading.Thread(target=_prewarm_browser, daemon=True).start()
     if os.environ.get("YT_WARMUP", "0") == "1" and HAS_VIDEO:
         threading.Thread(target=_warmup_once, daemon=True).start()
-    if os.environ.get("POT_SELFCHECK", "0") == "1":
+    if os.environ.get("POT_SELFCHECK", "1") == "1":
         threading.Thread(target=_pot_selfcheck, daemon=True).start()
     if RAM_WATCH:
         threading.Thread(target=_ram_watchdog, daemon=True).start()
