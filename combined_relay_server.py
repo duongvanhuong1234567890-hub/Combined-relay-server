@@ -1005,7 +1005,7 @@ COOKIES = CookieStore()
 
 YT_SUBPROC = _env_bool("YT_SUBPROC", True)
 YT_SUBPROC_TIMEOUT = _env_float("YT_SUBPROC_TIMEOUT", 150)
-YT_DENO_HEAP_MB = _env_int("YT_DENO_HEAP_MB", 128)
+YT_DENO_HEAP_MB = _env_int("YT_DENO_HEAP_MB", 256)  # 128 MB lam deno crash khi giai n-challenge (returncode -5, het heap)
 YT_SPAWN_RAM_MB = _env_float("YT_SPAWN_RAM_MB", 250)
 
 if HAS_YT:
