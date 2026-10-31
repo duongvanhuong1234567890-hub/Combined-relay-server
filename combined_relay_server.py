@@ -5560,12 +5560,12 @@ def _submit(fi, bname=None, bval=None):
 BR_ENGINE = os.environ.get("BR_ENGINE", "auto").strip().lower()
 BR_CR_ZOOM = max(1.0, min(3.0, float(os.environ.get("BR_CR_ZOOM", "1.25"))))
 BR_CR_TIMEOUT = float(os.environ.get("BR_CR_TIMEOUT", "15"))
-BR_CR_IDLE = float(os.environ.get("BR_CR_IDLE", "300"))
+BR_CR_IDLE = float(os.environ.get("BR_CR_IDLE", "90"))
 BR_CR_MIN_MB = float(os.environ.get("BR_CR_MIN_MB", "900"))
-BR_CR_MEM_MAX = float(os.environ.get("BR_CR_MEM_MAX", "0.90"))
+BR_CR_MEM_MAX = float(os.environ.get("BR_CR_MEM_MAX", "0.75"))
 BR_CR_RETRY = float(os.environ.get("BR_CR_RETRY", "120"))
-BR_CR_SOFT = float(os.environ.get("BR_CR_SOFT", "0.80"))
-BR_CR_RECYCLE = int(os.environ.get("BR_CR_RECYCLE", "30"))
+BR_CR_SOFT = float(os.environ.get("BR_CR_SOFT", "0.60"))
+BR_CR_RECYCLE = int(os.environ.get("BR_CR_RECYCLE", "10"))
 BR_CR_JS_MB = int(os.environ.get("BR_CR_JS_MB", "128"))
 BR_CR_SINGLE = os.environ.get("BR_CR_SINGLE", "0") == "1"
 BR_CR_KEEP = os.environ.get("BR_CR_KEEP", "1") == "1"
