@@ -4087,19 +4087,21 @@ _yt_trend_lock = threading.Lock()
 _YT_TREND_TTL = 900
 
 
-@app.route("/yt/trending")
-def yt_trending():
-    n = _int_arg("n", 6, 1, 12)
-    vi = (request.args.get("lang") or "vi").lower().startswith("vi")
-    key = "vi" if vi else "en"
-    now = time.time()
-    with _yt_trend_lock:
-        hit = _yt_trend_cache.get(key)
-    if hit and now - hit[0] < _YT_TREND_TTL and len(hit[1]) >= n:
-        return jsonify(hit[1][:n])
-    queries = ["video xu huong hom nay", "nhac moi hot"] if vi else ["trending videos today", "popular now"]
+_yt_trend_next = {}
+_yt_next_busy = set()
+_YT_TREND_QS = {
+    "vi": ["video xu huong hom nay", "nhac moi hot", "video hay nhat tuan nay", "phim ngan hot", "nhac tre moi nhat",
+           "review cong nghe moi", "hai huoc moi nhat", "du lich vlog moi"],
+    "en": ["trending videos today", "popular now", "viral videos this week", "new music videos", "tech reviews new",
+           "funny moments new", "travel vlog new", "short films popular"],
+}
+
+
+def _yt_trend_build(key, count=24):
+    qs = list(_YT_TREND_QS.get(key) or _YT_TREND_QS["vi"])
+    random.shuffle(qs)
     out, seen = [], set()
-    for q in queries:
+    for q in qs[:4]:
         try:
             res = VIDEO_SEARCH.search(q, 12) or []
         except Exception as e:
@@ -4110,8 +4112,32 @@ def yt_trending():
             if vid and vid not in seen and r.get("duration") != "LIVE":
                 seen.add(vid)
                 out.append(r)
-        if len(out) >= 12:
+        if len(out) >= count:
             break
+    random.shuffle(out)
+    return out[:count]
+
+
+@app.route("/yt/trending")
+def yt_trending():
+    n = _int_arg("n", 6, 1, 24)
+    vi = (request.args.get("lang") or "vi").lower().startswith("vi")
+    key = "vi" if vi else "en"
+    fresh = request.args.get("fresh") == "1"
+    now = time.time()
+    if fresh:
+        with _yt_trend_lock:
+            nx = _yt_trend_next.pop(key, None)
+        if nx:
+            with _yt_trend_lock:
+                _yt_trend_cache[key] = (now, nx)
+            threading.Thread(target=_yt_thumb_prefetch, args=([r["id"] for r in nx[:12]], 150, 70), daemon=True).start()
+            return jsonify(nx[:n])
+    with _yt_trend_lock:
+        hit = _yt_trend_cache.get(key)
+    if not fresh and hit and now - hit[0] < _YT_TREND_TTL and len(hit[1]) >= n:
+        return jsonify(hit[1][:n])
+    out = _yt_trend_build(key, 24)
     if out:
         with _yt_trend_lock:
             _yt_trend_cache[key] = (now, out)
@@ -4120,6 +4146,30 @@ def yt_trending():
     if hit:
         return jsonify(hit[1][:n])
     return jsonify([])
+
+
+def _yt_next_job(key):
+    try:
+        out = _yt_trend_build(key, 24)
+        if out:
+            with _yt_trend_lock:
+                _yt_trend_next[key] = out
+            _yt_thumb_prefetch([r["id"] for r in out[:12]], 150, 70)
+    finally:
+        with _yt_trend_lock:
+            _yt_next_busy.discard(key)
+
+
+@app.route("/yt/closed")
+def yt_closed():
+    vi = (request.args.get("lang") or "vi").lower().startswith("vi")
+    key = "vi" if vi else "en"
+    with _yt_trend_lock:
+        if key in _yt_next_busy:
+            return jsonify({"ok": True, "busy": True})
+        _yt_next_busy.add(key)
+    threading.Thread(target=_yt_next_job, args=(key,), daemon=True).start()
+    return jsonify({"ok": True})
 
 
 _yt_thumb_cache = {}
