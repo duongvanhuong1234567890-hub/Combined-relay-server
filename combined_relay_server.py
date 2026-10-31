@@ -1104,8 +1104,10 @@ def _ydl_info(url, opts, slim=False):
         print(f"[ydl] khong chay duoc tien trinh con ({e}) -> dung trong tien trinh chinh", flush=True)
         with yt_dlp.YoutubeDL(opts) as ydl:
             return ydl.extract_info(url, download=False)
+    _t_sub = time.monotonic()
     try:
         out, err = proc.communicate(payload, timeout=YT_SUBPROC_TIMEOUT)
+        print(f"[ydl] tien trinh con xong sau {time.monotonic() - _t_sub:.1f}s (rc={proc.returncode})", flush=True)
     except subprocess.TimeoutExpired:
         try:
             os.killpg(proc.pid, signal.SIGKILL)
@@ -2238,10 +2240,12 @@ class Resolver:
             raise ResolveError(f"server dang ban, cho qua {self.gate_wait:.0f}s")
         try:
             fmt = self._fmt(cap)
+            t_g = time.monotonic()
             with COOKIES.lease(True) as ck:
                 opts = self._opts(fmt, None, False, "", ck.path)
                 r = _extract_with(url, opts)
                 ck.keep = bool(ck.path)
+            print(f"[resolve:{self.name}] generic xong sau {time.monotonic() - t_g:.1f}s (client mac dinh, cookies={'co' if ck.path else 'khong'})", flush=True)
             return Streams(r[0], r[1], r[2], r[3], "", "generic")
         finally:
             self.gate.release()
