@@ -1024,9 +1024,26 @@ def _out(o):
     sys.stdout.write("\n@@YDL@@" + json.dumps(o, default=str) + "\n")
     sys.stdout.flush()
 _DROP = ("formats", "thumbnails", "storyboards", "heatmap", "chapters")
+_LOG = []
+class _L:
+    def _add(self, lvl, m):
+        if len(_LOG) < 60:
+            _LOG.append(lvl + ": " + str(m)[:300])
+    def debug(self, m):
+        s_ = str(m)
+        if any(k in s_.lower() for k in ("challenge", "pot", "sign in", "format", "player", "ejs")):
+            self._add("dbg", s_)
+    def info(self, m):
+        pass
+    def warning(self, m, *a, **k):
+        self._add("warn", m)
+    def error(self, m, *a, **k):
+        self._add("err", m)
 try:
     req = json.loads(sys.stdin.read())
     import yt_dlp
+    req["opts"]["logger"] = _L()
+    req["opts"]["verbose"] = True
     with yt_dlp.YoutubeDL(req["opts"]) as ydl:
         info = ydl.extract_info(req["url"], download=False)
         info = ydl.sanitize_info(info)
@@ -1044,7 +1061,7 @@ except BaseException as e:
     cls = type(e).__name__
     if ei and ei[0] is not None and getattr(ei[0], "__name__", "") == "GeoRestrictedError":
         cls = "GeoRestrictedError"
-    _out({"ok": False, "err": str(e), "cls": cls})
+    _out({"ok": False, "err": str(e), "cls": cls, "log": _LOG})
 """
 
 
@@ -1113,6 +1130,8 @@ def _ydl_info(url, opts, slim=False):
     except ValueError:
         raise RuntimeError("yt-dlp tra ket qua hong")
     if not res.get("ok"):
+        for _ln in (res.get("log") or []):
+            print(f"[ydl-log] {_ln}", flush=True)
         raise type(str(res.get("cls") or "YtDlpError"), (Exception,), {})(res.get("err") or "yt-dlp loi")
     return res.get("info")
 
@@ -2240,7 +2259,7 @@ class Resolver:
         return fmt
 
     def _opts(self, fmt, client, runtimes, px, cookiefile):
-        opts = {"quiet": True, "no_warnings": True, "format": fmt, "skip_download": True, "geo_bypass": True,
+        opts = {"quiet": True, "no_warnings": False, "format": fmt, "skip_download": True, "geo_bypass": True,
                 "socket_timeout": 10, "noplaylist": True, "retries": 1, "extractor_retries": 1}
         yt_args = {}
         if client:
