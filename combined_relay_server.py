@@ -6934,6 +6934,7 @@ _FB_UA = ("Mozilla/5.0 (Linux; U; Android 4.4.2; en-us; SM-G900F) AppleWebKit/53
           "(KHTML, like Gecko) Version/4.0 Mobile Safari/534.30")
 _FB_TTL = max(10, _env_int("FB_TTL", 45))
 _FB_COOKIE_FILE = "/tmp/fb_cookie.txt"
+_FB_SELF = _env_str("FB_SELF_NAME", "").strip().lower()
 _FB_IMG_HOSTS = ("fbcdn.net", "fbsbx.com", "facebook.com")
 _fb_lock = threading.Lock()
 _fb_cache = {}                      # kind|arg -> (ts, dict)
@@ -7434,17 +7435,174 @@ def _fb_next(pg):
     return ""
 
 
+# ---- tab Ban be: Loi moi (frq) / Goi y (fsg) / Ban be cua toi (fal) + nut Xac nhan / Xoa / Them ban ----
+_FB_FKINDS = ("friends", "frq", "fsg", "fal")
+_FB_ACT_PAT = (
+    ("ok", re.compile(r"^(xác nhận|xac nhan|confirm)$", re.I)),
+    ("no", re.compile(r"^(xóa|xoá|xóa yêu cầu|xoá yêu cầu|xóa lời mời|delete|delete request)$", re.I)),
+    ("add", re.compile(r"^(thêm bạn bè|thêm bạn|them ban be|add friend|add)$", re.I)),
+)
+_FB_NAV_BAD = ("friends/", "home.php", "notifications", "messages", "bookmarks", "settings", "logout", "search",
+               "help", "photo", "composer", "login", "/a/", "/policies", "/privacy", "/terms", "/cookies", "/r.php", "/menu")
+_FB_PERSON_HREF = re.compile(r"^(?:https?://[^/]*facebook\.com)?/(?:profile\.php\?id=\d+|[A-Za-z0-9.\-_]+)(?:[?&/].*)?$")
+_FB_EMPTY_RE = {
+    "frq": re.compile(r"(không có|chưa có|no)\s+(yêu cầu|lời mời|friend requests?|new requests?)|have no (new )?friend requests", re.I),
+    "fsg": re.compile(r"(không có|chưa có|no)\s+(gợi ý|suggestions?|people)", re.I),
+    "fal": re.compile(r"(không có|chưa có|no)\s+(bạn bè|friends)", re.I),
+}
+_fb_actok = collections.OrderedDict()   # id ngan cua link nut -> "ok" | "no" | "add" (chi cho phep chay nut da thay tren trang)
+
+
+def _fb_friend_rows(pg, mode, limit=30):
+    """Tach trang ban be mbasic thanh tung dong: ten, avatar, nut. mode: frq | fsg | fal."""
+    need = {"frq": "ok", "fsg": "add"}.get(mode)
+    rows, cur, lastimg, seen = [], None, "", set()
+
+    def flush():
+        nonlocal cur
+        if cur is not None and (not need or need in cur):
+            it = {"n": cur["n"], "f": cur["f"]}
+            if cur.get("a"):
+                it["a"] = cur["a"]
+            if mode == "frq":
+                if "ok" in cur:
+                    it["k1"] = cur["ok"]
+                if "no" in cur:
+                    it["k2"] = cur["no"]
+            elif mode == "fsg" and "add" in cur:
+                it["k1"] = cur["add"]
+            rows.append(it)
+        cur = None
+
+    pat = r'(?is)<img\b[^>]*?src="([^"]+)"[^>]*>|<a\b[^>]*?href="([^"]+)"[^>]*>(.*?)</a>'
+    for m in re.finditer(pat, pg or ""):
+        if m.group(1) is not None:
+            im = _fb_img(m.group(1))
+            if im:
+                lastimg = im
+            continue
+        href, inner = html.unescape(m.group(2)), m.group(3)
+        im = re.search(r'(?i)<img[^>]+src="([^"]+)"', inner)
+        if im and _fb_img(im.group(1)):
+            lastimg = _fb_img(im.group(1))
+        txt = _fb_txt(inner, 80).strip()
+        if not txt:
+            continue
+        act = next((a for a, rx in _FB_ACT_PAT if rx.match(txt)), "")
+        if act:
+            if cur is not None and act not in cur:
+                aid = _fb_id(href)
+                _fb_actok[aid] = act
+                while len(_fb_actok) > 2000:
+                    _fb_actok.popitem(last=False)
+                cur[act] = aid
+            continue
+        hl = href.lower()
+        if hl.startswith("#") or any(x in hl for x in _FB_NAV_BAD) or not _FB_PERSON_HREF.match(href):
+            continue
+        if len(txt) < 2 or len(txt) > 50:
+            continue
+        key = re.sub(r"[?&](?:fref|refid|ref|__tn__|eav|paipv|_rdr)=[^&]*", "", href)
+        if key in seen:
+            continue
+        flush()
+        if len(rows) >= limit:
+            break
+        seen.add(key)
+        cur = {"n": txt, "f": _fb_id(href), "a": lastimg}
+        lastimg = ""
+    flush()
+    return rows[:limit]
+
+
 def _fb_build(kind, arg):
     _fb_tl.pg = ""
     d, err = _fb_build0(kind, arg)
-    if d is not None and kind in ("feed", "friends", "watch", "market", "notif", "chats"):
+    if d is not None and kind in ("feed", "friends", "frq", "fsg", "fal", "watch", "market", "notif", "chats"):
         nx = _fb_next(getattr(_fb_tl, "pg", ""))
         if nx:
             d["nx"] = nx
     return d, err
 
 
+_FB_REELS_JS = """() => {
+  const ids = [];
+  const add = (h) => { const m = /\\/reel\\/(\\d{6,})/.exec(h || ''); if (m && ids.indexOf(m[1]) < 0) ids.push(m[1]); };
+  add(location.href);
+  document.querySelectorAll('a[href*="/reel/"]').forEach(a => add(a.getAttribute('href')));
+  return {ids: ids, url: location.href, title: document.title};
+}"""
+
+
+def _fb_reels_job(want, wait_s):
+    from playwright.sync_api import sync_playwright
+    ck = _fb_cookie()
+    if not ck:
+        return {"err": "chua co cookie"}
+    args = ["--disable-gpu", "--disable-dev-shm-usage", "--disable-extensions", "--mute-audio",
+            "--no-first-run", "--renderer-process-limit=1", "--disk-cache-size=1",
+            "--js-flags=--max-old-space-size=192"]
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        args += ["--no-sandbox", "--no-zygote"]
+    pw = sync_playwright().start()
+    try:
+        br = pw.chromium.launch(headless=True, args=args)
+        ctx = br.new_context(user_agent=_FB_MUA, viewport={"width": 412, "height": 915},
+                             locale="vi-VN", service_workers="block")
+        ctx.set_default_timeout(25000)
+        ctx.add_cookies(_fb_cookie_list(ck))
+        ctx.route("**/*", lambda r: r.abort() if r.request.resource_type in ("image", "media", "font") else r.continue_())
+        pg = ctx.new_page()
+        pg.goto("https://m.facebook.com/reel/", wait_until="domcontentloaded")
+        ids = []
+        end = time.monotonic() + wait_s
+        while time.monotonic() < end and len(ids) < want:
+            time.sleep(1.5)
+            try:
+                res = pg.evaluate(_FB_REELS_JS)
+            except Exception:
+                break
+            for i in (res.get("ids") or []):
+                if i not in ids:
+                    ids.append(i)
+            try:
+                pg.keyboard.press("ArrowDown")
+            except Exception:
+                pass
+        return {"ids": ids[:want]}
+    finally:
+        try:
+            pw.stop()
+        except Exception:
+            pass
+        gc.collect()
+
+
+def _fb_reels_list():
+    """Tra ve (items, err): danh sach Reels lay bang Chromium + cookie cua chu may."""
+    if _mem_frac() > 0.9:
+        return None, "thieu RAM"
+    if _cr is not None:
+        _cr_close_async(resume=True)
+    try:
+        res = _fb_pool.submit(_fb_reels_job, 8, 22).result(timeout=80)
+    except Exception as e:
+        return None, "chromium: " + type(e).__name__ + " " + str(e)[:120]
+    if res.get("err"):
+        return None, res["err"]
+    ids = res.get("ids") or []
+    if not ids:
+        return None, "khong lay duoc reel (cookie het han hoac Facebook doi giao dien)"
+    return [{"n": "Video %d" % (i + 1), "t": "", "w": "", "c": "https://www.facebook.com/reel/" + rid}
+            for i, rid in enumerate(ids)], ""
+
+
 def _fb_build0(kind, arg):
+    if kind == "reels":
+        items, err = _fb_reels_list()
+        if err:
+            return None, err
+        return {"p": items}, ""
     if kind == "feed" and _FB_BROWSER:
         items, err = _fb_browser_feed()
         if err:
@@ -7460,22 +7618,21 @@ def _fb_build0(kind, arg):
         if err:
             return None, err
         return {"p": _fb_articles(pg, 30)}, ""
-    if kind == "friends":
-        pg, err = _fb_get(_fb_path("/friends/center/requests/", arg))
+    if kind in _FB_FKINDS:
+        mode = "frq" if kind == "friends" else kind
+        default = {"frq": "/friends/center/requests/", "fsg": "/friends/center/suggestions/",
+                   "fal": "/friends/center/friends/"}[mode]
+        pg, err = _fb_get(_fb_path(default, arg))
         if err:
             return None, err
-        items = []
-        for href, txt, im in _fb_anchors(pg, r"/(?:profile\.php\?id=\d+|[A-Za-z0-9.\-_]+)(?:\?[^\"]*)?", 60):
-            if any(x in href for x in ("friends/", "home.php", "notifications", "messages", "bookmarks", "settings", "logout", "search", "help", "photo", "composer", "login")):
-                continue
-            if len(txt) < 2 or len(txt) > 50:
-                continue
-            it = {"n": txt, "f": _fb_id(href)}
-            if im:
-                it["a"] = im
-            items.append(it)
-            if len(items) >= 30:
-                break
+        items = _fb_friend_rows(pg, mode, 30)
+        if not items and mode == "fal" and not arg:       # du phong: trang ban be cua chinh chu may
+            pg2, err2 = _fb_get("/me/friends")
+            if not err2:
+                pg = pg2
+                items = _fb_friend_rows(pg, mode, 30)
+        if not items and _FB_EMPTY_RE[mode].search(_fb_txt(pg)):
+            return {"p": [], "empty": 1}, ""              # rong that su, khong phai Facebook doi giao dien
         return {"p": items}, ""
     if kind == "watch":
         pg, err = _fb_get(_fb_path("/watch/", arg))
@@ -7536,7 +7693,16 @@ def _fb_build0(kind, arg):
             tail = re.split(r'(?is)<a\b[^>]*href="/messages/read/', tail)[0]
             w = re.search(r"(?is)<abbr[^>]*>(.*?)</abbr>", tail)
             snip = _fb_txt(re.sub(r"(?is)<abbr.*?</abbr>", " ", tail), 100)
-            items.append({"n": name, "t": snip, "w": _fb_txt(w.group(1), 20) if w else "", "c": _fb_id(href)})
+            it = {"n": name, "t": snip, "w": _fb_txt(w.group(1), 20) if w else "", "c": _fb_id(href)}
+            im = re.search(r'(?i)<img[^>]+src="([^"]+)"', m.group(2)) or re.search(r'(?i)<img[^>]+src="([^"]+)"', tail)
+            av = _fb_img(im.group(1)) if im else ""
+            if av:
+                it["a"] = av
+            if re.search(r"(?i)đang hoạt động|active now", tail):
+                it["o"] = 1
+            if re.search(r"(?i)chưa đọc|unread|tin nhắn mới|new message", tail):
+                it["u"] = 1
+            items.append(it)
             if len(items) >= 30:
                 break
         if not items:
@@ -7544,7 +7710,7 @@ def _fb_build0(kind, arg):
             if "mã hóa đầu cuối" in low or "end-to-end" in low or "pin" in low:
                 return None, "chat ma hoa dau cuoi khong doc duoc qua relay"
             return None, "khong thay danh sach chat (Facebook bo trang tin nhan cu?)"
-        return {"p": items}, ""
+        return {"p": items, "ub": sum(1 for x in items if x.get("u"))}, ""
     if kind == "chat":
         path = _fb_ids.get(arg or "")
         if not path:
@@ -7557,7 +7723,11 @@ def _fb_build0(kind, arg):
             n, t = _fb_txt(m.group(1), 40), _fb_txt(m.group(2), 220)
             w = re.search(r"(?is)<abbr[^>]*>(.*?)</abbr>", m.group(3))
             if n and t and len(t) < 400:
-                items.append({"n": n, "t": t, "w": _fb_txt(w.group(1), 20) if w else ""})
+                it = {"n": n, "t": t, "w": _fb_txt(w.group(1), 20) if w else ""}
+                nl = n.strip().lower()
+                if nl in ("bạn", "you", "me", "tôi") or (_FB_SELF and nl == _FB_SELF):
+                    it["m"] = 1
+                items.append(it)
             if len(items) >= 30:
                 break
         items.reverse()   # tin moi nhat len dau
@@ -7612,7 +7782,7 @@ def _fb_note_bad(why):
 def fb_route(kind):
     if kind == "img":
         return _fb_image()
-    if kind not in ("feed", "friends", "watch", "market", "notif", "comments", "profile", "chats", "chat"):
+    if kind not in ("feed", "friends", "frq", "fsg", "fal", "watch", "reels", "market", "notif", "comments", "profile", "chats", "chat"):
         return jsonify({"ok": 0, "e": "kieu la"}), 404
     arg = (request.args.get("id") or "")[:16]
     key = kind + "|" + arg
@@ -7629,7 +7799,7 @@ def fb_route(kind):
         data, err = _fb_build(kind, arg)
     except Exception as e:
         data, err = None, "loi doc trang: " + type(e).__name__
-    if data is not None and (data.get("p") or kind == "profile"):
+    if data is not None and (data.get("p") or kind == "profile" or data.get("empty")):
         _fb_state["bad"] = ""
         with _fb_lock:
             if len(_fb_cache) >= 40:
@@ -7644,6 +7814,44 @@ def fb_route(kind):
         d = dict(hit[1]); d.update(ok=1, stale=1, age=int(now - hit[0]), why=err)
         return jsonify(d)
     return jsonify({"ok": 0, "stale": 1, "why": err, "p": []})
+
+
+@app.route("/fb/fract")
+def fb_friend_act():
+    """Xac nhan / Xoa loi moi / Them ban. Chi chay link nut da thay tren trang ban be (khong nhan URL tu ngoai)."""
+    act = request.args.get("a", "")
+    aid = (request.args.get("id") or "")[:16]
+    if act not in ("ok", "no", "add") or _fb_actok.get(aid) != act:
+        return jsonify({"ok": 0, "e": "het han, hay tai lai danh sach"})
+    path = _fb_ids.get(aid, "")
+    if not path:
+        return jsonify({"ok": 0, "e": "het han, hay tai lai danh sach"})
+    pg, err = _fb_get(path)
+    if err:
+        return jsonify({"ok": 0, "e": err})
+    if re.search(r"(?i)something went wrong|đã xảy ra lỗi|rất tiếc, đã có lỗi|sorry, something", _fb_txt(pg)[:600]):
+        return jsonify({"ok": 0, "e": "Facebook tu choi"})
+    with _fb_lock:
+        for k in [k for k in _fb_cache if k.split("|", 1)[0] in _FB_FKINDS]:
+            _fb_cache.pop(k, None)
+    return jsonify({"ok": 1})
+
+
+@app.route("/fb/warm")
+def fb_warm():
+    u = (request.args.get("u") or "")[:300]
+    if not re.match(r"^https://(www|m)\.facebook\.com/reel/\d{6,}/?$", u):
+        return jsonify({"ok": 0}), 400
+
+    def _w():
+        try:
+            if _mem_frac() > 0.8:
+                return
+            VIDEO.resolve(u, _warm_height(), background=True)
+        except Exception as e:
+            print(f"[fbwarm] loi {str(e)[:120]}", flush=True)
+    threading.Thread(target=_w, daemon=True).start()
+    return jsonify({"ok": 1})
 
 
 def _fb_image():
