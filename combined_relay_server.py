@@ -515,7 +515,7 @@ def _reqbusy_done(exc):
         _reqbusy_add(-1)
 
 
-_TOKEN_GATED = ("/stream", "/search", "/tr", "/gs", "/ytm", "/app", "/yt/")
+_TOKEN_GATED = ("/stream", "/search", "/tr", "/gs", "/ytm", "/app", "/yt/", "/fb/")
 _BR_GATED = ("/br", "/cookies")
 
 
@@ -4529,6 +4529,128 @@ def ytm_cover():
     return Response(data, mimetype="image/jpeg", headers={"Cache-Control": "public, max-age=86400"})
 
 
+_ytm_bg_cache = {}
+
+
+def _ytm_fetch_src(vid):
+    for name in ("mqdefault", "hqdefault", "default"):
+        try:
+            rq = urllib.request.Request(f"https://i.ytimg.com/vi/{vid}/{name}.jpg", headers={"User-Agent": UA})
+            with urllib.request.urlopen(rq, timeout=8) as r:
+                src = r.read(600_000)
+            if src:
+                return src
+        except Exception as e:
+            print(f"[ytm] nen {name} loi: {type(e).__name__}", flush=True)
+    return None
+
+
+def _ytm_bg_get(vid, w, h):
+    """Nen mo kieu Apple Music: anh bia phong to (cat day khung w x h), lam mo manh, toi di."""
+    key = (vid, w, h)
+    with _ytm_cover_lock:
+        data = _ytm_bg_cache.get(key)
+    if data:
+        return data
+    with _ytm_cover_gen_lock:
+        with _ytm_cover_lock:
+            data = _ytm_bg_cache.get(key)
+        if data:
+            return data
+        src = _ytm_fetch_src(vid)
+        if not src:
+            return None
+        data = b""
+        try:
+            from PIL import Image, ImageEnhance, ImageFilter
+            im = Image.open(io.BytesIO(src))
+            im.draft("RGB", (w, h))
+            im = im.convert("RGB")
+            s = max(w / im.width, h / im.height)
+            nw, nh = max(w, int(round(im.width * s))), max(h, int(round(im.height * s)))
+            im = im.resize((nw, nh), Image.BILINEAR)
+            l, t = (nw - w) // 2, (nh - h) // 2
+            im = im.crop((l, t, l + w, t + h))
+            im = im.filter(ImageFilter.GaussianBlur(max(6, w // 22)))
+            im = ImageEnhance.Color(im).enhance(1.25)
+            im = ImageEnhance.Brightness(im).enhance(0.50)
+            buf = io.BytesIO()
+            im.save(buf, "JPEG", quality=55)
+            data = buf.getvalue()
+        except Exception:
+            data = b""
+        if not data:
+            try:
+                vf = (f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},"
+                      f"boxblur={max(6, w // 22)}:2,eq=brightness=-0.18:saturation=1.2")
+                pr = subprocess.run(_nice_prefix() + ["ffmpeg", "-nostdin", "-v", "error", "-i", "pipe:0", "-vf", vf,
+                                                      "-frames:v", "1", "-q:v", "9", "-f", "mjpeg", "pipe:1"],
+                                    input=src, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=40)
+                data = pr.stdout
+            except Exception as e:
+                print(f"[ytm] loi lam mo nen: {type(e).__name__}", flush=True)
+        if not data:
+            return None
+        with _ytm_cover_lock:
+            if len(_ytm_bg_cache) > 40:
+                for k in list(_ytm_bg_cache)[:20]:
+                    _ytm_bg_cache.pop(k, None)
+            _ytm_bg_cache[key] = data
+        return data
+
+
+@app.route("/ytm_bg")
+def ytm_bg():
+    vid = request.args.get("id", "").strip()
+    if not _YTM_ID_ONLY.match(vid):
+        return Response("id khong hop le", 400)
+    try:
+        w = max(64, min(480, int(request.args.get("w", 320))))
+        h = max(32, min(320, int(request.args.get("h", 170))))
+    except ValueError:
+        w, h = 320, 170
+    data = _ytm_bg_get(vid, w, h)
+    if not data:
+        return Response("khong tao duoc nen", 502)
+    return Response(data, mimetype="image/jpeg", headers={"Cache-Control": "public, max-age=86400"})
+
+
+_ytm_suggest_cache = {}
+_ytm_suggest_lock = threading.Lock()
+
+
+@app.route("/ytm_suggest")
+def ytm_suggest():
+    """Goi y tim kiem cho trang chu YT Music: tra ve mang chuoi, vd ["son tung", "son tung mtp", ...]."""
+    q = request.args.get("q", "").strip()[:80]
+    try:
+        n = max(1, min(10, int(request.args.get("n", 6))))
+    except ValueError:
+        n = 6
+    if not q:
+        return jsonify([])
+    key = q.lower()
+    with _ytm_suggest_lock:
+        hit = _ytm_suggest_cache.get(key)
+    if hit is None:
+        hit = []
+        try:
+            u = ("https://suggestqueries.google.com/complete/search?client=firefox&ds=yt&hl="
+                 + urllib.parse.quote(YT_API_LANG or "en") + "&q=" + urllib.parse.quote(q))
+            rq = urllib.request.Request(u, headers={"User-Agent": UA})
+            with urllib.request.urlopen(rq, timeout=5) as r:
+                arr = json.loads(r.read(60_000).decode("utf-8", "replace"))
+            if isinstance(arr, list) and len(arr) > 1 and isinstance(arr[1], list):
+                hit = [str(x)[:80] for x in arr[1] if isinstance(x, str)][:10]
+        except Exception as e:
+            print(f"[ytm] goi y loi: {type(e).__name__}", flush=True)
+        with _ytm_suggest_lock:
+            if len(_ytm_suggest_cache) > 200:
+                _ytm_suggest_cache.clear()
+            _ytm_suggest_cache[key] = hit
+    return jsonify(hit[:n])
+
+
 @app.route("/ytm")
 def ytm_info():
     url = _normalize_input_url(request.args.get("url", ""))
@@ -4548,6 +4670,108 @@ def ytm_info():
     audio_url = f"{base}/ytm_audio?url={urllib.parse.quote(url, safe='')}{_tk_q()}"
     return jsonify(success=True, title=_ytm_title(url, vid or url), audio_url=audio_url,
                    cover_url=(f"{base}/ytm_cover?id={vid}{_tk_q()}" if vid else ""))
+
+
+_ytm_lyrics_cache = {}
+_ytm_lyrics_lock = threading.Lock()
+_LRC_LINE = re.compile(r"^\[(\d{1,2}):(\d{2})(?:[.:](\d{1,3}))?\]\s*(.*)$")
+
+
+def _lyrics_clean_title(t):
+    t = re.sub(r"[\(\[\{][^\)\]\}]*[\)\]\}]", " ", t or "")
+    t = re.sub(r"(?i)\b(official|music video|lyrics?|lyric video|audio|mv|hd|4k|visualizer)\b", " ", t)
+    t = re.sub(r"\s+", " ", t).strip(" -|")
+    return t
+
+
+def _lyrics_http_json(url):
+    rq = urllib.request.Request(url, headers={"User-Agent": "TDisplayRelay/1.0 (lyrics)"})
+    with urllib.request.urlopen(rq, timeout=8) as r:
+        return json.loads(r.read(400_000).decode("utf-8", "replace"))
+
+
+def _lyrics_pick(item):
+    if not isinstance(item, dict):
+        return None
+    synced = item.get("syncedLyrics") or ""
+    plain = item.get("plainLyrics") or ""
+    lines = []
+    if synced:
+        for raw in synced.splitlines():
+            m = _LRC_LINE.match(raw.strip())
+            if not m:
+                continue
+            frac = (m.group(3) or "0").ljust(3, "0")[:3]
+            ms = (int(m.group(1)) * 60 + int(m.group(2))) * 1000 + int(frac)
+            txt = m.group(4).strip()
+            lines.append({"t": ms, "s": txt[:120]})
+        if lines:
+            return {"synced": True, "lines": lines[:300]}
+    if plain:
+        for raw in plain.splitlines():
+            lines.append({"t": -1, "s": raw.strip()[:120]})
+        if lines:
+            return {"synced": False, "lines": lines[:300]}
+    return None
+
+
+def _lyrics_lookup(title, artist, dur):
+    t = _lyrics_clean_title(title)
+    a = re.sub(r"(?i)\s*-\s*topic$|vevo$", "", (artist or "").strip()).strip()
+    if not t:
+        return None
+    q = urllib.parse.urlencode({k: v for k, v in (("track_name", t), ("artist_name", a),
+                                                   ("duration", dur if dur > 0 else "")) if v != ""})
+    try:
+        got = _lyrics_pick(_lyrics_http_json("https://lrclib.net/api/get?" + q))
+        if got:
+            return got
+    except Exception as e:
+        print(f"[ytm] lyrics get loi: {type(e).__name__}", flush=True)
+    try:
+        arr = _lyrics_http_json("https://lrclib.net/api/search?" + urllib.parse.urlencode({"q": (t + " " + a).strip()}))
+        if isinstance(arr, list):
+            best = None
+            for it in arr[:10]:
+                got = _lyrics_pick(it)
+                if not got:
+                    continue
+                if got["synced"]:
+                    d = it.get("duration") or 0
+                    if dur <= 0 or not d or abs(d - dur) <= 8:
+                        return got
+                if best is None:
+                    best = got
+            return best
+    except Exception as e:
+        print(f"[ytm] lyrics search loi: {type(e).__name__}", flush=True)
+    return None
+
+
+@app.route("/ytm_lyrics")
+def ytm_lyrics():
+    title = request.args.get("title", "").strip()[:200]
+    artist = request.args.get("artist", "").strip()[:120]
+    try:
+        dur = max(0, min(3600, int(request.args.get("dur", 0))))
+    except ValueError:
+        dur = 0
+    if not title:
+        return jsonify(success=False, message="thieu title"), 400
+    key = (title.lower(), artist.lower(), dur // 3)
+    with _ytm_lyrics_lock:
+        hit = _ytm_lyrics_cache.get(key)
+    if hit is None:
+        got = _lyrics_lookup(title, artist, dur)
+        hit = got if got else {}
+        with _ytm_lyrics_lock:
+            if len(_ytm_lyrics_cache) > 120:
+                for k in list(_ytm_lyrics_cache)[:50]:
+                    _ytm_lyrics_cache.pop(k, None)
+            _ytm_lyrics_cache[key] = hit
+    if not hit:
+        return jsonify(success=False, message="khong co loi")
+    return jsonify(success=True, synced=hit["synced"], lines=hit["lines"])
 
 
 @app.route("/ytm_audio")
@@ -4658,8 +4882,8 @@ BR_TOKEN = os.environ.get("BR_TOKEN", "")
 BR_SS = max(1, min(3, int(os.environ.get("BR_SS", "2"))))
 BR_JPEG_Q = int(os.environ.get("BR_JPEG_Q", "65"))
 MAX_JPEG = int(os.environ.get("BR_MAX_JPEG", "56000"))
-BR_JPEG_Q_HI = int(os.environ.get("BR_JPEG_Q_HI", "82"))
-BR_JPEG_Q_SCROLL = int(os.environ.get("BR_JPEG_Q_SCROLL", "74"))
+BR_JPEG_Q_HI = int(os.environ.get("BR_JPEG_Q_HI", "72"))
+BR_JPEG_Q_SCROLL = int(os.environ.get("BR_JPEG_Q_SCROLL", "60"))
 BR_JPEG_444 = _env_bool("BR_JPEG_444", True)
 
 
@@ -5558,8 +5782,8 @@ def _submit(fi, bname=None, bval=None):
     return _S.goto(urllib.parse.urlunparse(p._replace(query=urllib.parse.urlencode(q), fragment="")))
 
 BR_ENGINE = os.environ.get("BR_ENGINE", "auto").strip().lower()
-BR_CR_ZOOM = max(1.0, min(3.0, float(os.environ.get("BR_CR_ZOOM", "1.25"))))
-BR_CR_TIMEOUT = float(os.environ.get("BR_CR_TIMEOUT", "15"))
+BR_CR_ZOOM = max(1.0, min(3.0, float(os.environ.get("BR_CR_ZOOM", "1.0"))))
+BR_CR_TIMEOUT = float(os.environ.get("BR_CR_TIMEOUT", "25"))
 BR_CR_IDLE = float(os.environ.get("BR_CR_IDLE", "90"))
 BR_CR_MIN_MB = float(os.environ.get("BR_CR_MIN_MB", "900"))
 BR_CR_MEM_MAX = float(os.environ.get("BR_CR_MEM_MAX", "0.75"))
@@ -5571,18 +5795,20 @@ BR_CR_SINGLE = os.environ.get("BR_CR_SINGLE", "0") == "1"
 BR_CR_KEEP = os.environ.get("BR_CR_KEEP", "1") == "1"
 BR_CR_STREAM_FRAC = float(os.environ.get("BR_CR_STREAM_FRAC", "0.60"))
 BR_CR_STRICT_DNS = os.environ.get("BR_CR_STRICT_DNS", "0") == "1"
-BR_CR_LOAD_MS = int(float(os.environ.get("BR_CR_LOAD_WAIT", "1.2")) * 1000)
-BR_CR_NETIDLE_MS = int(float(os.environ.get("BR_CR_IDLE_WAIT", "0.25")) * 1000)
-BR_CR_TAP_WAIT_MS = int(os.environ.get("BR_CR_TAP_WAIT_MS", "120"))
-BR_CR_SCROLL_WAIT_MS = int(os.environ.get("BR_CR_SCROLL_WAIT_MS", "30"))
+BR_CR_LOAD_MS = int(float(os.environ.get("BR_CR_LOAD_WAIT", "0.6")) * 1000)
+BR_CR_NETIDLE_MS = int(float(os.environ.get("BR_CR_IDLE_WAIT", "0.1")) * 1000)
+BR_CR_TAP_WAIT_MS = int(os.environ.get("BR_CR_TAP_WAIT_MS", "60"))
+BR_CR_SCROLL_WAIT_MS = int(os.environ.get("BR_CR_SCROLL_WAIT_MS", "15"))
 _CR_BLOCK_TYPES = ("media", "font", "websocket", "eventsource", "manifest", "texttrack", "ping", "prefetch",
-                   "cspviolationreport")
+                   "cspviolationreport", "beacon", "other")
 _CR_BLOCK_HOSTS = ("doubleclick.net", "googlesyndication.com", "googleadservices.com", "google-analytics.com",
                    "googletagmanager.com", "adservice.google.", "adnxs.com", "taboola.com", "outbrain.com",
                    "scorecardresearch.com", "hotjar.com", "connect.facebook.net", "amazon-adsystem.com",
                    "criteo.", "moatads.com", "quantserve.com", "clarity.ms", "adsrvr.org", "pubmatic.com",
                    "rubiconproject.com", "casalemedia.com", "googletagservices.com", "pagead2.", "adform.net",
-                   "mc.yandex.", "ads-twitter.com", "snap.licdn.com", "analytics.tiktok.com")
+                   "mc.yandex.", "ads-twitter.com", "snap.licdn.com", "analytics.tiktok.com",
+                   "graph.facebook.com/logging", "pixel.facebook.com", "www.facebook.com/tr", "b.scorecardresearch.",
+                   "static.xx.fbcdn.net/rsrc.php/v3/y", "google.com/ccm", "gstatic.com/ads", "imasdk.googleapis.com")
 
 _CR_INIT_JS = """(()=>{
 window.open=function(u){if(u){try{location.href=u}catch(e){}}return null;};
@@ -5849,7 +6075,7 @@ class _Chromium:
             pg.evaluate(_CR_SB_JS, BR_CR_ZOOM)
         except Exception:
             pass
-        raw = pg.screenshot(type="png", caret="hide", animations="disabled")
+        raw = pg.screenshot(type="png", caret="hide", animations="disabled", scale="css", timeout=8000)
         im = Image.open(io.BytesIO(raw)).convert("RGB")
         if im.size != (W, VH):
             im = im.resize((W, VH), Image.LANCZOS)
@@ -6697,6 +6923,505 @@ def _start_background_tasks():
           f"proxies={len(PROXIES.items)} relay_url={RELAY_URL or '-'}", flush=True)
     if HAS_YT:
         print(f"[update] yt-dlp hien tai: {_ytdlp_version()} | auto_update={AUTO_UPDATE} kiem tra khi dang dung, toi da moi {UPDATE_HOURS}h", flush=True)
+
+
+# ===== /fb/*: app Facebook cho LilyGo (doc trang mbasic bang cookie cua CHINH chu may) =====
+# Cookie khong bao gio gui xuong thiet bi. Nap bang: POST /fb/cookie?k=BR_TOKEN (body = header Cookie
+# "c_user=...; xs=...; datr=...") hoac bien moi truong FB_COOKIE. Khi Facebook chan / cookie het han:
+# tra ban luu lan cuoi kem "stale":1 de man hinh van hien noi dung cu + dai canh bao.
+_FB_HOST = "https://mbasic.facebook.com"
+_FB_UA = ("Mozilla/5.0 (Linux; U; Android 4.4.2; en-us; SM-G900F) AppleWebKit/534.30 "
+          "(KHTML, like Gecko) Version/4.0 Mobile Safari/534.30")
+_FB_TTL = max(10, _env_int("FB_TTL", 45))
+_FB_COOKIE_FILE = "/tmp/fb_cookie.txt"
+_FB_IMG_HOSTS = ("fbcdn.net", "fbsbx.com", "facebook.com")
+_fb_lock = threading.Lock()
+_fb_cache = {}                      # kind|arg -> (ts, dict)
+_fb_ids = collections.OrderedDict()  # id ngan -> duong dan tuong doi (bai viet / trang ca nhan)
+_fb_state = {"bad": "", "bad_ts": 0.0}
+_fb_tl = threading.local()
+
+
+def _fb_cookie():
+    try:
+        with open(_FB_COOKIE_FILE, "r", encoding="utf-8") as fh:
+            c = fh.read().strip()
+            if c:
+                return c
+    except Exception:
+        pass
+    return _env_str("FB_COOKIE")
+
+
+def _fb_txt(s, mx=0):
+    s = re.sub(r"(?is)<(script|style)\b.*?</\1>", " ", s or "")
+    s = re.sub(r"(?i)<br\s*/?>|</p>|</div>", " ", s)
+    s = re.sub(r"<[^>]+>", " ", s)
+    s = " ".join(html.unescape(s).replace("\xa0", " ").split())
+    return _gs_clean(s, mx) if mx else s
+
+
+def _fb_id(path):
+    key = format(zlib.crc32(path.encode("utf-8")) & 0xFFFFFFFF, "08x")
+    with _fb_lock:
+        _fb_ids[key] = path
+        _fb_ids.move_to_end(key)
+        while len(_fb_ids) > 2000:
+            _fb_ids.popitem(last=False)
+    return key
+
+
+def _fb_img(u):
+    u = html.unescape(u or "")
+    if not u.startswith("http"):
+        return ""
+    host = (urllib.parse.urlparse(u).hostname or "").lower()
+    if not host.endswith(_FB_IMG_HOSTS):
+        return ""
+    if any(x in u for x in ("/emoji", "static.xx", "rsrc.php", "/images/icons")):
+        return ""
+    return "/fb/img?u=" + urllib.parse.quote(u, safe="")
+
+
+def _fb_get(path):
+    """Tra ve (html, ly_do_loi). ly_do_loi rong = thanh cong."""
+    ck = _fb_cookie()
+    if "c_user=" not in ck or "xs=" not in ck:
+        return "", "chua co cookie"
+    url = path if path.startswith("http") else _FB_HOST + path
+    if not (urllib.parse.urlparse(url).hostname or "").endswith("facebook.com"):
+        return "", "url la"
+    req = urllib.request.Request(url, headers={"User-Agent": _FB_UA, "Cookie": ck,
+                                               "Accept-Language": "vi-VN,vi;q=0.9,en;q=0.5",
+                                               "Accept-Encoding": "identity"})
+    try:
+        with urllib.request.urlopen(req, timeout=12) as r:
+            final = r.geturl()
+            body = r.read(2_500_000).decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return "", f"http {e.code}"
+    except Exception as e:
+        return "", f"mang: {type(e).__name__}"
+    _fb_tl.pg = body
+    low = body[:60000].lower()
+    if "/login" in final or "/checkpoint" in final or 'id="login_form"' in low or 'name="login"' in low:
+        return "", "cookie het han hoac bi chan"
+    return body, ""
+
+
+def _fb_articles(page, limit):
+    out = []
+    for ch in re.split(r'(?i)<div[^>]+role="article"', page)[1:]:
+        ch = ch[:14000]
+        m = re.search(r"(?is)<h3[^>]*>(.*?)</h3>", ch)
+        name = _fb_txt(m.group(1), 60) if m else ""
+        if not name:
+            m = re.search(r"(?is)<strong[^>]*>(.*?)</strong>", ch)
+            name = _fb_txt(m.group(1), 60) if m else ""
+        if not name:
+            continue
+        pf = ""
+        if m:
+            h = re.search(r'href="(/[^"#]+)"', ch[:m.end() + 400])
+            pf = html.unescape(h.group(1)) if h else ""
+        paras = [_fb_txt(p) for p in re.findall(r"(?is)<p[^>]*>(.*?)</p>", ch)]
+        body = " ".join(p for p in paras if p)
+        if not body:
+            d = re.search(r'(?is)<div[^>]+data-ft[^>]*>(.*?)</div>', ch)
+            body = _fb_txt(d.group(1)) if d else ""
+        w = re.search(r"(?is)<abbr[^>]*>(.*?)</abbr>", ch)
+        imgs = [x for x in (_fb_img(u) for u in re.findall(r'(?i)<img[^>]+src="([^"]+)"', ch)) if x]
+        av, ph = "", ""
+        if len(imgs) >= 2:
+            av, ph = imgs[0], imgs[-1]
+        elif imgs:
+            av = imgs[0]
+        cm = re.search(r'href="(/(?:story\.php|[^"]*?/posts/|[^"]*?comment)[^"]*)"', ch)
+        it = {"n": name, "t": _gs_clean(body, 240), "w": _fb_txt(w.group(1), 24) if w else ""}
+        if av:
+            it["a"] = av
+        if ph:
+            it["i"] = ph
+        if cm:
+            it["c"] = _fb_id(html.unescape(cm.group(1)))
+        if pf:
+            it["f"] = _fb_id(pf)
+        if it["t"] or ph:
+            out.append(it)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _fb_anchors(page, href_pat, limit):
+    out, seen = [], set()
+    for m in re.finditer(r'(?is)<a\b[^>]*href="(' + href_pat + r')"[^>]*>(.*?)</a>', page):
+        href, inner = html.unescape(m.group(1)), m.group(2)
+        txt = _fb_txt(inner, 110)
+        if not txt or href in seen:
+            continue
+        seen.add(href)
+        im = re.search(r'(?i)<img[^>]+src="([^"]+)"', inner)
+        out.append((href, txt, _fb_img(im.group(1)) if im else ""))
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _fb_path(default, arg):
+    return _fb_ids.get(arg or "") or default
+
+
+def _fb_next(pg):
+    """Tim lien ket 'Xem them' (mbasic) de tai tiep khong gioi han; tra ve id ngan."""
+    for m in re.finditer(r'(?is)<a\b[^>]*href="([^"]+)"[^>]*>(.*?)</a>', pg or ""):
+        t = _fb_txt(m.group(2), 40).lower()
+        h = html.unescape(m.group(1))
+        if re.search(r"xem th[êe]m|see more|more stories|th[êe]m th[ôo]ng b[áa]o|earlier notifications|older|tin nhắn cũ|tin nhắn trước", t) and not h.startswith("#") \
+                and ("cursor" in h or "stories.php" in h or "notifications" in h or "more" in h or "page" in h or "friends" in h or "watch" in h or "marketplace" in h):
+            return _fb_id(h)
+    return ""
+
+
+def _fb_build(kind, arg):
+    _fb_tl.pg = ""
+    d, err = _fb_build0(kind, arg)
+    if d is not None and kind in ("feed", "friends", "watch", "market", "notif", "chats"):
+        nx = _fb_next(getattr(_fb_tl, "pg", ""))
+        if nx:
+            d["nx"] = nx
+    return d, err
+
+
+def _fb_build0(kind, arg):
+    if kind == "feed":
+        pg, err = _fb_get(_fb_path("/home.php", arg))
+        if err:
+            return None, err
+        return {"p": _fb_articles(pg, 30)}, ""
+    if kind == "friends":
+        pg, err = _fb_get(_fb_path("/friends/center/requests/", arg))
+        if err:
+            return None, err
+        items = []
+        for href, txt, im in _fb_anchors(pg, r"/(?:profile\.php\?id=\d+|[A-Za-z0-9.\-_]+)(?:\?[^\"]*)?", 60):
+            if any(x in href for x in ("friends/", "home.php", "notifications", "messages", "bookmarks", "settings", "logout", "search", "help", "photo", "composer", "login")):
+                continue
+            if len(txt) < 2 or len(txt) > 50:
+                continue
+            it = {"n": txt, "f": _fb_id(href)}
+            if im:
+                it["a"] = im
+            items.append(it)
+            if len(items) >= 30:
+                break
+        return {"p": items}, ""
+    if kind == "watch":
+        pg, err = _fb_get(_fb_path("/watch/", arg))
+        if err:
+            return None, err
+        items = []
+        for href, txt, im in _fb_anchors(pg, r"/(?:watch|video_redirect|video\.php|reel)[^\"]*", 40):
+            if len(txt) < 4:
+                continue
+            it = {"n": txt, "t": "", "w": ""}
+            if im:
+                it["i"] = im
+            items.append(it)
+            if len(items) >= 20:
+                break
+        return {"p": items}, ""
+    if kind == "market":
+        pg, err = _fb_get(_fb_path("/marketplace/", arg))
+        if err:
+            return None, err
+        items = []
+        for href, txt, im in _fb_anchors(pg, r"/marketplace/item/[^\"]*", 40):
+            pr = re.search(r"(\d[\d.,]*\s?(?:đ|₫|VND|vnd|k|tr)|\$\s?\d[\d.,]*)", txt)
+            title = txt.replace(pr.group(1), "").strip(" -·") if pr else txt
+            it = {"n": _gs_clean(title, 60), "t": pr.group(1) if pr else ""}
+            if im:
+                it["i"] = im
+            items.append(it)
+            if len(items) >= 20:
+                break
+        return {"p": items}, ""
+    if kind == "notif":
+        pg, err = _fb_get(_fb_path("/notifications.php", arg))
+        if err:
+            return None, err
+        items = []
+        for href, txt, im in _fb_anchors(pg, r"/a/notifications\.php[^\"]*|/notifications/[^\"]*|/[^\"]*redir=[^\"]*", 40):
+            tm = re.search(r"(\d+\s?(?:giờ|phút|ngày|tuần|h|m|d|w)\b[^\"]{0,12}|Hôm qua|Yesterday)\s*$", txt)
+            it = {"n": _gs_clean(txt, 110), "w": tm.group(1)[:20] if tm else ""}
+            if im:
+                it["a"] = im
+            items.append(it)
+            if len(items) >= 30:
+                break
+        return {"p": items}, ""
+    if kind == "chats":
+        pg, err = _fb_get(_fb_path("/messages/", arg))
+        if err:
+            return None, err
+        items, seen = [], set()
+        for m in re.finditer(r'(?is)<a\b[^>]*href="(/messages/read/[^"]*)"[^>]*>(.*?)</a>(?=(.{0,700}))', pg):
+            href = html.unescape(m.group(1))
+            name = _fb_txt(m.group(2), 50)
+            if not name or href in seen:
+                continue
+            seen.add(href)
+            tail = m.group(3)
+            tail = re.split(r'(?is)<a\b[^>]*href="/messages/read/', tail)[0]
+            w = re.search(r"(?is)<abbr[^>]*>(.*?)</abbr>", tail)
+            snip = _fb_txt(re.sub(r"(?is)<abbr.*?</abbr>", " ", tail), 100)
+            items.append({"n": name, "t": snip, "w": _fb_txt(w.group(1), 20) if w else "", "c": _fb_id(href)})
+            if len(items) >= 30:
+                break
+        if not items:
+            low = pg.lower()
+            if "mã hóa đầu cuối" in low or "end-to-end" in low or "pin" in low:
+                return None, "chat ma hoa dau cuoi khong doc duoc qua relay"
+            return None, "khong thay danh sach chat (Facebook bo trang tin nhan cu?)"
+        return {"p": items}, ""
+    if kind == "chat":
+        path = _fb_ids.get(arg or "")
+        if not path:
+            return None, "id het han"
+        pg, err = _fb_get(path)
+        if err:
+            return None, err
+        items = []
+        for m in re.finditer(r"(?is)<(?:strong|h3|h4)[^>]*>(.*?)</(?:strong|h3|h4)>\s*<(?:div|span|p)[^>]*>(.*?)</(?:div|span|p)>(?=(.{0,300}))", pg):
+            n, t = _fb_txt(m.group(1), 40), _fb_txt(m.group(2), 220)
+            w = re.search(r"(?is)<abbr[^>]*>(.*?)</abbr>", m.group(3))
+            if n and t and len(t) < 400:
+                items.append({"n": n, "t": t, "w": _fb_txt(w.group(1), 20) if w else ""})
+            if len(items) >= 30:
+                break
+        items.reverse()   # tin moi nhat len dau
+        return {"p": items}, ""
+    if kind == "comments":
+        path = _fb_ids.get(arg or "")
+        if not path:
+            return None, "id het han"
+        pg, err = _fb_get(path)
+        if err:
+            return None, err
+        items = []
+        for m in re.finditer(r"(?is)<h3[^>]*>(.*?)</h3>\s*<div[^>]*>(.*?)</div>", pg):
+            n, t = _fb_txt(m.group(1), 50), _fb_txt(m.group(2), 200)
+            if n and t:
+                items.append({"n": n, "t": t})
+            if len(items) >= 9:
+                break
+        return {"p": items[1:] if len(items) > 1 else items}, ""
+    if kind == "profile":
+        path = _fb_ids.get(arg or "")
+        if not path:
+            return None, "id het han"
+        pg, err = _fb_get(path)
+        if err:
+            return None, err
+        tm = re.search(r"(?is)<title[^>]*>(.*?)</title>", pg)
+        mu = re.search(r"(\d[\d.,]*)\s*(?:bạn chung|mutual friends?)", pg, re.I)
+        loc = re.search(r"(?:Sống tại|Lives in)\s*<[^>]*>([^<]{2,40})<", pg)
+        ims = [x for x in (_fb_img(u) for u in re.findall(r'(?i)<img[^>]+src="([^"]+)"', pg)) if x]
+        d = {"n": _fb_txt(tm.group(1), 60) if tm else "", "mu": mu.group(1) if mu else "",
+             "l": _fb_txt(loc.group(1), 40) if loc else "", "p": _fb_articles(pg, 3)}
+        if ims:
+            d["a"] = ims[0]
+        return d, ""
+    return None, "kieu la"
+
+
+def _fb_note_bad(why):
+    _fb_state["bad"], _fb_state["bad_ts"] = why, time.time()
+
+
+@app.route("/fb/<kind>")
+def fb_route(kind):
+    if kind == "img":
+        return _fb_image()
+    if kind not in ("feed", "friends", "watch", "market", "notif", "comments", "profile", "chats", "chat"):
+        return jsonify({"ok": 0, "e": "kieu la"}), 404
+    arg = (request.args.get("id") or "")[:16]
+    key = kind + "|" + arg
+    now = time.time()
+    with _fb_lock:
+        hit = _fb_cache.get(key)
+    if hit and now - hit[0] < _FB_TTL and request.args.get("fresh") != "1":
+        d = dict(hit[1]); d.update(ok=1, stale=0, age=int(now - hit[0]))
+        return jsonify(d)
+    if _fb_state["bad"] and now - _fb_state["bad_ts"] < 90 and hit:
+        d = dict(hit[1]); d.update(ok=1, stale=1, age=int(now - hit[0]), why=_fb_state["bad"])
+        return jsonify(d)
+    try:
+        data, err = _fb_build(kind, arg)
+    except Exception as e:
+        data, err = None, "loi doc trang: " + type(e).__name__
+    if data is not None and (data.get("p") or kind == "profile"):
+        _fb_state["bad"] = ""
+        with _fb_lock:
+            if len(_fb_cache) >= 40:
+                _fb_cache.pop(next(iter(_fb_cache)), None)
+            _fb_cache[key] = (now, data)
+        d = dict(data); d.update(ok=1, stale=0, age=0)
+        return jsonify(d)
+    if data is not None and not err:
+        err = "trang rong (Facebook doi giao dien?)"
+    _fb_note_bad(err)
+    if hit:
+        d = dict(hit[1]); d.update(ok=1, stale=1, age=int(now - hit[0]), why=err)
+        return jsonify(d)
+    return jsonify({"ok": 0, "stale": 1, "why": err, "p": []})
+
+
+def _fb_image():
+    u = request.args.get("u", "")
+    host = (urllib.parse.urlparse(u).hostname or "").lower()
+    if not u.startswith("https://") or not host.endswith(_FB_IMG_HOSTS):
+        return Response("url khong hop le", 400)
+    if not _PIL_OK:
+        return Response("thieu Pillow", 503)
+    w = _int_arg("w", 140, 16, 320)
+    h = _int_arg("h", 40, 16, 170)
+    ck = ("img", u, w, h)
+    with _fb_lock:
+        hit = _fb_cache.get(ck)
+    if hit:
+        return Response(hit[1], mimetype="image/jpeg", headers={"Cache-Control": "public, max-age=86400"})
+    try:
+        req = urllib.request.Request(u, headers={"User-Agent": _FB_UA})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            src = r.read(4_000_000)
+        im = Image.open(io.BytesIO(src)).convert("RGB")
+        sw, sh = im.size
+        s = max(w / sw, h / sh)
+        nw, nh = max(w, int(sw * s + .5)), max(h, int(sh * s + .5))
+        im = im.resize((nw, nh), Image.BILINEAR)
+        l, t = (nw - w) // 2, (nh - h) // 2
+        im = im.crop((l, t, l + w, t + h))
+        buf = io.BytesIO()
+        im.save(buf, "JPEG", quality=62, progressive=False)  # TJpgDec khong doc duoc progressive
+        data = buf.getvalue()
+    except Exception:
+        return Response("khong lay duoc anh", 502)
+    with _fb_lock:
+        if len(_fb_cache) >= 120:
+            _fb_cache.pop(next(iter(_fb_cache)), None)
+        _fb_cache[ck] = (time.time(), data)
+    return Response(data, mimetype="image/jpeg", headers={"Cache-Control": "public, max-age=86400"})
+
+
+def _fb_post(url, fields):
+    """POST form len Facebook bang cookie cua chu may. Tra ve (html, ly_do_loi)."""
+    ck = _fb_cookie()
+    if "c_user=" not in ck or "xs=" not in ck:
+        return "", "chua co cookie"
+    full = url if url.startswith("http") else _FB_HOST + url
+    if not (urllib.parse.urlparse(full).hostname or "").endswith("facebook.com"):
+        return "", "url la"
+    data = urllib.parse.urlencode(fields).encode("utf-8")
+    req = urllib.request.Request(full, data=data, headers={
+        "User-Agent": _FB_UA, "Cookie": ck, "Accept-Language": "vi-VN,vi;q=0.9,en;q=0.5",
+        "Accept-Encoding": "identity", "Content-Type": "application/x-www-form-urlencoded",
+        "Referer": _FB_HOST + "/messages/"})
+    try:
+        with urllib.request.urlopen(req, timeout=12) as r:
+            final = r.geturl()
+            body = r.read(600_000).decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return "", f"http {e.code}"
+    except Exception as e:
+        return "", f"mang: {type(e).__name__}"
+    if "/login" in final or "/checkpoint" in final:
+        return "", "cookie het han hoac bi chan"
+    return body, ""
+
+
+def _fb_send_text(path, text):
+    """Mo trang chat, tim form soan tin (o name=body), dien noi dung roi gui. Tra ve '' neu thanh cong."""
+    pg, err = _fb_get(path)
+    if err:
+        return err
+    for fm in re.finditer(r"(?is)<form\b([^>]*)>(.*?)</form>", pg):
+        attrs, inner = fm.group(1), fm.group(2)
+        if not re.search(r'(?i)\bname="body"', inner):
+            continue
+        act = re.search(r'(?i)\baction="([^"]+)"', attrs)
+        if not act:
+            continue
+        fields, send_name = {}, "send"
+        for im in re.finditer(r"(?is)<input\b[^>]*>", inner):
+            tag = im.group(0)
+            nm = re.search(r'(?i)\bname="([^"]*)"', tag)
+            if not nm:
+                continue
+            ty = re.search(r'(?i)\btype="([^"]*)"', tag)
+            typ = ty.group(1).lower() if ty else "text"
+            vm = re.search(r'(?i)\bvalue="([^"]*)"', tag)
+            val = html.unescape(vm.group(1)) if vm else ""
+            if typ == "hidden":
+                fields[nm.group(1)] = val
+            elif typ == "submit" and "send" in nm.group(1).lower():
+                send_name = nm.group(1)
+                fields[send_name] = val or "Send"
+        fields["body"] = text
+        fields.setdefault(send_name, "Send")
+        _, err = _fb_post(html.unescape(act.group(1)), fields)
+        return err
+    return "khong thay khung soan tin (Facebook doi giao dien hoac chat ma hoa dau cuoi)"
+
+
+_fb_send_ts = [0.0]
+
+
+@app.route("/fb/send")
+def fb_send():
+    cid = (request.args.get("id") or "")[:16]
+    text = " ".join((request.args.get("t") or "").split())[:500]
+    path = _fb_ids.get(cid)
+    if not path:
+        return jsonify({"ok": 0, "e": "id het han, mo lai cuoc chat"})
+    if not text:
+        return jsonify({"ok": 0, "e": "tin nhan rong"})
+    now = time.time()
+    with _fb_lock:
+        if now - _fb_send_ts[0] < 1.5:
+            return jsonify({"ok": 0, "e": "gui qua nhanh"})
+        _fb_send_ts[0] = now
+    try:
+        err = _fb_send_text(path, text)
+    except Exception as e:
+        err = "loi gui: " + type(e).__name__
+    if err:
+        return jsonify({"ok": 0, "e": err})
+    with _fb_lock:
+        _fb_cache.pop("chat|" + cid, None)
+    return jsonify({"ok": 1})
+
+
+@app.route("/fb/cookie", methods=["GET", "POST"])
+def fb_cookie():
+    if not _tok_ok(request.args.get("k", ""), BR_TOKEN):
+        return "forbidden - them ?k=BR_TOKEN vao URL", 403
+    if request.method == "GET":
+        ck = _fb_cookie()
+        return f"fb cookie: {'co' if 'c_user=' in ck and 'xs=' in ck else 'chua co'}; loi gan nhat: {_fb_state['bad'] or 'khong'}", 200
+    txt = request.get_data(cache=False)[:8000].decode("utf-8", "replace").strip()
+    if "\t" in txt:  # cookies.txt (Netscape) -> header Cookie
+        pairs = [ln.split("\t") for ln in txt.splitlines() if ln and not ln.startswith("#") and "facebook.com" in ln]
+        txt = "; ".join(f"{p[5]}={p[6]}" for p in pairs if len(p) >= 7)
+    if "c_user=" not in txt or "xs=" not in txt:
+        return "thieu c_user hoac xs", 400
+    with open(_FB_COOKIE_FILE, "w", encoding="utf-8") as fh:
+        fh.write(txt)
+    os.chmod(_FB_COOKIE_FILE, 0o600)
+    _fb_state["bad"] = ""
+    with _fb_lock:
+        _fb_cache.clear()
+    return "da luu cookie Facebook", 200
 
 
 if __name__ == "__main__":
