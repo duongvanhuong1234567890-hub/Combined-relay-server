@@ -7078,9 +7078,17 @@ def _fb_ago(ts):
     return f"{d // 86400} ngay"
 
 
-def _fb_collect(o, acc, depth=0):
-    """Lay ten tac gia, noi dung, thoi gian dau tien trong 1 cum story."""
-    if depth > 40 or (acc.get("n") and acc.get("t") and acc.get("w")):
+_FB_AV_KEYS = ("profile_picture", "profilePicture", "profile_pic", "actor_photo", "icon_image", "profile_picture_depth_0")
+
+
+def _fb_uri_ok(u):
+    return (isinstance(u, str) and u.startswith("https://") and ("fbcdn" in u or "scontent" in u)
+            and not any(x in u for x in ("/emoji", "static.xx", "rsrc.php", "/images/icons")))
+
+
+def _fb_collect(o, acc, depth=0, pk=""):
+    """Lay ten tac gia, noi dung, thoi gian, anh dai dien va anh bai dang trong 1 cum story."""
+    if depth > 45:
         return
     if isinstance(o, dict):
         a = o.get("actors")
@@ -7092,23 +7100,35 @@ def _fb_collect(o, acc, depth=0):
         ct = o.get("creation_time")
         if not acc.get("w") and isinstance(ct, int) and ct > 1_000_000_000:
             acc["w"] = _fb_ago(ct)
-        for v in o.values():
+        u = o.get("uri")
+        if _fb_uri_ok(u):
+            if pk in _FB_AV_KEYS:
+                if not acc.get("a"):
+                    acc["a"] = u
+            else:
+                try:
+                    area = int(o.get("width") or 0) * int(o.get("height") or 0)
+                except Exception:
+                    area = 0
+                if not acc.get("i") or area > acc.get("ia", 0):
+                    acc["i"], acc["ia"] = u, area
+        for k, v in o.items():
             if isinstance(v, (dict, list)):
-                _fb_collect(v, acc, depth + 1)
+                _fb_collect(v, acc, depth + 1, k)
     elif isinstance(o, list):
         for v in o:
             if isinstance(v, (dict, list)):
-                _fb_collect(v, acc, depth + 1)
+                _fb_collect(v, acc, depth + 1, pk)
 
 
 def _fb_walk(o, out, depth=0):
-    if depth > 60 or len(out) >= 40:
+    if depth > 60 or len(out) >= 60:
         return
     if isinstance(o, dict):
         if "comet_sections" in o and isinstance(o.get("comet_sections"), dict):
             acc = {}
             _fb_collect(o, acc)
-            if acc.get("n") and acc.get("t"):
+            if acc.get("n") and (acc.get("t") or acc.get("i")):
                 out.append(acc)
             return  # khong di sau vao cum da xu ly
         for v in o.values():
@@ -7125,25 +7145,50 @@ def _fb_json_feed(body, limit=30):
     found = []
     for m in re.finditer(r'(?is)<script[^>]*type="application/json"[^>]*>(.*?)</script>', body or ""):
         txt = m.group(1)
-        if '"message"' not in txt and '"comet_sections"' not in txt:
+        if '"message"' not in txt and '"comet_sections"' not in txt and '"uri"' not in txt:
             continue
         try:
             j = json.loads(txt)
         except Exception:
             continue
         _fb_walk(j, found)
-        if len(found) >= limit:
+        if len(found) >= limit * 2:
             break
     out, seen = [], set()
     for a in found:
-        key = (a["n"], a["t"][:40])
+        key = (a["n"], (a.get("t") or "")[:40], (a.get("i") or "")[-24:])
         if key in seen:
             continue
         seen.add(key)
-        out.append({"n": _gs_clean(a["n"], 60), "t": _gs_clean(a["t"], 240), "w": a.get("w", "")})
+        it = {"n": _gs_clean(a["n"], 60), "t": _gs_clean(a.get("t", ""), 240), "w": a.get("w", "")}
+        av, ph = _fb_img(a.get("a", "")), _fb_img(a.get("i", ""))
+        if av:
+            it["a"] = av
+        if ph:
+            it["i"] = ph
+        out.append(it)
         if len(out) >= limit:
             break
     return out
+
+
+def _fb_feed_pages(limit=30):
+    """Trang chu + 'Gan day nhat' (khac thu tu) de co nhieu bai hon; trang 2 chi tai khi con thieu."""
+    items, err = [], ""
+    for i, path in enumerate(("/", "/?sk=h_chr")):
+        if i and len(items) >= 8:
+            break
+        pg, e = _fb_get_www(path)
+        if e:
+            err = err or e
+            continue
+        seen = {(x["n"], x["t"][:40], x.get("i", "")[-24:]) for x in items}
+        for it in _fb_json_feed(pg, limit):
+            if (it["n"], it["t"][:40], it.get("i", "")[-24:]) not in seen:
+                items.append(it)
+        if len(items) >= limit:
+            break
+    return items[:limit], ("" if items else (err or "trang rong"))
 
 
 def _fb_get(path):
@@ -7358,10 +7403,10 @@ def _fb_build0(kind, arg):
             return None, err
         return {"p": items}, ""
     if kind == "feed" and not _FB_BROWSER:
-        pg, err = _fb_get_www("/")
+        items, err = _fb_feed_pages()
         if err:
             return None, err
-        return {"p": _fb_json_feed(pg)}, ""
+        return {"p": items}, ""
     if kind == "feed":
         pg, err = _fb_get(_fb_path("/home.php", arg))
         if err:
@@ -7590,13 +7635,12 @@ def fb_debug():
     if not ck:
         return "chua co cookie", 200
     if request.args.get("feed") == "1":
-        pg, err = _fb_get_www("/")
+        items, err = _fb_feed_pages()
         if err:
             return "loi: " + err, 200
-        items = _fb_json_feed(pg)
-        lines = [f"len: {len(pg)} | bai doc duoc: {len(items)}"]
-        for it in items[:8]:
-            lines.append(f"- {it['n']} ({it['w']}): {it['t'][:100]}")
+        lines = [f"bai doc duoc: {len(items)} | co anh bai: {sum(1 for x in items if x.get('i'))} | co avatar: {sum(1 for x in items if x.get('a'))}"]
+        for it in items[:12]:
+            lines.append(f"- {it['n']} ({it['w']}) a={int('a' in it)} i={int('i' in it)}: {it['t'][:80]}")
         return Response("\n".join(lines), mimetype="text/plain; charset=utf-8")
     if request.args.get("b") == "1":
         r = _fb_browser(request.args.get("p", "/"))
