@@ -7362,8 +7362,15 @@ def fb_debug():
     path = request.args.get("p", "/home.php")
     if not path.startswith("/"):
         path = "/" + path
+    ua = _FB_UA
+    if request.args.get("ua") == "new":
+        ua = ("Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/124.0.0.0 Mobile Safari/537.36")
+    elif request.args.get("ua") == "pc":
+        ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/124.0.0.0 Safari/537.36")
     req = urllib.request.Request("https://" + host + path, headers={
-        "User-Agent": _FB_UA, "Cookie": ck, "Accept-Language": "vi-VN,vi;q=0.9,en;q=0.5",
+        "User-Agent": ua, "Cookie": ck, "Accept-Language": "vi-VN,vi;q=0.9,en;q=0.5",
         "Accept-Encoding": "identity"})
     try:
         with urllib.request.urlopen(req, timeout=15) as r:
@@ -7379,6 +7386,9 @@ def fb_debug():
            f"title: {_fb_txt(m.group(1))[:100] if m else ''}",
            f"role=article: {len(re.findall('role=.article.', body))}",
            f"login_form: {'login_form' in body.lower()}",
+           f"<article: {body.count('<article')} | story_message: {body.count('story_message')} | "
+           f"message: {body.count('message')}",
+           f"khong ho tro: {'khong duoc ho tro' in _fb_txt(body).lower() or 'không được hỗ trợ' in _fb_txt(body).lower()}",
            f"text: {txt}"]
     return Response("\n".join(out), mimetype="text/plain; charset=utf-8")
 
