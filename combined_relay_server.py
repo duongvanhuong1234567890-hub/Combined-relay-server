@@ -7100,6 +7100,13 @@ def _fb_collect(o, acc, depth=0, pk=""):
         ct = o.get("creation_time")
         if not acc.get("w") and isinstance(ct, int) and ct > 1_000_000_000:
             acc["w"] = _fb_ago(ct)
+        if not acc.get("u"):
+            for uk in ("wwwURL", "permalink_url", "url"):
+                pu = o.get(uk)
+                if isinstance(pu, str) and "facebook.com/" in pu and re.search(
+                        r"/(posts|permalink|videos|reel|photo|watch)\b|story_fbid|/permalink\.php|fbid=", pu):
+                    acc["u"] = pu.split("facebook.com", 1)[1]
+                    break
         u = o.get("uri")
         if _fb_uri_ok(u):
             if pk in _FB_AV_KEYS:
@@ -7166,7 +7173,48 @@ def _fb_json_feed(body, limit=30):
             it["a"] = av
         if ph:
             it["i"] = ph
+        if a.get("u"):
+            it["c"] = _fb_id(html.unescape(a["u"]))
         out.append(it)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _fb_walk_comments(o, out, depth=0):
+    if depth > 60 or len(out) >= 12:
+        return
+    if isinstance(o, dict):
+        au, bd = o.get("author"), o.get("body")
+        if isinstance(au, dict) and au.get("name") and isinstance(bd, dict) and isinstance(bd.get("text"), str) \
+                and bd["text"].strip():
+            out.append({"n": _gs_clean(str(au["name"]), 50), "t": _gs_clean(bd["text"], 200)})
+        for v in o.values():
+            if isinstance(v, (dict, list)):
+                _fb_walk_comments(v, out, depth + 1)
+    elif isinstance(o, list):
+        for v in o:
+            if isinstance(v, (dict, list)):
+                _fb_walk_comments(v, out, depth + 1)
+
+
+def _fb_json_comments(body, limit=9):
+    found = []
+    for m in re.finditer(r'(?is)<script[^>]*type="application/json"[^>]*>(.*?)</script>', body or ""):
+        txt = m.group(1)
+        if '"body"' not in txt or '"author"' not in txt:
+            continue
+        try:
+            j = json.loads(txt)
+        except Exception:
+            continue
+        _fb_walk_comments(j, found)
+    out, seen = [], set()
+    for c in found:
+        k = (c["n"], c["t"][:40])
+        if k not in seen:
+            seen.add(k)
+            out.append(c)
         if len(out) >= limit:
             break
     return out
@@ -7175,8 +7223,8 @@ def _fb_json_feed(body, limit=30):
 def _fb_feed_pages(limit=30):
     """Trang chu + 'Gan day nhat' (khac thu tu) de co nhieu bai hon; trang 2 chi tai khi con thieu."""
     items, err = [], ""
-    for i, path in enumerate(("/", "/?sk=h_chr")):
-        if i and len(items) >= 8:
+    for i, path in enumerate(("/", "/?sk=h_chr", "/groups/feed/")):
+        if i and len(items) >= 12:
             break
         pg, e = _fb_get_www(path)
         if e:
@@ -7514,6 +7562,14 @@ def _fb_build0(kind, arg):
                 break
         items.reverse()   # tin moi nhat len dau
         return {"p": items}, ""
+    if kind == "comments" and not _FB_BROWSER:
+        path = _fb_ids.get(arg or "")
+        if not path:
+            return None, "id het han"
+        pg, err = _fb_get_www(path)
+        if err:
+            return None, err
+        return {"p": _fb_json_comments(pg)}, ""
     if kind == "comments":
         path = _fb_ids.get(arg or "")
         if not path:
@@ -7640,7 +7696,19 @@ def fb_debug():
             return "loi: " + err, 200
         lines = [f"bai doc duoc: {len(items)} | co anh bai: {sum(1 for x in items if x.get('i'))} | co avatar: {sum(1 for x in items if x.get('a'))}"]
         for it in items[:12]:
-            lines.append(f"- {it['n']} ({it['w']}) a={int('a' in it)} i={int('i' in it)}: {it['t'][:80]}")
+            lines.append(f"- {it['n']} ({it['w']}) a={int('a' in it)} i={int('i' in it)} c={int('c' in it)}: {it['t'][:60]}")
+        first = next((x for x in items if x.get("c")), None)
+        if first:
+            cp, ce = _fb_get_www(_fb_ids.get(first["c"], "/"))
+            cm = [] if ce else _fb_json_comments(cp)
+            lines.append(f"binh luan bai dau co link: {len(cm)} (loi: {ce or 'khong'})")
+            for c in cm[:3]:
+                lines.append(f"  * {c['n']}: {c['t'][:60]}")
+        pg0, e0 = _fb_get_www("/")
+        if not e0:
+            lines.append("scan: end_cursor=%d has_next_page=%d NewsFeedPagination=%d fb_dtsg=%d comment_list=%d top_level_comments=%d" % (
+                pg0.count("end_cursor"), pg0.count("has_next_page"), pg0.count("NewsFeedPagination"),
+                pg0.count("DTSGInitialData"), pg0.count("comment_list_renderer"), pg0.count("top_level_comments")))
         return Response("\n".join(lines), mimetype="text/plain; charset=utf-8")
     if request.args.get("b") == "1":
         r = _fb_browser(request.args.get("p", "/"))
