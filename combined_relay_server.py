@@ -6943,14 +6943,25 @@ _fb_tl = threading.local()
 
 
 def _fb_cookie():
+    """Lay cookie hop le dau tien: file /tmp truoc, roi bien FB_COOKIE. Bo qua gia tri thieu c_user/xs."""
+    cands = []
     try:
         with open(_FB_COOKIE_FILE, "r", encoding="utf-8") as fh:
-            c = fh.read().strip()
-            if c:
-                return c
+            cands.append(fh.read())
     except Exception:
         pass
-    return _env_str("FB_COOKIE")
+    for p in ("/etc/secrets/FB_COOKIE", "/etc/secrets/fb_cookie.txt"):
+        try:
+            with open(p, "r", encoding="utf-8") as fh:
+                cands.append(fh.read())
+        except Exception:
+            pass
+    cands.append(_env_str("FB_COOKIE"))
+    for c in cands:
+        c = (c or "").strip().strip('"').strip("'").replace("\r", "").replace("\n", "; ").strip()
+        if "c_user=" in c and "xs=" in c:
+            return c
+    return ""
 
 
 def _fb_txt(s, mx=0):
@@ -7312,94 +7323,6 @@ def _fb_image():
             _fb_cache.pop(next(iter(_fb_cache)), None)
         _fb_cache[ck] = (time.time(), data)
     return Response(data, mimetype="image/jpeg", headers={"Cache-Control": "public, max-age=86400"})
-
-
-def _fb_post(url, fields):
-    """POST form len Facebook bang cookie cua chu may. Tra ve (html, ly_do_loi)."""
-    ck = _fb_cookie()
-    if "c_user=" not in ck or "xs=" not in ck:
-        return "", "chua co cookie"
-    full = url if url.startswith("http") else _FB_HOST + url
-    if not (urllib.parse.urlparse(full).hostname or "").endswith("facebook.com"):
-        return "", "url la"
-    data = urllib.parse.urlencode(fields).encode("utf-8")
-    req = urllib.request.Request(full, data=data, headers={
-        "User-Agent": _FB_UA, "Cookie": ck, "Accept-Language": "vi-VN,vi;q=0.9,en;q=0.5",
-        "Accept-Encoding": "identity", "Content-Type": "application/x-www-form-urlencoded",
-        "Referer": _FB_HOST + "/messages/"})
-    try:
-        with urllib.request.urlopen(req, timeout=12) as r:
-            final = r.geturl()
-            body = r.read(600_000).decode("utf-8", "replace")
-    except urllib.error.HTTPError as e:
-        return "", f"http {e.code}"
-    except Exception as e:
-        return "", f"mang: {type(e).__name__}"
-    if "/login" in final or "/checkpoint" in final:
-        return "", "cookie het han hoac bi chan"
-    return body, ""
-
-
-def _fb_send_text(path, text):
-    """Mo trang chat, tim form soan tin (o name=body), dien noi dung roi gui. Tra ve '' neu thanh cong."""
-    pg, err = _fb_get(path)
-    if err:
-        return err
-    for fm in re.finditer(r"(?is)<form\b([^>]*)>(.*?)</form>", pg):
-        attrs, inner = fm.group(1), fm.group(2)
-        if not re.search(r'(?i)\bname="body"', inner):
-            continue
-        act = re.search(r'(?i)\baction="([^"]+)"', attrs)
-        if not act:
-            continue
-        fields, send_name = {}, "send"
-        for im in re.finditer(r"(?is)<input\b[^>]*>", inner):
-            tag = im.group(0)
-            nm = re.search(r'(?i)\bname="([^"]*)"', tag)
-            if not nm:
-                continue
-            ty = re.search(r'(?i)\btype="([^"]*)"', tag)
-            typ = ty.group(1).lower() if ty else "text"
-            vm = re.search(r'(?i)\bvalue="([^"]*)"', tag)
-            val = html.unescape(vm.group(1)) if vm else ""
-            if typ == "hidden":
-                fields[nm.group(1)] = val
-            elif typ == "submit" and "send" in nm.group(1).lower():
-                send_name = nm.group(1)
-                fields[send_name] = val or "Send"
-        fields["body"] = text
-        fields.setdefault(send_name, "Send")
-        _, err = _fb_post(html.unescape(act.group(1)), fields)
-        return err
-    return "khong thay khung soan tin (Facebook doi giao dien hoac chat ma hoa dau cuoi)"
-
-
-_fb_send_ts = [0.0]
-
-
-@app.route("/fb/send")
-def fb_send():
-    cid = (request.args.get("id") or "")[:16]
-    text = " ".join((request.args.get("t") or "").split())[:500]
-    path = _fb_ids.get(cid)
-    if not path:
-        return jsonify({"ok": 0, "e": "id het han, mo lai cuoc chat"})
-    if not text:
-        return jsonify({"ok": 0, "e": "tin nhan rong"})
-    now = time.time()
-    with _fb_lock:
-        if now - _fb_send_ts[0] < 1.5:
-            return jsonify({"ok": 0, "e": "gui qua nhanh"})
-        _fb_send_ts[0] = now
-    try:
-        err = _fb_send_text(path, text)
-    except Exception as e:
-        err = "loi gui: " + type(e).__name__
-    if err:
-        return jsonify({"ok": 0, "e": err})
-    with _fb_lock:
-        _fb_cache.pop("chat|" + cid, None)
-    return jsonify({"ok": 1})
 
 
 @app.route("/fb/cookie", methods=["GET", "POST"])
