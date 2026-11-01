@@ -7018,6 +7018,18 @@ def _fb_img(u):
     return "/fb/img?u=" + urllib.parse.quote(u, safe="")
 
 
+_FB_PROXY = _env_str("FB_PROXY", "0") == "1"
+
+
+def _fb_open(req, timeout, proxy=None):
+    """urlopen, tuy chon di qua WARP/VPN (127.0.0.1:WARP_PORT) khi FB_PROXY=1 hoac proxy=True."""
+    if _FB_PROXY if proxy is None else proxy:
+        px = f"http://127.0.0.1:{WARP_PORT}"
+        op = urllib.request.build_opener(urllib.request.ProxyHandler({"http": px, "https": px}))
+        return op.open(req, timeout=timeout)
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
 def _fb_get(path):
     """Tra ve (html, ly_do_loi). ly_do_loi rong = thanh cong."""
     ck = _fb_cookie()
@@ -7030,7 +7042,7 @@ def _fb_get(path):
                                                "Accept-Language": "vi-VN,vi;q=0.9,en;q=0.5",
                                                "Accept-Encoding": "identity"})
     try:
-        with urllib.request.urlopen(req, timeout=12) as r:
+        with _fb_open(req, 12) as r:
             final = r.geturl()
             body = r.read(2_500_000).decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
@@ -7042,6 +7054,101 @@ def _fb_get(path):
     if "/login" in final or "/checkpoint" in final or 'id="login_form"' in low or 'name="login"' in low:
         return "", "cookie het han hoac bi chan"
     return body, ""
+
+
+
+# ---- Facebook bang Chromium that (m.facebook.com khong con HTML don gian cho client thuong) ----
+_FB_BROWSER = _env_str("FB_BROWSER", "0") == "1"
+_fb_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="fbchromium")
+_FB_MUA = ("Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) "
+           "Chrome/124.0.0.0 Mobile Safari/537.36")
+_FB_JS = """() => {
+  const out = [];
+  const arts = [...document.querySelectorAll('[role="article"]')].filter(a => !a.parentElement.closest('[role="article"]'));
+  for (const a of arts) {
+    const t = (a.innerText || '').replace(/\\s+/g, ' ').trim();
+    if (t.length < 20) continue;
+    const h = a.querySelector('h2,h3,h4,strong');
+    out.push({n: (h ? h.innerText : t.slice(0, 40)).replace(/\\s+/g, ' ').trim().slice(0, 60), t: t.slice(0, 500)});
+    if (out.length >= 30) break;
+  }
+  return {items: out, nart: arts.length, title: document.title, url: location.href,
+          body: (document.body ? document.body.innerText : '').replace(/\\s+/g, ' ').slice(0, 300)};
+}"""
+
+
+def _fb_cookie_list(ck):
+    out = []
+    for part in ck.split(";"):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            k, v = k.strip(), v.strip()
+            if k:
+                out.append({"name": k, "value": v, "domain": ".facebook.com", "path": "/", "secure": True})
+    return out
+
+
+def _fb_browser_job(path, wait_s):
+    from playwright.sync_api import sync_playwright
+    ck = _fb_cookie()
+    if not ck:
+        return {"err": "chua co cookie"}
+    args = ["--disable-gpu", "--disable-dev-shm-usage", "--disable-extensions", "--mute-audio",
+            "--no-first-run", "--renderer-process-limit=1", "--disk-cache-size=1",
+            "--js-flags=--max-old-space-size=192"]
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        args += ["--no-sandbox", "--no-zygote"]
+    pw = sync_playwright().start()
+    try:
+        br = pw.chromium.launch(headless=True, args=args)
+        ctx = br.new_context(user_agent=_FB_MUA, viewport={"width": 412, "height": 915},
+                             locale="vi-VN", service_workers="block")
+        ctx.set_default_timeout(25000)
+        ctx.add_cookies(_fb_cookie_list(ck))
+        ctx.route("**/*", lambda r: r.abort() if r.request.resource_type in ("image", "media", "font") else r.continue_())
+        pg = ctx.new_page()
+        pg.goto("https://m.facebook.com" + path, wait_until="domcontentloaded")
+        end = time.monotonic() + wait_s
+        res = None
+        while time.monotonic() < end:
+            time.sleep(1.5)
+            res = pg.evaluate(_FB_JS)
+            if res["items"]:
+                break
+        if res and not res["items"]:
+            pg.mouse.wheel(0, 1500)
+            time.sleep(2)
+            res = pg.evaluate(_FB_JS)
+        return res or {"err": "khong doc duoc"}
+    finally:
+        try:
+            pw.stop()
+        except Exception:
+            pass
+        gc.collect()
+
+
+def _fb_browser(path="/", wait_s=14):
+    """Tra ve dict {items, nart, title, url, body} hoac {err}."""
+    if _mem_frac() > 0.9:
+        return {"err": "thieu RAM"}
+    if _cr is not None:
+        _cr_close_async(resume=True)  # nhuong RAM: chi cho 1 Chromium chay
+    try:
+        return _fb_pool.submit(_fb_browser_job, path, wait_s).result(timeout=wait_s + 50)
+    except Exception as e:
+        return {"err": "chromium: " + type(e).__name__ + " " + str(e)[:120]}
+
+
+def _fb_browser_feed():
+    r = _fb_browser("/")
+    if r.get("err"):
+        return None, r["err"]
+    u = r.get("url", "")
+    if "/login" in u or "/checkpoint" in u:
+        return None, "cookie het han hoac bi chan"
+    items = [{"n": it["n"], "t": _gs_clean(it["t"], 240), "w": ""} for it in r.get("items", [])]
+    return items, ("" if items else "trang rong (chua thay bai viet)")
 
 
 def _fb_articles(page, limit):
@@ -7129,6 +7236,11 @@ def _fb_build(kind, arg):
 
 
 def _fb_build0(kind, arg):
+    if kind == "feed" and _FB_BROWSER:
+        items, err = _fb_browser_feed()
+        if err:
+            return None, err
+        return {"p": items}, ""
     if kind == "feed":
         pg, err = _fb_get(_fb_path("/home.php", arg))
         if err:
@@ -7356,6 +7468,16 @@ def fb_debug():
     ck = _fb_cookie()
     if not ck:
         return "chua co cookie", 200
+    if request.args.get("b") == "1":
+        r = _fb_browser(request.args.get("p", "/"))
+        if r.get("err"):
+            return "loi: " + r["err"], 200
+        lines = [f"url: {r['url'].split('?')[0]}", f"title: {r['title'][:80]}",
+                 f"role=article: {r['nart']} | doc duoc: {len(r['items'])}",
+                 f"text: {r['body']}"]
+        for it in r["items"][:3]:
+            lines.append("- " + it["n"] + " | " + it["t"][:120])
+        return Response("\n".join(lines), mimetype="text/plain; charset=utf-8")
     host = request.args.get("h", "mbasic.facebook.com")
     if not host.endswith("facebook.com"):
         return "host la", 400
@@ -7370,16 +7492,24 @@ def fb_debug():
         ua = "Opera/9.80 (J2ME/MIDP; Opera Mini/9.80 (S60; SymbOS; Opera Mobi/23.348; U; en) Presto/2.5.25 Version/10.54"
     elif request.args.get("ua") == "nokia":
         ua = "NokiaC3-00/5.0 (07.20) Profile/MIDP-2.1 Configuration/CLDC-1.1 Mozilla/5.0 AppleWebKit/420+ (KHTML, like Gecko) Safari/420+"
+    elif request.args.get("ua") == "full":
+        ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/124.0.0.0 Safari/537.36")
     elif request.args.get("ua") == "pc":
         ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
               "Chrome/124.0.0.0 Safari/537.36")
     req = urllib.request.Request("https://" + host + path, headers={
         "User-Agent": ua, "Cookie": ck,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Upgrade-Insecure-Requests": "1", "Accept-Language": "vi-VN,vi;q=0.9,en;q=0.5",
+        "Upgrade-Insecure-Requests": "1",
+        **({"Sec-Fetch-Dest": "document", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1", "Cache-Control": "max-age=0",
+            "Sec-CH-UA": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+            "Sec-CH-UA-Mobile": "?0", "Sec-CH-UA-Platform": '"Windows"'}
+           if request.args.get("ua") == "full" else {}), "Accept-Language": "vi-VN,vi;q=0.9,en;q=0.5",
         "Accept-Encoding": "identity"})
     try:
-        with urllib.request.urlopen(req, timeout=15) as r:
+        with _fb_open(req, 20, proxy=(request.args.get("px") == "1") or None) as r:
             final, code = r.geturl(), r.status
             body = r.read(2_500_000).decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
@@ -7393,7 +7523,8 @@ def fb_debug():
            f"role=article: {len(re.findall('role=.article.', body))}",
            f"login_form: {'login_form' in body.lower()}",
            f"<article: {body.count('<article')} | story_message: {body.count('story_message')} | "
-           f"message: {body.count('message')}",
+           f"message: {body.count('message')} | json_text: {body.count(chr(34)+'text'+chr(34)+':')} | "
+           f"actors: {body.count('actors')} | creation_time: {body.count('creation_time')}",
            f"khong ho tro: {'khong duoc ho tro' in _fb_txt(body).lower() or 'không được hỗ trợ' in _fb_txt(body).lower()}",
            f"text: {txt}"]
     return Response("\n".join(out), mimetype="text/plain; charset=utf-8")
