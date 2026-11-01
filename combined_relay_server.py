@@ -6942,6 +6942,30 @@ _fb_state = {"bad": "", "bad_ts": 0.0}
 _fb_tl = threading.local()
 
 
+def _fb_norm_cookie(raw):
+    """Chap nhan: chuoi header 'a=b; c=d', 'Cookie: ...', cookies.txt (Netscape, tab) hoac JSON export."""
+    raw = (raw or "").replace("\ufeff", "").strip()
+    if not raw:
+        return ""
+    if raw[:1] in "[{":
+        try:
+            j = json.loads(raw)
+            if isinstance(j, dict):
+                j = j.get("cookies", [j])
+            return "; ".join(f"{x['name']}={x['value']}" for x in j
+                             if isinstance(x, dict) and "name" in x and "value" in x)
+        except Exception:
+            pass
+    if "\t" in raw:
+        pairs = [ln.split("\t") for ln in raw.splitlines() if ln and not ln.startswith("#")]
+        out = [f"{p[5]}={p[6].strip()}" for p in pairs if len(p) >= 7 and "facebook" in p[0]]
+        if out:
+            return "; ".join(out)
+    raw = re.sub(r"(?im)^\s*cookie\s*:\s*", "", raw)
+    raw = raw.strip().strip('"').strip("'").replace("\r", "").replace("\n", "; ").strip()
+    return raw
+
+
 def _fb_cookie():
     """Lay cookie hop le dau tien: file /tmp truoc, roi bien FB_COOKIE. Bo qua gia tri thieu c_user/xs."""
     cands = []
@@ -6958,7 +6982,7 @@ def _fb_cookie():
             pass
     cands.append(_env_str("FB_COOKIE"))
     for c in cands:
-        c = (c or "").strip().strip('"').strip("'").replace("\r", "").replace("\n", "; ").strip()
+        c = _fb_norm_cookie(c)
         if "c_user=" in c and "xs=" in c:
             return c
     return ""
