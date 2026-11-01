@@ -7030,6 +7030,122 @@ def _fb_open(req, timeout, proxy=None):
     return urllib.request.urlopen(req, timeout=timeout)
 
 
+_FB_WWW = "https://www.facebook.com"
+_FB_FULL_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+               "Chrome/124.0.0.0 Safari/537.36")
+_FB_FULL_HDR = {
+    "User-Agent": _FB_FULL_UA,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "vi-VN,vi;q=0.9,en;q=0.5", "Accept-Encoding": "identity",
+    "Upgrade-Insecure-Requests": "1", "Sec-Fetch-Dest": "document", "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none", "Sec-Fetch-User": "?1", "Cache-Control": "max-age=0",
+    "Sec-CH-UA": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "Sec-CH-UA-Mobile": "?0", "Sec-CH-UA-Platform": '"Windows"'}
+
+
+def _fb_get_www(path="/"):
+    """Tai trang www.facebook.com bang header day du (khong can trinh duyet). Tra ve (html, loi)."""
+    ck = _fb_cookie()
+    if not ck:
+        return "", "chua co cookie"
+    url = path if path.startswith("http") else _FB_WWW + path
+    if not (urllib.parse.urlparse(url).hostname or "").endswith("facebook.com"):
+        return "", "url la"
+    hdr = dict(_FB_FULL_HDR)
+    hdr["Cookie"] = ck
+    try:
+        with _fb_open(urllib.request.Request(url, headers=hdr), 20) as r:
+            final = r.geturl()
+            body = r.read(4_000_000).decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return "", f"http {e.code}"
+    except Exception as e:
+        return "", f"mang: {type(e).__name__}"
+    if "/login" in final or "/checkpoint" in final:
+        return "", "cookie het han hoac bi chan"
+    return body, ""
+
+
+def _fb_ago(ts):
+    try:
+        d = max(0, int(time.time()) - int(ts))
+    except Exception:
+        return ""
+    if d < 3600:
+        return f"{max(1, d // 60)} phut"
+    if d < 86400:
+        return f"{d // 3600} gio"
+    return f"{d // 86400} ngay"
+
+
+def _fb_collect(o, acc, depth=0):
+    """Lay ten tac gia, noi dung, thoi gian dau tien trong 1 cum story."""
+    if depth > 40 or (acc.get("n") and acc.get("t") and acc.get("w")):
+        return
+    if isinstance(o, dict):
+        a = o.get("actors")
+        if not acc.get("n") and isinstance(a, list) and a and isinstance(a[0], dict) and a[0].get("name"):
+            acc["n"] = str(a[0]["name"])
+        m = o.get("message")
+        if not acc.get("t") and isinstance(m, dict) and isinstance(m.get("text"), str) and m["text"].strip():
+            acc["t"] = m["text"]
+        ct = o.get("creation_time")
+        if not acc.get("w") and isinstance(ct, int) and ct > 1_000_000_000:
+            acc["w"] = _fb_ago(ct)
+        for v in o.values():
+            if isinstance(v, (dict, list)):
+                _fb_collect(v, acc, depth + 1)
+    elif isinstance(o, list):
+        for v in o:
+            if isinstance(v, (dict, list)):
+                _fb_collect(v, acc, depth + 1)
+
+
+def _fb_walk(o, out, depth=0):
+    if depth > 60 or len(out) >= 40:
+        return
+    if isinstance(o, dict):
+        if "comet_sections" in o and isinstance(o.get("comet_sections"), dict):
+            acc = {}
+            _fb_collect(o, acc)
+            if acc.get("n") and acc.get("t"):
+                out.append(acc)
+            return  # khong di sau vao cum da xu ly
+        for v in o.values():
+            if isinstance(v, (dict, list)):
+                _fb_walk(v, out, depth + 1)
+    elif isinstance(o, list):
+        for v in o:
+            if isinstance(v, (dict, list)):
+                _fb_walk(v, out, depth + 1)
+
+
+def _fb_json_feed(body, limit=30):
+    """Doc bang tin tu cac the <script type=application/json> cua www.facebook.com."""
+    found = []
+    for m in re.finditer(r'(?is)<script[^>]*type="application/json"[^>]*>(.*?)</script>', body or ""):
+        txt = m.group(1)
+        if '"message"' not in txt and '"comet_sections"' not in txt:
+            continue
+        try:
+            j = json.loads(txt)
+        except Exception:
+            continue
+        _fb_walk(j, found)
+        if len(found) >= limit:
+            break
+    out, seen = [], set()
+    for a in found:
+        key = (a["n"], a["t"][:40])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"n": _gs_clean(a["n"], 60), "t": _gs_clean(a["t"], 240), "w": a.get("w", "")})
+        if len(out) >= limit:
+            break
+    return out
+
+
 def _fb_get(path):
     """Tra ve (html, ly_do_loi). ly_do_loi rong = thanh cong."""
     ck = _fb_cookie()
@@ -7241,6 +7357,11 @@ def _fb_build0(kind, arg):
         if err:
             return None, err
         return {"p": items}, ""
+    if kind == "feed" and not _FB_BROWSER:
+        pg, err = _fb_get_www("/")
+        if err:
+            return None, err
+        return {"p": _fb_json_feed(pg)}, ""
     if kind == "feed":
         pg, err = _fb_get(_fb_path("/home.php", arg))
         if err:
@@ -7468,6 +7589,15 @@ def fb_debug():
     ck = _fb_cookie()
     if not ck:
         return "chua co cookie", 200
+    if request.args.get("feed") == "1":
+        pg, err = _fb_get_www("/")
+        if err:
+            return "loi: " + err, 200
+        items = _fb_json_feed(pg)
+        lines = [f"len: {len(pg)} | bai doc duoc: {len(items)}"]
+        for it in items[:8]:
+            lines.append(f"- {it['n']} ({it['w']}): {it['t'][:100]}")
+        return Response("\n".join(lines), mimetype="text/plain; charset=utf-8")
     if request.args.get("b") == "1":
         r = _fb_browser(request.args.get("p", "/"))
         if r.get("err"):
