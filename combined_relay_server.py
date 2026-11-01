@@ -6950,7 +6950,7 @@ def _fb_cookie():
             cands.append(fh.read())
     except Exception:
         pass
-    for p in ("/etc/secrets/FB_COOKIE", "/etc/secrets/fb_cookie.txt"):
+    for p in ("/etc/secrets/FB_COOKIE", "/etc/secrets/FB_COOKIE.txt", "/etc/secrets/fb_cookie.txt"):
         try:
             with open(p, "r", encoding="utf-8") as fh:
                 cands.append(fh.read())
