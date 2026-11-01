@@ -7366,11 +7366,17 @@ def fb_debug():
     if request.args.get("ua") == "new":
         ua = ("Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) "
               "Chrome/124.0.0.0 Mobile Safari/537.36")
+    elif request.args.get("ua") == "lite":
+        ua = "Opera/9.80 (J2ME/MIDP; Opera Mini/9.80 (S60; SymbOS; Opera Mobi/23.348; U; en) Presto/2.5.25 Version/10.54"
+    elif request.args.get("ua") == "nokia":
+        ua = "NokiaC3-00/5.0 (07.20) Profile/MIDP-2.1 Configuration/CLDC-1.1 Mozilla/5.0 AppleWebKit/420+ (KHTML, like Gecko) Safari/420+"
     elif request.args.get("ua") == "pc":
         ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
               "Chrome/124.0.0.0 Safari/537.36")
     req = urllib.request.Request("https://" + host + path, headers={
-        "User-Agent": ua, "Cookie": ck, "Accept-Language": "vi-VN,vi;q=0.9,en;q=0.5",
+        "User-Agent": ua, "Cookie": ck,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Upgrade-Insecure-Requests": "1", "Accept-Language": "vi-VN,vi;q=0.9,en;q=0.5",
         "Accept-Encoding": "identity"})
     try:
         with urllib.request.urlopen(req, timeout=15) as r:
