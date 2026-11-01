@@ -7349,6 +7349,40 @@ def _fb_image():
     return Response(data, mimetype="image/jpeg", headers={"Cache-Control": "public, max-age=86400"})
 
 
+@app.route("/fb/debug")
+def fb_debug():
+    if not _tok_ok(request.args.get("k", ""), BR_TOKEN):
+        return "forbidden - them ?k=BR_TOKEN vao URL", 403
+    ck = _fb_cookie()
+    if not ck:
+        return "chua co cookie", 200
+    host = request.args.get("h", "mbasic.facebook.com")
+    if not host.endswith("facebook.com"):
+        return "host la", 400
+    path = request.args.get("p", "/home.php")
+    if not path.startswith("/"):
+        path = "/" + path
+    req = urllib.request.Request("https://" + host + path, headers={
+        "User-Agent": _FB_UA, "Cookie": ck, "Accept-Language": "vi-VN,vi;q=0.9,en;q=0.5",
+        "Accept-Encoding": "identity"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            final, code = r.geturl(), r.status
+            body = r.read(2_500_000).decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return f"http {e.code} tai https://{host}{path}", 200
+    except Exception as e:
+        return f"loi mang: {type(e).__name__}", 200
+    m = re.search(r"(?is)<title[^>]*>(.*?)</title>", body)
+    txt = _fb_txt(body)[:300]
+    out = [f"status: {code}", f"final: {final.split('?')[0]}", f"len: {len(body)}",
+           f"title: {_fb_txt(m.group(1))[:100] if m else ''}",
+           f"role=article: {len(re.findall('role=.article.', body))}",
+           f"login_form: {'login_form' in body.lower()}",
+           f"text: {txt}"]
+    return Response("\n".join(out), mimetype="text/plain; charset=utf-8")
+
+
 @app.route("/fb/cookie", methods=["GET", "POST"])
 def fb_cookie():
     if not _tok_ok(request.args.get("k", ""), BR_TOKEN):
