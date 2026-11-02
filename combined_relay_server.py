@@ -8111,25 +8111,191 @@ def _fb_login_step(final, pg, depth=0):
     return {"ok": 0, "e": "Facebook từ chối. Hãy dán cookie từ điện thoại"}
 
 
+# ---- Dang nhap Facebook bang Chromium that (mbasic da bi Facebook dong, form HTML don gian khong con) ----
+_fb_lgb = {"pw": None, "br": None, "ctx": None, "pg": None}   # chi dung trong luong _fb_pool (playwright sync)
+
+
+def _fb_lgb_close():
+    for k in ("ctx", "br"):
+        try:
+            if _fb_lgb[k]:
+                _fb_lgb[k].close()
+        except Exception:
+            pass
+    try:
+        if _fb_lgb["pw"]:
+            _fb_lgb["pw"].stop()
+    except Exception:
+        pass
+    _fb_lgb.update(pw=None, br=None, ctx=None, pg=None)
+    gc.collect()
+
+
+def _fb_lgb_cookies():
+    try:
+        cs = _fb_lgb["ctx"].cookies()
+    except Exception:
+        return ""
+    return "; ".join(f"{c['name']}={c['value']}" for c in cs if "facebook.com" in (c.get("domain") or ""))
+
+
+def _fb_lgb_save(ck):
+    if "c_user=" not in ck or "xs=" not in ck:
+        return False
+    with open(_FB_COOKIE_FILE, "w", encoding="utf-8") as fh:
+        fh.write(ck)
+    os.chmod(_FB_COOKIE_FILE, 0o600)
+    _fb_state["bad"] = ""
+    with _fb_lock:
+        _fb_cache.clear()
+    return True
+
+
+_FB_BTN_RE = re.compile(r"(?i)^\s*(allow all cookies|allow essential and optional cookies|cho ph[eé]p t[aấ]t c[aả] cookie|"
+                        r"ch[aấ]p nh[aậ]n t[aấ]t c[aả]|accept all|decline optional cookies|t[uừ] ch[oố]i cookie t[uù]y ch[oọ]n)\s*$")
+_FB_NEXT_RE = re.compile(r"(?i)^\s*(continue|ti[eế]p t[uụ]c|this was me|[dđ][aâ]y l[aà] t[oô]i|trust this device|"
+                         r"tin c[aậ]y thi[eế]t b[iị] n[aà]y|save browser|l[uư]u tr[iì]nh duy[eệ]t|save|l[uư]u|ok|not now|l[uú]c kh[aá]c)\s*$")
+
+
+def _fb_lgb_click(pg, rx):
+    try:
+        for el in pg.query_selector_all("button, [role=button], a[role=button], div[role=button], input[type=submit]"):
+            try:
+                t = (el.inner_text() or el.get_attribute("value") or "").strip()
+            except Exception:
+                continue
+            if t and len(t) < 50 and rx.match(t) and el.is_visible():
+                el.click(timeout=4000)
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _fb_lgb_code_box(pg):
+    for sel in ("input[name=approvals_code]", "input[autocomplete=one-time-code]",
+                "input[type=tel]", "input[inputmode=numeric]", "input[name=code]"):
+        try:
+            el = pg.query_selector(sel)
+            if el and el.is_visible():
+                return el
+        except Exception:
+            pass
+    return None
+
+
+def _fb_lgb_judge(pg, loops=18):
+    """Cho trang sau khi bam dang nhap / nhap ma, tra ve dict ket qua."""
+    t_end = time.monotonic() + loops
+    clicks = 0
+    while time.monotonic() < t_end:
+        time.sleep(1.0)
+        ck = _fb_lgb_cookies()
+        if "c_user=" in ck and "xs=" in ck:
+            time.sleep(1.5)                     # cho Facebook ghi not cookie (vd. fr, sb)
+            ck = _fb_lgb_cookies()
+            ok = _fb_lgb_save(ck)
+            _fb_lgb_close()
+            return {"ok": 1} if ok else {"ok": 0, "e": "Không lấy được phiên đăng nhập"}
+        if _fb_lgb_code_box(pg):
+            return {"ok": 0, "need": "2fa"}
+        if clicks < 6 and _fb_lgb_click(pg, _FB_NEXT_RE):
+            clicks += 1
+    url = (pg.url or "").lower()
+    try:
+        low = (pg.inner_text("body") or "")[:3000].lower()
+    except Exception:
+        low = ""
+    _fb_lgb_close()
+    if re.search(r"incorrect|wrong password|sai m[aậ]t kh[aẩ]u|m[aậ]t kh[aẩ]u b[aạ]n nh[aậ]p|kh[oô]ng ch[ií]nh x[aá]c|isn.t correct", low):
+        return {"ok": 0, "e": "Sai email hoặc mật khẩu"}
+    if re.search(r"other device|thi[eế]t b[iị] kh[aá]c|approve|ph[eê] duy[eệ]t|duy[eệ]t", low):
+        return {"ok": 0, "e": "Facebook đòi duyệt trên thiết bị khác. Hãy duyệt rồi thử lại, hoặc dán cookie"}
+    if "checkpoint" in url or "two_step" in url or "confirm" in url:
+        return {"ok": 0, "e": "Facebook đòi xác minh thêm. Hãy dán cookie từ điện thoại"}
+    return {"ok": 0, "e": "Facebook từ chối. Hãy dán cookie từ điện thoại"}
+
+
+def _fb_cr_login_job(u, p):
+    from playwright.sync_api import sync_playwright
+    _fb_lgb_close()
+    args = ["--disable-gpu", "--disable-dev-shm-usage", "--disable-extensions", "--mute-audio",
+            "--no-first-run", "--renderer-process-limit=1", "--disk-cache-size=1",
+            "--js-flags=--max-old-space-size=192"]
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        args += ["--no-sandbox", "--no-zygote"]
+    try:
+        _fb_lgb["pw"] = sync_playwright().start()
+        _fb_lgb["br"] = _fb_lgb["pw"].chromium.launch(headless=True, args=args)
+        ctx = _fb_lgb["br"].new_context(user_agent=_FB_MUA, viewport={"width": 412, "height": 915},
+                                        locale="vi-VN", service_workers="block")
+        ctx.set_default_timeout(25000)
+        ctx.route("**/*", lambda r: r.abort() if r.request.resource_type in ("media", "font") else r.continue_())
+        _fb_lgb["ctx"] = ctx
+        pg = ctx.new_page()
+        _fb_lgb["pg"] = pg
+        pg.goto("https://m.facebook.com/login/", wait_until="domcontentloaded")
+        time.sleep(1.5)
+        _fb_lgb_click(pg, _FB_BTN_RE)               # banner cookie (neu co)
+        time.sleep(0.8)
+        em = pg.query_selector("input[name=email]") or pg.query_selector("input[type=email]") \
+            or pg.query_selector("input[type=text]")
+        pw_ = pg.query_selector("input[name=pass]") or pg.query_selector("input[type=password]")
+        if not em or not pw_:
+            _fb_lgb_close()
+            return {"ok": 0, "e": "Facebook không cho đăng nhập kiểu này, hãy dán cookie"}
+        em.click()
+        em.fill(u)
+        pw_.click()
+        pw_.fill(p)
+        btn = pg.query_selector("button[name=login]") or pg.query_selector("button[type=submit]") \
+            or pg.query_selector("input[type=submit]")
+        if btn:
+            btn.click()
+        else:
+            pw_.press("Enter")
+        return _fb_lgb_judge(pg)
+    except Exception as e:
+        _fb_lgb_close()
+        return {"ok": 0, "e": "Lỗi trình duyệt: " + type(e).__name__}
+
+
+def _fb_cr_login2_job(code):
+    pg = _fb_lgb["pg"]
+    if pg is None:
+        return {"ok": 0, "e": "Phiên đăng nhập hết hạn, hãy nhập lại từ đầu"}
+    try:
+        box = _fb_lgb_code_box(pg)
+        if not box:
+            _fb_lgb_close()
+            return {"ok": 0, "e": "Phiên đăng nhập hết hạn, hãy nhập lại từ đầu"}
+        box.click()
+        box.fill(code)
+        if not _fb_lgb_click(pg, re.compile(r"(?i)^\s*(continue|ti[eế]p t[uụ]c|submit|g[uử]i|confirm|x[aá]c nh[aậ]n)\s*$")):
+            box.press("Enter")
+        res = _fb_lgb_judge(pg, 20)
+        if res.get("need") == "2fa":
+            res["e"] = "Mã chưa đúng hoặc đã hết hạn"
+        return res
+    except Exception as e:
+        _fb_lgb_close()
+        return {"ok": 0, "e": "Lỗi trình duyệt: " + type(e).__name__}
+
+
 def _fb_login_start(u, p):
-    import http.cookiejar as _cj
-    jar = _cj.CookieJar()
-    hs = [urllib.request.HTTPCookieProcessor(jar)]
-    if _FB_PROXY:
-        px = f"http://127.0.0.1:{WARP_PORT}"
-        hs.append(urllib.request.ProxyHandler({"http": px, "https": px}))
-    _fb_login_s.update(jar=jar, op=urllib.request.build_opener(*hs), form=None, ts=time.time())
-    final, pg = _fb_lg_open("/login/")
-    form = next((f for f in _fb_forms(pg) if "email" in f["fields"] and "pass" in f["fields"]), None)
-    if not form:
-        _fb_lg_done()
-        return {"ok": 0, "e": "Facebook không cho đăng nhập kiểu này, hãy dán cookie"}
-    data = dict(form["fields"])
-    data["email"], data["pass"] = u, p
-    if form["submits"]:
-        data[form["submits"][0][0]] = form["submits"][0][1]
-    final, pg = _fb_lg_open(form["action"] or "/login/device-based/regular/login/", data)
-    return _fb_login_step(final, pg)
+    if _mem_frac() > 0.92:
+        return {"ok": 0, "e": "Server thiếu RAM, thử lại sau ít phút"}
+    if _cr is not None:
+        _cr_close_async(resume=True)             # nhuong RAM: chi cho 1 Chromium chay
+    _fb_login_s["ts"] = time.time()
+    try:
+        res = _fb_pool.submit(_fb_cr_login_job, u, p).result(timeout=90)
+    except Exception as e:
+        _fb_lgb_close()
+        return {"ok": 0, "e": "Lỗi trình duyệt: " + type(e).__name__}
+    if res.get("need") == "2fa":
+        _fb_login_s.update(form={"chromium": 1}, jar=True, ts=time.time())
+    return res
 
 
 # ---- Dang nhap Facebook chay o NEN: POST /fb/login tra ngay {"wait":1}, may hoi GET /fb/lstat ----
@@ -8165,18 +8331,17 @@ def _fb_job_start(fn):
 
 def _fb_login2_do(code):
     s = _fb_login_s
-    f = s["form"]
-    if not f or s["jar"] is None or time.time() - s["ts"] > 600:
+    if not s["form"] or time.time() - s["ts"] > 600:
         _fb_lg_done()
+        _fb_pool.submit(_fb_lgb_close)
         return {"ok": 0, "e": "Phiên đăng nhập hết hạn, hãy nhập lại từ đầu"}
-    data = dict(f["fields"])
-    data["approvals_code"] = code
-    if f["submits"]:
-        data[f["submits"][0][0]] = f["submits"][0][1]
-    final, pg = _fb_lg_open(f["action"] or "/login/checkpoint/", data)
-    res = _fb_login_step(final, pg)
-    if res.get("need") == "2fa":
-        res["e"] = "Mã chưa đúng hoặc đã hết hạn"
+    try:
+        res = _fb_pool.submit(_fb_cr_login2_job, code).result(timeout=90)
+    except Exception as e:
+        _fb_lg_done()
+        return {"ok": 0, "e": "Lỗi trình duyệt: " + type(e).__name__}
+    if res.get("ok") or not res.get("need"):
+        _fb_lg_done()
     return res
 
 
