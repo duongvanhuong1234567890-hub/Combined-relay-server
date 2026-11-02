@@ -8229,13 +8229,21 @@ def _fb_cr_login_job(u, p):
         _fb_lgb["br"] = _fb_lgb["pw"].chromium.launch(headless=True, args=args)
         ctx = _fb_lgb["br"].new_context(user_agent=_FB_MUA, viewport={"width": 412, "height": 915},
                                         locale="vi-VN", service_workers="block")
-        ctx.set_default_timeout(25000)
-        ctx.route("**/*", lambda r: r.abort() if r.request.resource_type in ("media", "font") else r.continue_())
+        ctx.set_default_timeout(15000)
+        ctx.route("**/*", lambda r: r.abort() if r.request.resource_type in ("media", "font", "image") else r.continue_())
         _fb_lgb["ctx"] = ctx
         pg = ctx.new_page()
         _fb_lgb["pg"] = pg
-        pg.goto("https://m.facebook.com/login/", wait_until="domcontentloaded")
-        time.sleep(1.5)
+        step = "mo trang"
+        print("[fblogin] mo m.facebook.com/login", flush=True)
+        try:
+            pg.goto("https://m.facebook.com/login/", wait_until="commit", timeout=45000)
+            pg.wait_for_selector("input[name=email], input[type=email], input[type=password]", timeout=30000)
+        except Exception as e:
+            print("[fblogin] khong thay form:", type(e).__name__, "url=", pg.url, flush=True)
+            if "login" not in (pg.url or "") :
+                pass
+        time.sleep(1.0)
         _fb_lgb_click(pg, _FB_BTN_RE)               # banner cookie (neu co)
         time.sleep(0.8)
         em = pg.query_selector("input[name=email]") or pg.query_selector("input[type=email]") \
@@ -8244,19 +8252,26 @@ def _fb_cr_login_job(u, p):
         if not em or not pw_:
             _fb_lgb_close()
             return {"ok": 0, "e": "Facebook không cho đăng nhập kiểu này, hãy dán cookie"}
-        em.click()
-        em.fill(u)
-        pw_.click()
-        pw_.fill(p)
+        print("[fblogin] dien form, url=", pg.url, flush=True)
+        em.fill(u, force=True, timeout=10000)
+        pw_.fill(p, force=True, timeout=10000)
         btn = pg.query_selector("button[name=login]") or pg.query_selector("button[type=submit]") \
             or pg.query_selector("input[type=submit]")
         if btn:
-            btn.click()
+            btn.click(force=True, timeout=10000)
         else:
             pw_.press("Enter")
         return _fb_lgb_judge(pg)
     except Exception as e:
+        u_ = ""
+        try:
+            u_ = _fb_lgb["pg"].url
+        except Exception:
+            pass
+        print("[fblogin] loi:", type(e).__name__, str(e).splitlines()[0][:200] if str(e) else "", "url=", u_, flush=True)
         _fb_lgb_close()
+        if type(e).__name__ == "TimeoutError":
+            return {"ok": 0, "e": "Facebook tải quá chậm, thử lại hoặc dán cookie"}
         return {"ok": 0, "e": "Lỗi trình duyệt: " + type(e).__name__}
 
 
