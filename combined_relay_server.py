@@ -8184,7 +8184,7 @@ def _fb_lgb_code_box(pg):
     return None
 
 
-def _fb_lgb_judge(pg, loops=26):
+def _fb_lgb_judge(pg, loops=55):
     """Cho trang sau khi bam dang nhap / nhap ma, tra ve dict ket qua."""
     t_end = time.monotonic() + loops
     clicks = 0
@@ -8201,6 +8201,13 @@ def _fb_lgb_judge(pg, loops=26):
             return {"ok": 0, "need": "2fa"}
         if clicks < 6 and _fb_lgb_click(pg, _FB_NEXT_RE):
             clicks += 1
+        if time.monotonic() > t_end - loops + 20:          # sau 20s: neu khong con trang "kiem tra bao mat" thi thoi cho
+            try:
+                tx = (pg.inner_text("body") or "")[:600].lower()
+            except Exception:
+                tx = ""
+            if not re.search(r"ki[eể]m tra b[aả]o m[aậ]t|security check|vui l[oò]ng [dđ][oợ]i|please wait|checking your browser", tx):
+                break
     url = (pg.url or "").lower()
     try:
         low = (pg.inner_text("body") or "")[:3000].lower()
@@ -8232,6 +8239,7 @@ def _fb_cr_login_job(u, p):
         ctx = _fb_lgb["br"].new_context(user_agent=_FB_MUA, viewport={"width": 412, "height": 915},
                                         locale="vi-VN", service_workers="block")
         ctx.set_default_timeout(15000)
+        ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
         ctx.route("**/*", lambda r: r.abort() if r.request.resource_type in ("media", "font", "image") else r.continue_())
         _fb_lgb["ctx"] = ctx
         pg = ctx.new_page()
@@ -8314,7 +8322,7 @@ def _fb_login_start(u, p):
         _cr_close_async(resume=True)             # nhuong RAM: chi cho 1 Chromium chay
     _fb_login_s["ts"] = time.time()
     try:
-        res = _fb_pool.submit(_fb_cr_login_job, u, p).result(timeout=90)
+        res = _fb_pool.submit(_fb_cr_login_job, u, p).result(timeout=130)
     except Exception as e:
         _fb_lgb_close()
         return {"ok": 0, "e": "Lỗi trình duyệt: " + type(e).__name__}
@@ -8345,7 +8353,7 @@ def _fb_job_run(jid, fn):
 def _fb_job_start(fn):
     """Bat dau viec dang nhap o nen. Tra False neu dang co viec khac chay (chua qua 150 giay)."""
     with _fb_job_lock:
-        if _fb_job["state"] == "run" and time.time() - _fb_job["ts"] < 150:
+        if _fb_job["state"] == "run" and time.time() - _fb_job["ts"] < 170:
             return False
         _fb_job["id"] += 1
         jid = _fb_job["id"]
@@ -8407,7 +8415,7 @@ def fb_lstat():
         st, res, ts = _fb_job["state"], _fb_job["res"], _fb_job["ts"]
         age = time.time() - ts
         if st == "run":
-            if age > 150:
+            if age > 170:
                 _fb_job.update(state="idle", res=None)
                 return jsonify({"ok": 0, "e": "Facebook phản hồi quá lâu"})
             return jsonify({"ok": 0, "wait": 1})
