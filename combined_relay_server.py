@@ -8255,11 +8255,19 @@ def _fb_cr_login_job(u, p):
         print("[fblogin] dien form, url=", pg.url, flush=True)
         em.fill(u, force=True, timeout=10000)
         pw_.fill(p, force=True, timeout=10000)
-        btn = pg.query_selector("button[name=login]") or pg.query_selector("button[type=submit]") \
-            or pg.query_selector("input[type=submit]")
-        if btn:
-            btn.click(force=True, timeout=10000)
-        else:
+        clicked = False
+        for el in pg.query_selector_all("button[name=login], button[type=submit], input[type=submit], "
+                                        "[role=button], div[aria-label], button"):
+            try:
+                t = ((el.inner_text() or "") + " " + (el.get_attribute("aria-label") or "")
+                     + " " + (el.get_attribute("value") or "")).lower()
+                if el.is_visible() and re.search(r"đăng nhập|dang nhap|log in|login", t):
+                    el.click(timeout=8000)
+                    clicked = True
+                    break
+            except Exception:
+                continue
+        if not clicked:
             pw_.press("Enter")
         return _fb_lgb_judge(pg)
     except Exception as e:
