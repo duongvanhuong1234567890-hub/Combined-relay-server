@@ -7466,11 +7466,11 @@ def _fb_friend_rows(pg, mode, limit=30):
                 it["a"] = cur["a"]
             if mode == "frq":
                 if "ok" in cur:
-                    it["k1"] = cur["ok"]
+                    it["c"] = cur["ok"]
                 if "no" in cur:
-                    it["k2"] = cur["no"]
+                    it["w"] = cur["no"]
             elif mode == "fsg" and "add" in cur:
-                it["k1"] = cur["add"]
+                it["c"] = cur["add"]
             rows.append(it)
         cur = None
 
