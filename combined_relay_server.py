@@ -8184,7 +8184,7 @@ def _fb_lgb_code_box(pg):
     return None
 
 
-def _fb_lgb_judge(pg, loops=18):
+def _fb_lgb_judge(pg, loops=26):
     """Cho trang sau khi bam dang nhap / nhap ma, tra ve dict ket qua."""
     t_end = time.monotonic() + loops
     clicks = 0
@@ -8206,6 +8206,8 @@ def _fb_lgb_judge(pg, loops=18):
         low = (pg.inner_text("body") or "")[:3000].lower()
     except Exception:
         low = ""
+    print("[fblogin] ket thuc url=", url[:160], "| cookies=", sorted({c.split("=")[0] for c in _fb_lgb_cookies().split("; ") if c})[:12],
+          "| text=", re.sub(r"\s+", " ", low)[:300], flush=True)
     _fb_lgb_close()
     if re.search(r"incorrect|wrong password|sai m[aậ]t kh[aẩ]u|m[aậ]t kh[aẩ]u b[aạ]n nh[aậ]p|kh[oô]ng ch[ií]nh x[aá]c|isn.t correct", low):
         return {"ok": 0, "e": "Sai email hoặc mật khẩu"}
