@@ -7240,6 +7240,27 @@ def _fb_feed_pages(limit=30):
     return items[:limit], ("" if items else (err or "trang rong"))
 
 
+_fb_badges = {}   # so huy hieu doc duoc tu thanh dieu huong mbasic: nb = thong bao, fr = loi moi ket ban
+
+
+def _fb_scan_badges(body):
+    """Doc so tren cac nut 'Thong bao' va 'Yeu cau ket ban' o thanh dieu huong; chi cap nhat khi thay nut do."""
+    try:
+        for m in re.finditer(r'(?is)<a\b[^>]*?href="([^"]*)"[^>]*>(.*?)</a>', body[:90000]):
+            href = html.unescape(m.group(1)).lower()
+            txt = " ".join(html.unescape(re.sub(r"<[^>]+>", " ", m.group(2))).split())
+            if not txt or len(txt) > 40:
+                continue
+            n = re.search(r"(\d{1,3})\s*\)?\s*$", txt)
+            cnt = int(n.group(1)) if n else 0
+            if "/notifications" in href and re.match(r"(?i)^(thông báo|notifications?)\b", txt):
+                _fb_badges["nb"] = cnt
+            elif "/friends/center/requests" in href and re.match(r"(?i)^(bạn bè|yêu cầu kết bạn|lời mời|friends?|friend requests?)\b", txt):
+                _fb_badges["fr"] = cnt
+    except Exception:
+        pass
+
+
 def _fb_get(path):
     """Tra ve (html, ly_do_loi). ly_do_loi rong = thanh cong."""
     ck = _fb_cookie()
@@ -7263,6 +7284,7 @@ def _fb_get(path):
     low = body[:60000].lower()
     if "/login" in final or "/checkpoint" in final or 'id="login_form"' in low or 'name="login"' in low:
         return "", "cookie het han hoac bi chan"
+    _fb_scan_badges(body)
     return body, ""
 
 
@@ -7791,10 +7813,10 @@ def fb_route(kind):
         hit = _fb_cache.get(key)
     if hit and now - hit[0] < _FB_TTL and request.args.get("fresh") != "1":
         d = dict(hit[1]); d.update(ok=1, stale=0, age=int(now - hit[0]))
-        return jsonify(d)
+        return jsonify(dict(d, **_fb_badges))
     if _fb_state["bad"] and now - _fb_state["bad_ts"] < 90 and hit:
         d = dict(hit[1]); d.update(ok=1, stale=1, age=int(now - hit[0]), why=_fb_state["bad"])
-        return jsonify(d)
+        return jsonify(dict(d, **_fb_badges))
     try:
         data, err = _fb_build(kind, arg)
     except Exception as e:
@@ -7806,13 +7828,13 @@ def fb_route(kind):
                 _fb_cache.pop(next(iter(_fb_cache)), None)
             _fb_cache[key] = (now, data)
         d = dict(data); d.update(ok=1, stale=0, age=0)
-        return jsonify(d)
+        return jsonify(dict(d, **_fb_badges))
     if data is not None and not err:
         err = "trang rong (Facebook doi giao dien?)"
     _fb_note_bad(err)
     if hit:
         d = dict(hit[1]); d.update(ok=1, stale=1, age=int(now - hit[0]), why=err)
-        return jsonify(d)
+        return jsonify(dict(d, **_fb_badges))
     return jsonify({"ok": 0, "stale": 1, "why": err, "p": []})
 
 
@@ -7980,17 +8002,253 @@ def fb_debug():
     return Response("\n".join(out), mimetype="text/plain; charset=utf-8")
 
 
+# ---- Dang nhap Facebook qua relay: email + mat khau (+ ma 2FA). Mat khau khong duoc luu va khong ghi log; chi luu cookie ----
+_fb_login_s = {"ts": 0.0, "jar": None, "op": None, "form": None, "tries": []}
+_fb_login_lock = threading.Lock()
+
+
+def _fb_forms(pg):
+    """Tach cac <form>: [{action, fields{name: value}, submits[(name, value)]}]."""
+    out = []
+    for fm in re.finditer(r"(?is)<form\b([^>]*)>(.*?)</form>", pg or ""):
+        am = re.search(r'(?i)action="([^"]*)"', fm.group(1))
+        f = {"action": html.unescape(am.group(1)) if am else "", "fields": {}, "submits": []}
+        for im in re.finditer(r"(?is)<input\b([^>]*)>", fm.group(2)):
+            at = im.group(1)
+
+            def g(n):
+                m = re.search(r'(?i)\b' + n + r'="([^"]*)"', at)
+                return html.unescape(m.group(1)) if m else None
+            nm, ty, vl = g("name"), (g("type") or "text").lower(), g("value") or ""
+            if not nm:
+                continue
+            if ty == "submit":
+                f["submits"].append((nm, vl))
+            elif ty in ("radio", "checkbox"):
+                if re.search(r"(?i)\bchecked\b", at):
+                    f["fields"][nm] = vl
+            else:
+                f["fields"][nm] = vl
+        out.append(f)
+    return out
+
+
+def _fb_lg_open(url, data=None):
+    if url.startswith("/"):
+        url = _FB_HOST + url
+    if not (urllib.parse.urlparse(url).hostname or "").endswith("facebook.com"):
+        raise ValueError("url la")
+    body = urllib.parse.urlencode(data).encode() if data is not None else None
+    req = urllib.request.Request(url, data=body, headers={
+        "User-Agent": _FB_UA, "Accept-Language": "vi-VN,vi;q=0.9,en;q=0.5", "Accept-Encoding": "identity"})
+    last = None
+    for _att in range(2):  # loi mang thoang qua: thu lai 1 lan
+        try:
+            with _fb_login_s["op"].open(req, timeout=20) as r:
+                return r.geturl(), r.read(1_500_000).decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:  # 4xx/5xx van co the la trang checkpoint hop le
+            try:
+                pg = e.read(1_500_000).decode("utf-8", "replace")
+            except Exception:
+                pg = ""
+            return (e.geturl() or url), pg
+        except (urllib.error.URLError, socket.timeout, ConnectionError, http.client.HTTPException) as e:
+            last = e
+            time.sleep(0.8)
+    raise last
+
+
+def _fb_lg_save():
+    ck = "; ".join(f"{c.name}={c.value}" for c in _fb_login_s["jar"] if "facebook.com" in (c.domain or ""))
+    if "c_user=" not in ck or "xs=" not in ck:
+        return False
+    with open(_FB_COOKIE_FILE, "w", encoding="utf-8") as fh:
+        fh.write(ck)
+    os.chmod(_FB_COOKIE_FILE, 0o600)
+    _fb_state["bad"] = ""
+    with _fb_lock:
+        _fb_cache.clear()
+    return True
+
+
+def _fb_lg_done():
+    _fb_login_s.update(jar=None, op=None, form=None)
+
+
+def _fb_login_step(final, pg, depth=0):
+    s = _fb_login_s
+    names = {c.name for c in s["jar"]}
+    if "c_user" in names and "xs" in names:
+        ok = _fb_lg_save()
+        _fb_lg_done()
+        return {"ok": 1} if ok else {"ok": 0, "e": "Không lấy được phiên đăng nhập"}
+    forms = _fb_forms(pg)
+    f2 = next((f for f in forms if "approvals_code" in f["fields"]), None)
+    if f2:
+        s["form"] = f2
+        return {"ok": 0, "need": "2fa"}
+    low = (pg or "")[:80000].lower()
+    mid = ("name_action_selected" in low) or ("checkpoint" in (final or "").lower())
+    if mid and depth < 5:
+        for f in forms:
+            pick = next(((nm, vl) for nm, vl in f["submits"]
+                         if re.search(r"(?i)continue|tiếp tục|this was me|đây là tôi|\bok\b", nm + " " + vl)), None)
+            if pick:
+                data = dict(f["fields"])
+                data[pick[0]] = pick[1]
+                if "save_device" in low:  # "Luu thiet bi?": chon luu de lan sau khong bi hoi lai
+                    data["name_action_selected"] = "save_device"
+                f2url, pg2 = _fb_lg_open(f["action"], data)
+                return _fb_login_step(f2url, pg2, depth + 1)
+    if any("email" in f["fields"] and "pass" in f["fields"] for f in forms):
+        _fb_lg_done()
+        return {"ok": 0, "e": "Sai email hoặc mật khẩu"}
+    _fb_lg_done()
+    if "checkpoint" in (final or "").lower():
+        if re.search(r"(?i)approvals?\b|other device|thiết bị khác|thiet bi khac", low):
+            return {"ok": 0, "e": "Facebook đòi duyệt trên thiết bị khác. Hãy duyệt rồi thử lại, hoặc dán cookie"}
+        return {"ok": 0, "e": "Facebook đòi xác minh thêm. Hãy dán cookie từ điện thoại"}
+    return {"ok": 0, "e": "Facebook từ chối. Hãy dán cookie từ điện thoại"}
+
+
+def _fb_login_start(u, p):
+    import http.cookiejar as _cj
+    jar = _cj.CookieJar()
+    hs = [urllib.request.HTTPCookieProcessor(jar)]
+    if _FB_PROXY:
+        px = f"http://127.0.0.1:{WARP_PORT}"
+        hs.append(urllib.request.ProxyHandler({"http": px, "https": px}))
+    _fb_login_s.update(jar=jar, op=urllib.request.build_opener(*hs), form=None, ts=time.time())
+    final, pg = _fb_lg_open("/login/")
+    form = next((f for f in _fb_forms(pg) if "email" in f["fields"] and "pass" in f["fields"]), None)
+    if not form:
+        _fb_lg_done()
+        return {"ok": 0, "e": "Facebook không cho đăng nhập kiểu này, hãy dán cookie"}
+    data = dict(form["fields"])
+    data["email"], data["pass"] = u, p
+    if form["submits"]:
+        data[form["submits"][0][0]] = form["submits"][0][1]
+    final, pg = _fb_lg_open(form["action"] or "/login/device-based/regular/login/", data)
+    return _fb_login_step(final, pg)
+
+
+# ---- Dang nhap Facebook chay o NEN: POST /fb/login tra ngay {"wait":1}, may hoi GET /fb/lstat ----
+# (Facebook tu IP Render co the cham > 40 giay; neu giu mot request dai thi may bi het gio / gunicorn cat worker)
+_fb_job = {"id": 0, "state": "idle", "res": None, "ts": 0.0}
+_fb_job_lock = threading.Lock()
+_fb_tries_lock = threading.Lock()
+
+
+def _fb_job_run(jid, fn):
+    try:
+        with _fb_login_lock:
+            res = fn()
+    except Exception as e:
+        _fb_lg_done()
+        res = {"ok": 0, "e": "Lỗi mạng: " + type(e).__name__}
+    with _fb_job_lock:
+        if _fb_job["id"] == jid:
+            _fb_job.update(state="done", res=res, ts=time.time())
+
+
+def _fb_job_start(fn):
+    """Bat dau viec dang nhap o nen. Tra False neu dang co viec khac chay (chua qua 150 giay)."""
+    with _fb_job_lock:
+        if _fb_job["state"] == "run" and time.time() - _fb_job["ts"] < 150:
+            return False
+        _fb_job["id"] += 1
+        jid = _fb_job["id"]
+        _fb_job.update(state="run", res=None, ts=time.time())
+    threading.Thread(target=_fb_job_run, args=(jid, fn), daemon=True).start()
+    return True
+
+
+def _fb_login2_do(code):
+    s = _fb_login_s
+    f = s["form"]
+    if not f or s["jar"] is None or time.time() - s["ts"] > 600:
+        _fb_lg_done()
+        return {"ok": 0, "e": "Phiên đăng nhập hết hạn, hãy nhập lại từ đầu"}
+    data = dict(f["fields"])
+    data["approvals_code"] = code
+    if f["submits"]:
+        data[f["submits"][0][0]] = f["submits"][0][1]
+    final, pg = _fb_lg_open(f["action"] or "/login/checkpoint/", data)
+    res = _fb_login_step(final, pg)
+    if res.get("need") == "2fa":
+        res["e"] = "Mã chưa đúng hoặc đã hết hạn"
+    return res
+
+
+@app.route("/fb/login", methods=["POST"])
+def fb_login():
+    j = request.get_json(silent=True) or {}
+    u, pw = str(j.get("u") or "").strip()[:120], str(j.get("p") or "")[:200]
+    if not u or not pw:
+        return jsonify({"ok": 0, "e": "Thiếu email hoặc mật khẩu"})
+    now = time.time()
+    with _fb_tries_lock:
+        tr = [t for t in _fb_login_s["tries"] if now - t < 600]
+        if len(tr) >= 5:
+            return jsonify({"ok": 0, "e": "Thử quá nhiều lần, chờ 10 phút"})
+        tr.append(now)
+        _fb_login_s["tries"] = tr
+    _fb_job_start(lambda: _fb_login_start(u, pw))   # dang chay roi thi may cu hoi tiep ket qua
+    return jsonify({"ok": 0, "wait": 1})
+
+
+@app.route("/fb/login2", methods=["POST"])
+def fb_login2():
+    j = request.get_json(silent=True) or {}
+    code = re.sub(r"\D", "", str(j.get("c") or ""))[:8]
+    s = _fb_login_s
+    if not s["form"] or s["jar"] is None or time.time() - s["ts"] > 600:
+        _fb_lg_done()
+        return jsonify({"ok": 0, "e": "Phiên đăng nhập hết hạn, hãy nhập lại từ đầu"})
+    if len(code) < 6:
+        return jsonify({"ok": 0, "need": "2fa", "e": "Mã gồm 6 số"})
+    _fb_job_start(lambda: _fb_login2_do(code))
+    return jsonify({"ok": 0, "wait": 1})
+
+
+@app.route("/fb/lstat")
+def fb_lstat():
+    with _fb_job_lock:
+        st, res, ts = _fb_job["state"], _fb_job["res"], _fb_job["ts"]
+        age = time.time() - ts
+        if st == "run":
+            if age > 150:
+                _fb_job.update(state="idle", res=None)
+                return jsonify({"ok": 0, "e": "Facebook phản hồi quá lâu"})
+            return jsonify({"ok": 0, "wait": 1})
+        if st == "done" and age < 120:
+            return jsonify(res or {"ok": 0, "e": "Không có kết quả"})
+    return jsonify({"ok": 0, "e": "Không có phiên đăng nhập đang chạy"})
+
+
 @app.route("/fb/cookie", methods=["GET", "POST"])
 def fb_cookie():
-    if not _tok_ok(request.args.get("k", ""), BR_TOKEN):
+    k = request.args.get("k", "")
+    if not _tok_ok(k, BR_TOKEN):
         return "forbidden - them ?k=BR_TOKEN vao URL", 403
     if request.method == "GET":
         ck = _fb_cookie()
-        return f"fb cookie: {'co' if 'c_user=' in ck and 'xs=' in ck else 'chua co'}; loi gan nhat: {_fb_state['bad'] or 'khong'}", 200
-    txt = request.get_data(cache=False)[:8000].decode("utf-8", "replace").strip()
-    if "\t" in txt:  # cookies.txt (Netscape) -> header Cookie
-        pairs = [ln.split("\t") for ln in txt.splitlines() if ln and not ln.startswith("#") and "facebook.com" in ln]
-        txt = "; ".join(f"{p[5]}={p[6]}" for p in pairs if len(p) >= 7)
+        st = f"Cookie Facebook: {'đã có' if 'c_user=' in ck and 'xs=' in ck else 'chưa có'}. Lỗi gần nhất: {_fb_state['bad'] or 'không'}"
+        if request.args.get("t") == "1":
+            return st, 200
+        page = ("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
+                "<title>Cookie Facebook</title><body style='font-family:sans-serif;max-width:560px;margin:16px auto;padding:0 12px'>"
+                f"<h3>Dán cookie Facebook</h3><p>{html.escape(st)}</p>"
+                f"<form method=post action='/fb/cookie?k={urllib.parse.quote(k)}'>"
+                "<textarea name=c rows=9 style='width:100%' placeholder='c_user=...; xs=...  (hoặc cookies.txt / JSON)'></textarea>"
+                "<p><button style='padding:10px 18px;font-size:16px'>Lưu cookie</button></p></form>"
+                "<p style='color:#666;font-size:13px'>Cookie cần có c_user và xs. Mất khi relay khởi động lại.</p></body>")
+        return Response(page, mimetype="text/html; charset=utf-8")
+    if request.mimetype == "application/x-www-form-urlencoded":
+        txt = (request.form.get("c") or "")[:12000].strip()
+    else:
+        txt = request.get_data(cache=False)[:12000].decode("utf-8", "replace").strip()
+    txt = _fb_norm_cookie(txt)
     if "c_user=" not in txt or "xs=" not in txt:
         return "thieu c_user hoac xs", 400
     with open(_FB_COOKIE_FILE, "w", encoding="utf-8") as fh:
