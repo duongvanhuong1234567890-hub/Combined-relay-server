@@ -4074,12 +4074,9 @@ def search():
 
 
 # ---------------- YouTube: lien quan / phu de ----------------
-_YT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
-
-
 def _yt_id():
     vid = (request.args.get("id") or "").strip()
-    return vid if _YT_ID_RE.match(vid) else ""
+    return vid if _YT_BARE_ID.match(vid) else ""
 
 
 @app.route("/yt/related")
@@ -4156,6 +4153,7 @@ def yt_trending():
             with _yt_trend_lock:
                 _yt_trend_cache[key] = (now, nx)
             threading.Thread(target=_yt_thumb_prefetch, args=([r["id"] for r in nx[:12]], 150, 70), daemon=True).start()
+            warm_results(nx[:n])
             return jsonify(nx[:n])
     with _yt_trend_lock:
         hit = _yt_trend_cache.get(key)
@@ -4166,6 +4164,7 @@ def yt_trending():
         with _yt_trend_lock:
             _yt_trend_cache[key] = (now, out)
         threading.Thread(target=_yt_thumb_prefetch, args=([r["id"] for r in out[:12]], 150, 70), daemon=True).start()
+        warm_results(out[:n])
         return jsonify(out[:n])
     if hit:
         return jsonify(hit[1][:n])
