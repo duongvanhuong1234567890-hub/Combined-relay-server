@@ -1019,7 +1019,8 @@ else:
     yt_dlp = _LazyYT()
 
 _YDL_WORKER = r"""
-import sys, json
+import sys, json, time
+_T0 = time.time()
 def _out(o):
     sys.stdout.write("\n@@YDL@@" + json.dumps(o, default=str) + "\n")
     sys.stdout.flush()
@@ -1028,7 +1029,7 @@ _LOG = []
 class _L:
     def _add(self, lvl, m):
         if len(_LOG) < 60:
-            _LOG.append(lvl + ": " + str(m)[:300])
+            _LOG.append("%.1fs %s: %s" % (time.time() - _T0, lvl, str(m)[:300]))
     def debug(self, m):
         s_ = str(m)
         if any(k in s_.lower() for k in ("challenge", "pot", "sign in", "format", "player", "ejs")):
@@ -1055,7 +1056,7 @@ try:
             if isinstance(e, dict):
                 for k in _DROP:
                     e.pop(k, None)
-    _out({"ok": True, "info": info})
+    _out({"ok": True, "info": info, "log": _LOG})
 except BaseException as e:
     ei = getattr(e, "exc_info", None)
     cls = type(e).__name__
@@ -1131,6 +1132,9 @@ def _ydl_info(url, opts, slim=False):
         res = json.loads(out[_i + 7:].strip())
     except ValueError:
         raise RuntimeError("yt-dlp tra ket qua hong")
+    if res.get("ok") and _env_bool("YT_YDL_TRACE", True):
+        for _ln in (res.get("log") or [])[:25]:
+            print(f"[ydl-trace] {_ln}", flush=True)
     if not res.get("ok"):
         for _ln in (res.get("log") or []):
             print(f"[ydl-log] {_ln}", flush=True)
@@ -2277,7 +2281,9 @@ class Resolver:
             opts.setdefault("extractor_args", {})["youtubepot-bgutilhttp"] = {"base_url": [_pot]}
         if runtimes:
             opts["js_runtimes"] = {"deno": {}, "node": {}}
-            opts["remote_components"] = ["ejs:github"] if _env_bool("YT_REMOTE_EJS", True) else []
+            import importlib.util as _iu
+            _has_ejs = _iu.find_spec("yt_dlp_ejs") is not None
+            opts["remote_components"] = ["ejs:github"] if _env_bool("YT_REMOTE_EJS", not _has_ejs) else []
         if px:
             opts["proxy"] = px
         if cookiefile:
@@ -6944,6 +6950,66 @@ def _pot_selfcheck():
         print(f"[pot] LOI: khong chay duoc deno: {type(e).__name__}: {str(e)[:200]}", flush=True)
 
 
+_POT_SRV_PORT = _env_int("POT_PORT", 4416)
+
+
+def _pot_server_start():
+    """Chay bgutil POT provider THUONG TRUC (HTTP) thay vi spawn deno cho moi lan resolve.
+    Neu khong chay duoc thi giu nguyen hanh vi cu (script-deno)."""
+    if not _env_bool("POT_SERVER", True) or os.environ.get("YT_POT_URL", "").strip():
+        return
+    home = os.environ.get("HOME") or os.path.expanduser("~")
+    server = os.path.join(home, "bgutil-ytdlp-pot-provider", "server")
+    main = os.path.join(server, "src", "main.ts")
+    if not os.path.isfile(main):
+        print(f"[pot-srv] khong thay {main} -> dung script-deno nhu cu", flush=True)
+        return
+    # -A: server cuc bo, DENO_NO_PROMPT=1 nen thieu quyen se chet ngay (vd. --allow-sys cho HTTP server)
+    cmd = ["deno", "run", "-A", main, "--port", str(_POT_SRV_PORT)]
+    url = f"http://127.0.0.1:{_POT_SRV_PORT}"
+    for attempt in range(1, 4):
+        env = dict(os.environ, DENO_NO_PROMPT="1", DENO_NO_UPDATE_CHECK="1", FORCE_COLOR="false",
+                   DENO_V8_FLAGS="--max-old-space-size=%d" % _env_int("POT_HEAP_MB", 96))
+        try:
+            proc = subprocess.Popen(_oom_prefix() + cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True, env=env, start_new_session=True)
+        except Exception as e:
+            print(f"[pot-srv] khong chay duoc deno: {type(e).__name__}: {str(e)[:150]}", flush=True)
+            return
+
+        def _pump(p=proc):
+            n = 0
+            for ln in p.stdout:
+                n += 1
+                if n <= 15:
+                    print(f"[pot-srv] {ln.rstrip()[:200]}", flush=True)
+        threading.Thread(target=_pump, daemon=True).start()
+        t0, ok = time.monotonic(), False
+        while time.monotonic() - t0 < 90 and proc.poll() is None:
+            try:
+                with urllib.request.urlopen(url + "/ping", timeout=2) as r:
+                    if r.status == 200:
+                        ok = True
+                        break
+            except Exception:
+                time.sleep(1.0)
+        if not ok:
+            print(f"[pot-srv] lan {attempt}: server khong len sau {time.monotonic() - t0:.0f}s (rc={proc.poll()})", flush=True)
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except Exception:
+                pass
+            continue
+        os.environ["YT_POT_URL"] = url
+        POT.base, POT.fail_until, POT.fails = url, 0.0, 0
+        print(f"[pot-srv] OK {url} sau {time.monotonic() - t0:.1f}s -> yt-dlp + direct dung PO token tu server nay", flush=True)
+        proc.wait()
+        os.environ.pop("YT_POT_URL", None)
+        POT.base = ""
+        print(f"[pot-srv] server thoat (rc={proc.returncode}) -> thu chay lai", flush=True)
+    print("[pot-srv] bo cuoc sau 3 lan, quay ve script-deno", flush=True)
+
+
 def _warmup_once():
     time.sleep(_env_float("YT_WARMUP_DELAY", 25))
     if ARB.any_active():
@@ -7012,6 +7078,8 @@ def _start_background_tasks():
         threading.Thread(target=_warmup_once, daemon=True).start()
     if os.environ.get("POT_SELFCHECK", "1") == "1":
         threading.Thread(target=_pot_selfcheck, daemon=True).start()
+    if HAS_YT:
+        threading.Thread(target=_pot_server_start, name="pot-srv", daemon=True).start()
     if RAM_WATCH:
         threading.Thread(target=_ram_watchdog, daemon=True).start()
     print(f"[power] role={ROLE} warmup={os.environ.get('YT_WARMUP', '0')} pot={'on' if POT.base else 'off'} "
