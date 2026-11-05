@@ -144,11 +144,19 @@ def _wg_parse(raw):
         return ""
 
     drop = ("postup", "postdown", "preup", "predown", "table", "saveconfig", "fwmark")
+    v4only = _env_bool("WG_IPV4_ONLY", True)   # DNS/dia chi IPv6 trong tunnel hay het gio -> "lookup ... i/o timeout"
     out = []
     for ln in raw.replace("\r", "").split("\n"):
         k = ln.split("=", 1)[0].strip().lower()
         if k in drop:
             continue
+        if v4only and "=" in ln and k in ("address", "dns", "allowedips"):
+            vals = [v.strip() for v in ln.split("=", 1)[1].split(",") if v.strip() and ":" not in v]
+            if not vals and k == "allowedips":
+                vals = ["0.0.0.0/0"]
+            if not vals:
+                continue
+            ln = f"{ln.split('=', 1)[0].strip()} = {', '.join(vals)}"
         out.append(ln)
     return "\n".join(out).strip() + "\n"
 
@@ -1310,7 +1318,7 @@ class PotClient:
             hit = self.cache.get(binding)
             if hit and hit[0] > now:
                 return hit[1]
-        body = {"content_binding": binding, "visitor_data": binding}
+        body = {"content_binding": binding}
         if px:
             body["proxy"] = px
         try:
@@ -6956,7 +6964,7 @@ _POT_SRV_PORT = _env_int("POT_PORT", 4416)
 def _pot_server_start():
     """Chay bgutil POT provider THUONG TRUC (HTTP) thay vi spawn deno cho moi lan resolve.
     Neu khong chay duoc thi giu nguyen hanh vi cu (script-deno)."""
-    if not _env_bool("POT_SERVER", True) or os.environ.get("YT_POT_URL", "").strip():
+    if not _env_bool("POT_SERVER", False) or os.environ.get("YT_POT_URL", "").strip():
         return
     home = os.environ.get("HOME") or os.path.expanduser("~")
     server = os.path.join(home, "bgutil-ytdlp-pot-provider", "server")
