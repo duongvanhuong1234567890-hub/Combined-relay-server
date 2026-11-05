@@ -515,12 +515,12 @@ def _reqbusy_done(exc):
         _reqbusy_add(-1)
 
 
-_TOKEN_GATED = ("/stream", "/search", "/tr", "/gs", "/ytm", "/app", "/yt/", "/fb/")
+_TOKEN_GATED = ("/stream", "/search", "/tr", "/gs", "/ytm", "/app", "/yt/", "/fb/", "/v2/")
 _BR_GATED = ("/br", "/cookies")
 
 
 def _svc_of(path):
-    if path.startswith(("/stream", "/search", "/_src/", "/yt/")):
+    if path.startswith(("/stream", "/search", "/_src/", "/yt/", "/v2/")):
         return "video"
     if path.startswith("/ytm"):
         return "music"
@@ -3883,7 +3883,7 @@ def _ffmpeg_cmd(v_url, a_url, v_hdr, a_hdr, px, w, h, fps, q, ar, v_local=False,
     return cmd
 
 
-def _stream_impl(video_url):
+def _stream_impl(video_url, open_only=False):
     global _last_height_cap, _cur_proc
     t_req = time.monotonic()
     if not (video_url or "").strip():
@@ -4007,6 +4007,10 @@ def _stream_impl(video_url):
         _stat["last"] = time.time()
         _n = _stat["streams"]
     print(f"[proof] giai ma cho LilyGo #{_n} sid={sess.sid} | {_who()} | {w}x{h}@{fps}fps | khong luu o dia", flush=True)
+    if open_only:
+        with sess.cv:
+            sess.detached_at = time.monotonic()
+        return jsonify({"sid": sess.sid, "first": len(first)}), 200, {"Cache-Control": "no-store", "X-Sid": sess.sid}
     return _sess_response(sess, 0)
 
 
@@ -4055,6 +4059,75 @@ def stream():
             return Response("off sai", 400)
         return _stream_resume(sid, off)
     return _stream_impl(request.args.get("url", ""))
+
+
+# ---------------- v2: ESP keo tung doan tren 1 ket noi HTTPS dung chung ----------------
+# /v2/open  : lay link + chay ffmpeg, tra {"sid": ...} (khong stream)
+# /v2/chunk : tra DUNG [off, off+len) cua phien (Content-Length ro rang) -> ket noi giu mo duoc, ESP tu dieu toc
+V2_CHUNK_MAX = int(_env_float("V2_CHUNK_MAX_KB", 512) * 1024)
+V2_FILL_WAIT = _env_float("V2_FILL_WAIT", 1.2)
+V2_HARD_WAIT = _env_float("V2_HARD_WAIT", 12.0)
+
+
+@app.route("/v2/open")
+def v2_open():
+    return _stream_impl(request.args.get("url", ""), open_only=True)
+
+
+@app.route("/v2/chunk")
+def v2_chunk():
+    sid = (request.args.get("sid") or "").strip()
+    try:
+        off = max(0, int(request.args.get("off", "0")))
+        ln = int(request.args.get("len", "65536"))
+    except ValueError:
+        return Response("bad args", 400)
+    ln = max(1, min(ln, V2_CHUNK_MAX))
+    sess = _sessions.get(sid)
+    if sess is None or sess.dead:
+        return jsonify({"error": "session_gone"}), 410
+    t0 = time.monotonic()
+    with sess.cv:
+        sess.gen += 1
+        sess.detached_at = None
+    sess.resume()
+    data = b""
+    eof = False
+    with sess.cv:
+        internal = off + sess.skew
+        if internal < sess.base:
+            sess.detached_at = time.monotonic()
+            return jsonify({"error": "offset_trimmed"}), 410
+        if internal > sess.end:
+            sess.detached_at = time.monotonic()
+            return jsonify({"error": "offset_ahead"}), 416
+        while not sess.dead:
+            avail = sess.end - internal
+            waited = time.monotonic() - t0
+            if avail >= ln or sess.eof:
+                break
+            if avail >= 4096 and waited >= V2_FILL_WAIT:
+                break
+            if waited >= V2_HARD_WAIT:
+                break
+            sess.cv.wait(0.25)
+        if sess.dead:
+            return jsonify({"error": "session_gone"}), 410
+        n = min(ln, sess.end - internal)
+        if n > 0:
+            lo = internal - sess.base
+            data = bytes(sess.buf[lo:lo + n])
+            sess.sent = max(sess.sent, internal + n)
+            sess._trim()
+        eof = bool(sess.eof and internal + n >= sess.end)
+        sess.detached_at = time.monotonic()
+    _mark_stream()
+    if not data:
+        if eof:
+            return Response("", 204, headers={"Cache-Control": "no-store"})
+        return Response("", 202, headers={"Cache-Control": "no-store"})
+    return Response(data, 200, mimetype="application/octet-stream",
+                    headers={"Cache-Control": "no-store", "X-Eof": "1" if eof else "0", "X-Sid": sess.sid})
 
 
 @app.route("/search")
@@ -6616,6 +6689,29 @@ def esp_exit_report():
     if request.args.get("end") == "1" and request.args.get("sid"):
         _sess_drop(request.args.get("sid"), "ESP bao thoat han")
     return Response("", 204)
+
+
+# ---- ESP bao cao nguyen nhan reset (panic / watchdog / brownout) sau khi khoi dong lai ----
+_ESP_CRASHES = collections.deque(maxlen=60)
+
+
+@app.route("/yt/crash")
+def esp_crash_report():
+    def _c(k, n=40):
+        v = (request.args.get(k) or "?")[:n]
+        return "".join(ch if 32 <= ord(ch) < 127 else "_" for ch in v)
+    line = (f"{time.strftime('%Y-%m-%d %H:%M:%S')} rr={_c('rr', 12)} uptime_truoc={_c('up', 10)}ms tag={_c('tag', 32)} "
+            f"ram_trong={_c('fi', 8)} khoi_lon={_c('lg', 8)} psram={_c('fp', 9)} min_trong={_c('mi', 8)} "
+            f"rssi={_c('rssi', 5)} tx={_c('tx', 5)} tls_mo={_c('tls', 3)} seq={_c('seq', 8)} hopden_hople={_c('pv', 2)} | {_who()}")
+    _ESP_CRASHES.append(line)
+    print("[esp-crash] " + line, flush=True)
+    return Response("", 204)
+
+
+@app.route("/yt/crashlog")
+def esp_crash_log():
+    txt = "\n".join(_ESP_CRASHES) or "chua co bao cao nao (chi ghi trong RAM, mat khi relay khoi dong lai)"
+    return Response(txt + "\n", mimetype="text/plain; charset=utf-8", headers={"Cache-Control": "no-store"})
 
 
 @app.route("/app")
