@@ -150,6 +150,11 @@ def _wg_parse(raw):
         k = ln.split("=", 1)[0].strip().lower()
         if k in drop:
             continue
+        if k == "dns" and "=" in ln:
+            _d = _env_str("WG_DNS", "1.1.1.1, 8.8.8.8").strip()
+            if _d:
+                out.append(f"DNS = {_d}")
+                continue
         if v4only and "=" in ln and k in ("address", "dns", "allowedips"):
             vals = [v.strip() for v in ln.split("=", 1)[1].split(",") if v.strip() and ":" not in v]
             if not vals and k == "allowedips":
@@ -7018,6 +7023,47 @@ def _pot_server_start():
     print("[pot-srv] bo cuoc sau 3 lan, quay ve script-deno", flush=True)
 
 
+def _route_probe():
+    """Thu tung duong ra ngoai (WG/WARP/khong proxy) bang 1 yeu cau android_vr that, chon duong YouTube chap nhan.
+    Duong nao qua -> resolve ~2s (khong can deno/PO token)."""
+    try:
+        if _WARP_THREAD.is_alive():
+            _WARP_THREAD.join(timeout=150)
+        PROXIES.load()
+        cands = list(PROXIES.items)
+        if _env_bool("YT_PROBE_DIRECT", True) and "direct" not in cands:
+            cands.append("direct")
+        vid = os.environ.get("YT_PROBE_VIDEO", "dQw4w9WgXcQ")
+        good, bad = [], []
+        for c in cands:
+            px = "" if c == "direct" else c
+            t0 = time.monotonic()
+            try:
+                innertube_player(INNERTUBE_BASE, "android_vr", vid, _proxy_opener(px), Visitor(), px, timeout=15)
+                good.append(c)
+                print(f"[route] {PROXIES._mask(c) if c != 'direct' else 'khong proxy'}: YouTube CHAP NHAN "
+                      f"({time.monotonic() - t0:.1f}s)", flush=True)
+            except Exception as e:
+                bad.append(c)
+                print(f"[route] {PROXIES._mask(c) if c != 'direct' else 'khong proxy'}: bi tu choi "
+                      f"({str(e)[:90]}) ({time.monotonic() - t0:.1f}s)", flush=True)
+        if not good:
+            print("[route] khong duong nao duoc YouTube chap nhan -> giu nguyen thu tu cu", flush=True)
+            return
+        cool = _env_float("YT_PROBE_COOL", 300)
+        with PROXIES.lock:
+            PROXIES.items = good + bad
+            PROXIES.i = 0
+            now = time.monotonic()
+            for b in bad:
+                PROXIES.bad[b] = now + cool
+            for g in good:
+                PROXIES.bad.pop(g, None)
+        print(f"[route] dung duong: {PROXIES._mask(good[0]) if good[0] != 'direct' else 'khong proxy'}", flush=True)
+    except Exception as e:
+        print(f"[route] loi probe: {type(e).__name__}: {str(e)[:150]}", flush=True)
+
+
 def _warmup_once():
     time.sleep(_env_float("YT_WARMUP_DELAY", 25))
     if ARB.any_active():
@@ -7088,6 +7134,8 @@ def _start_background_tasks():
         threading.Thread(target=_pot_selfcheck, daemon=True).start()
     if HAS_YT:
         threading.Thread(target=_pot_server_start, name="pot-srv", daemon=True).start()
+        if HAS_VIDEO and _env_bool("YT_ROUTE_PROBE", True):
+            threading.Thread(target=_route_probe, name="route-probe", daemon=True).start()
     if RAM_WATCH:
         threading.Thread(target=_ram_watchdog, daemon=True).start()
     print(f"[power] role={ROLE} warmup={os.environ.get('YT_WARMUP', '0')} pot={'on' if POT.base else 'off'} "
