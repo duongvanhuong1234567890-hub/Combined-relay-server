@@ -6796,7 +6796,20 @@ def _yg_job(email, pw):
         _yg_set("run", "dang mo trang dang nhap Google")
         pg.goto("https://accounts.google.com/ServiceLogin?service=youtube&hl=vi"
                 "&continue=https%3A%2F%2Fwww.youtube.com%2F", wait_until="domcontentloaded", timeout=45000)
-        em = pg.wait_for_selector("input[type=email]", timeout=25000)
+        try:
+            em = pg.wait_for_selector("input[type=email], input[name=identifier], input#identifierId", timeout=25000)
+        except Exception as e_:
+            try:
+                snap = re.sub(r"\s+", " ", pg.inner_text("body")[:400])
+            except Exception:
+                snap = "?"
+            try:
+                inputs = [(el.get_attribute("type") or "", el.get_attribute("name") or "")
+                          for el in pg.query_selector_all("input")][:12]
+            except Exception:
+                inputs = []
+            print(f"[yt-login] KHONG THAY O EMAIL | url={pg.url[:200]} | inputs={inputs} | text={snap}", flush=True)
+            raise _YgFail("Google không hiện ô email (xem log [yt-login] để biết trang đang hiện gì)") from e_
         em.fill(email)
         _yg_click_next(pg, "#identifierNext")
         pwi = pg.wait_for_selector("input[type=password]", timeout=25000)
