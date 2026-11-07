@@ -6826,9 +6826,9 @@ YT_GOOGLE_EMAIL = _env_str("YT_GOOGLE_EMAIL")
 YT_GOOGLE_PASSWORD = os.environ.get("YT_GOOGLE_PASSWORD", "")
 YT_AUTO_LOGIN = _env_bool("YT_AUTO_LOGIN", True)
 YT_AUTO_COOLDOWN = _env_float("YT_AUTO_COOLDOWN", 21600)
-YT_LOGIN_WAIT = _env_float("YT_LOGIN_WAIT", 200)
+YT_LOGIN_WAIT = _env_float("YT_LOGIN_WAIT", 300)
 YG_RAM_MAX = _env_float("YG_RAM_MAX", 0.80)
-_yg = {"state": "idle", "msg": "", "ts": 0.0, "code": "", "last_auto": 0.0, "vid": "", "shot": ""}
+_yg = {"state": "idle", "msg": "", "ts": 0.0, "code": "", "last_auto": 0.0, "vid": "", "shot": "", "acts": []}
 _yg_pg_ref = {"pg": None}
 _yg_shot_t = [0.0]
 _yg_lock = threading.Lock()
@@ -6853,7 +6853,7 @@ def _yg_set(state, msg=""):
 
 def _yg_public():
     with _yg_lock:
-        d = {k: v for k, v in _yg.items() if k not in ("code", "vid", "shot")}
+        d = {k: v for k, v in _yg.items() if k not in ("code", "vid", "shot", "acts")}
     d["cookies"] = COOKIES.info()
     d["creds"] = bool(YT_GOOGLE_EMAIL and YT_GOOGLE_PASSWORD)
     return d
@@ -6906,6 +6906,34 @@ def _yg_click_next(pg, sel=None):
     return False
 
 
+def _yg_do_acts(pg):
+    with _yg_lock:
+        acts, _yg["acts"] = list(_yg.get("acts") or []), []
+    for a in acts[:12]:
+        try:
+            t = a.get("t")
+            if t == "click":
+                pg.mouse.click(max(0.0, min(1024.0, float(a["x"]))), max(0.0, min(700.0, float(a["y"]))))
+            elif t == "type":
+                pg.keyboard.type(str(a.get("s", ""))[:200], delay=35)
+            elif t == "key" and a.get("s") in ("Enter", "Backspace", "Tab"):
+                pg.keyboard.press(a["s"])
+        except Exception:
+            pass
+
+
+def _yg_snap(pg, force=False):
+    if not force and time.monotonic() - _yg_shot_t[0] < 1.5:
+        return
+    _yg_shot_t[0] = time.monotonic()
+    try:
+        png = pg.screenshot(type="jpeg", quality=55, full_page=False)
+        with _yg_lock:
+            _yg["shot"] = __import__("base64").b64encode(png).decode()
+    except Exception:
+        pass
+
+
 def _yg_job(email, pw):
     from playwright.sync_api import sync_playwright
     _yg_set("run", "dang don RAM va mo Chromium")
@@ -6951,24 +6979,26 @@ def _yg_job(email, pw):
             raise _YgFail("Google không hiện ô email (xem log [yt-login] để biết trang đang hiện gì)") from e_
         em.fill(email)
         _yg_click_next(pg, "#identifierNext")
-        pwi = pg.wait_for_selector("input[type=password]", timeout=25000)
-        time.sleep(1.0)
-        pwi.fill(pw)
-        _yg_click_next(pg, "#passwordNext")
+        try:
+            pwi = pg.wait_for_selector("input[type=password]", timeout=25000)
+            time.sleep(1.0)
+            pwi.fill(pw)
+            _yg_click_next(pg, "#passwordNext")
+        except Exception:
+            try:
+                snap = re.sub(r"\s+", " ", pg.inner_text("body")[:400])
+            except Exception:
+                snap = "?"
+            print(f"[yt-login] KHONG THAY O MAT KHAU | url={pg.url[:200]} | text={snap}", flush=True)
+            _yg_snap(pg, force=True)
+            _yg_set("prompt", "Google chua hien o mat khau: mo trang xac minh, xem anh va tu thao tac")
         end = time.monotonic() + YT_LOGIN_WAIT
         while time.monotonic() < end:
-            time.sleep(1.0)
+            _yg_do_acts(pg)
+            time.sleep(0.5)
             if _yg_logged(ctx.cookies()):
                 break
-            if _yg["state"] in ("prompt", "need_code") and time.monotonic() - _yg_shot_t[0] > 4:
-                _yg_shot_t[0] = time.monotonic()
-                try:
-                    import base64 as _b64
-                    png = pg.screenshot(type="jpeg", quality=60, full_page=False)
-                    with _yg_lock:
-                        _yg["shot"] = _b64.b64encode(png).decode()
-                except Exception:
-                    pass
+            _yg_snap(pg)
             try:
                 low = re.sub(r"\s+", " ", pg.inner_text("body")[:2500]).lower()
             except Exception:
@@ -7030,7 +7060,7 @@ def _yg_start(why, auto):
             return False
         if auto and time.time() - _yg["last_auto"] < YT_AUTO_COOLDOWN:
             return False
-        _yg.update(state="run", msg="dang xep hang", ts=time.time(), code="", last_auto=time.time(),
+        _yg.update(state="run", msg="dang xep hang", ts=time.time(), code="", last_auto=time.time(), acts=[],
                    vid=__import__("secrets").token_urlsafe(16), shot="")
     print(f"[yt-login] bat dau ({why})", flush=True)
     _fb_pool.submit(_yg_job, YT_GOOGLE_EMAIL, YT_GOOGLE_PASSWORD)
@@ -7069,43 +7099,84 @@ def cookies_code():
     return "da nhan ma, dang chuyen cho Google", 200
 
 
+def _yg_valid(vid):
+    with _yg_lock:
+        return bool(_yg.get("vid")) and vid == _yg["vid"] and _yg["state"] in ("run", "prompt", "need_code")
+
+
 @app.route("/cookies/verify/<vid>")
 def cookies_verify_page(vid):
-    from html import escape as _esc
-    with _yg_lock:
-        valid = bool(_yg.get("vid")) and vid == _yg["vid"] and _yg["state"] in ("run", "prompt", "need_code")
-        shot, state, msg = _yg.get("shot", ""), _yg["state"], _yg.get("msg", "")
-    if not valid:
+    if not _yg_valid(vid):
         return "Link khong hop le hoac da het han", 404
-    img = (f'<img src="data:image/jpeg;base64,{shot}" style="max-width:100%;border:1px solid #ccc">'
-           if shot else "<p>Dang chup man hinh...</p>")
-    form = ""
-    refresh = '<meta http-equiv="refresh" content="4">'
-    if state == "need_code":
-        refresh = ""
-        form = (f'<form method="post" action="/cookies/verify/{_esc(vid)}">'
-                '<input name="code" inputmode="numeric" maxlength="8" placeholder="Ma 2 buoc"> '
-                '<button type="submit">Gui ma</button></form>')
-    html = ('<!doctype html><html><head><meta charset="utf-8">'
-            '<meta name="viewport" content="width=device-width,initial-scale=1">' + refresh +
-            '<title>Xac minh Google</title></head><body style="font-family:sans-serif">'
-            f'<p>Trang thai: {_esc(state)} - {_esc(msg)}</p>{img}{form}'
-            '<p>Neu Google yeu cau, bam "Co" tren dien thoai. Trang tu lam moi.</p></body></html>')
+    html = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Xac minh Google</title>
+<style>body{font-family:sans-serif;margin:8px}img{width:100%;border:1px solid #888;touch-action:manipulation}
+input{font-size:16px;padding:6px;width:55%}button{font-size:16px;padding:6px 10px;margin:2px}</style></head><body>
+<div id="st">...</div>
+<img id="v" alt="dang chup man hinh">
+<div><input id="t" placeholder="Go chu / ma vao o dang chon"> <button onclick="send('type')">Go</button>
+<button onclick="key('Enter')">Enter</button><button onclick="key('Backspace')">Xoa</button></div>
+<div><input id="c" inputmode="numeric" maxlength="8" placeholder="Ma 2 buoc (neu co)"> <button onclick="code()">Gui ma</button></div>
+<p>Cham vao anh de bam/chon o nhap. Anh tu lam moi.</p>
+<script>
+var vid="__VID__",img=document.getElementById("v");
+function post(u,b){return fetch("/cookies/verify/"+vid+u,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)})}
+function refresh(){img.src="/cookies/verify/"+vid+"/shot.jpg?t="+Date.now();
+ fetch("/cookies/verify/"+vid+"/st").then(function(r){return r.ok?r.text():"Het han"}).then(function(x){document.getElementById("st").textContent=x})}
+img.onclick=function(e){var r=img.getBoundingClientRect(),k=1024/r.width;
+ post("/act",{t:"click",x:(e.clientX-r.left)*k,y:(e.clientY-r.top)*k}).then(function(){setTimeout(refresh,700)})};
+function send(){var v=document.getElementById("t");post("/act",{t:"type",s:v.value}).then(function(){v.value="";setTimeout(refresh,700)})}
+function key(k){post("/act",{t:"key",s:k}).then(function(){setTimeout(refresh,700)})}
+function code(){var v=document.getElementById("c");post("/code",{code:v.value}).then(function(){v.value="";setTimeout(refresh,1500)})}
+refresh();setInterval(refresh,3000);
+</script></body></html>""".replace("__VID__", vid)
     return html
+
+
+@app.route("/cookies/verify/<vid>/st")
+def cookies_verify_st(vid):
+    if not _yg_valid(vid):
+        return "Het han", 404
+    with _yg_lock:
+        return f"{_yg['state']}: {_yg.get('msg', '')}", 200
+
+
+@app.route("/cookies/verify/<vid>/shot.jpg")
+def cookies_verify_shot(vid):
+    if not _yg_valid(vid):
+        return "Het han", 404
+    with _yg_lock:
+        b64 = _yg.get("shot", "")
+    if not b64:
+        return "chua co anh", 404
+    return Response(__import__("base64").b64decode(b64), mimetype="image/jpeg",
+                    headers={"Cache-Control": "no-store"})
+
+
+@app.route("/cookies/verify/<vid>/act", methods=["POST"])
+def cookies_verify_act(vid):
+    if not _yg_valid(vid):
+        return "Het han", 404
+    d = request.get_json(silent=True) or {}
+    if d.get("t") not in ("click", "type", "key"):
+        return "sai", 400
+    with _yg_lock:
+        if len(_yg["acts"]) < 20:
+            _yg["acts"].append({k: d.get(k) for k in ("t", "x", "y", "s")})
+    return "ok", 200
 
 
 @app.route("/cookies/verify/<vid>/code", methods=["POST"])
 def cookies_verify_code(vid):
-    with _yg_lock:
-        valid = bool(_yg.get("vid")) and vid == _yg["vid"] and _yg["state"] in ("run", "prompt", "need_code")
-    if not valid:
-        return "Link khong hop le hoac da het han", 404
-    code = (request.form.get("code") or "").strip()
+    if not _yg_valid(vid):
+        return "Het han", 404
+    d = request.get_json(silent=True) or {}
+    code = str(d.get("code", "")).strip()
     if not re.fullmatch(r"\d{4,8}", code):
         return "Ma khong hop le (4-8 chu so)", 400
     with _yg_lock:
         _yg["code"] = code
-    return f'<meta http-equiv="refresh" content="0;url=/cookies/verify/{vid}">Da gui ma.', 200
+    return "ok", 200
 
 
 @app.route("/cookies", methods=["GET", "POST"])
