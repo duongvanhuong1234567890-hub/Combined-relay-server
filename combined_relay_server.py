@@ -1131,9 +1131,10 @@ def _ck_rotate_once():
 
 
 def _ck_rotate_loop():
+    time.sleep(min(_ROT_EVERY, 90))  # lan dau chay som: free tier hay bi ngu truoc khi toi 15 phut
     while True:
-        time.sleep(_ROT_EVERY)
         if not COOKIES.exists():
+            time.sleep(_ROT_EVERY)
             continue
         try:
             _ck_rotate_once()
@@ -1141,6 +1142,7 @@ def _ck_rotate_loop():
         except Exception as e:
             _rot_state["fail"] += 1
             print(f"[cookies] gia han that bai ({_rot_state['fail']}): {str(e)[:160]}", flush=True)
+        time.sleep(_ROT_EVERY)
 
 
 def _ck_rotate_start():
