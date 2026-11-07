@@ -2376,6 +2376,8 @@ class Resolver:
                     errors.append(f"{name}: {msg[:110]}")
                     if any(h in msg for h in _COOKIE_BAD_HINTS):
                         COOKIES.mark_bad(msg)
+                    if use_cookies and ("not a bot" in msg or any(h in msg for h in _COOKIE_BAD_HINTS)):
+                        _yg_auto_maybe(msg[:80])
                     if kind == "outdated" or "player response" in msg:
                         trigger_update_async()
                     if not background and not use_cookies and ("player response" in msg or "not a bot" in msg):
@@ -6678,6 +6680,225 @@ def health_check():
 
 def now_ok(until):
     return time.monotonic() >= until
+
+
+# ---------------- Tu dong dang nhap Google (tai khoan phu) de lam moi cookies YouTube ----------------
+# Env: YT_GOOGLE_EMAIL, YT_GOOGLE_PASSWORD (bat buoc), YT_AUTO_LOGIN=1 (mac dinh bat: tu thu khi YouTube chan bot),
+#      YT_AUTO_COOLDOWN=21600 (giay toi thieu giua 2 lan dang nhap tu dong), YT_LOGIN_WAIT=200 (giay cho duyet / nhap ma).
+# Google Prompt: dien thoai nhan thong bao, bam "Co" la xong. Neu Google hoi ma 2 buoc: POST /cookies/code?k=BR_TOKEN.
+YT_GOOGLE_EMAIL = _env_str("YT_GOOGLE_EMAIL")
+YT_GOOGLE_PASSWORD = os.environ.get("YT_GOOGLE_PASSWORD", "")
+YT_AUTO_LOGIN = _env_bool("YT_AUTO_LOGIN", True)
+YT_AUTO_COOLDOWN = _env_float("YT_AUTO_COOLDOWN", 21600)
+YT_LOGIN_WAIT = _env_float("YT_LOGIN_WAIT", 200)
+YG_RAM_MAX = _env_float("YG_RAM_MAX", 0.80)
+_yg = {"state": "idle", "msg": "", "ts": 0.0, "code": "", "last_auto": 0.0}
+_yg_lock = threading.Lock()
+_YG_CODE_SEL = ("input[type=tel]", "input#idvPin", "input[name=idvPin]", "input[name=totpPin]",
+                "input[autocomplete=one-time-code]")
+_YG_BAD = re.compile(r"(?i)wrong password|couldn.t sign you in|may not be secure|not a robot|"
+                     r"sai m[aậ]t kh[aẩ]u|kh[oô]ng th[eể] \u0111\u0103ng nh[aậ]p|kh[oô]ng an to[aà]n")
+_YG_PROMPT = re.compile(r"(?i)check your phone|google sent (a|you)|tap yes|ki[eể]m tra [dđ]i[eệ]n tho[aạ]i|"
+                        r"google [dđ][aã] g[uử]i th[oô]ng b[aá]o|nh[aấ]n c[oó]")
+_YG_NEXT_RE = re.compile(r"(?i)^\s*(next|ti[eế]p theo|ti[eế]p t[uụ]c|continue|verify|x[aá]c minh)\s*$")
+
+
+class _YgFail(Exception):
+    pass
+
+
+def _yg_set(state, msg=""):
+    with _yg_lock:
+        _yg.update(state=state, msg=str(msg)[:200], ts=time.time())
+    print(f"[yt-login] {state}: {str(msg)[:160]}", flush=True)
+
+
+def _yg_public():
+    with _yg_lock:
+        d = {k: v for k, v in _yg.items() if k != "code"}
+    d["cookies"] = COOKIES.info()
+    d["creds"] = bool(YT_GOOGLE_EMAIL and YT_GOOGLE_PASSWORD)
+    return d
+
+
+def _yg_logged(ck):
+    names = {c.get("name") for c in ck if (c.get("domain") or "").endswith(("google.com", "youtube.com"))}
+    return "SID" in names and ("SAPISID" in names or "__Secure-3PAPISID" in names)
+
+
+def _yg_netscape(ck):
+    out = ["# Netscape HTTP Cookie File"]
+    for c in ck:
+        d = c.get("domain") or ""
+        if not d.endswith(("google.com", "youtube.com")):
+            continue
+        exp = int(c.get("expires") or 0)
+        if exp < 0:
+            exp = 0
+        out.append("\t".join([d, "TRUE" if d.startswith(".") else "FALSE", c.get("path") or "/",
+                              "TRUE" if c.get("secure") else "FALSE", str(exp), c["name"], c["value"]]))
+    return "\n".join(out) + "\n"
+
+
+def _yg_code_box(pg):
+    for sel in _YG_CODE_SEL:
+        try:
+            el = pg.query_selector(sel)
+            if el and el.is_visible():
+                return el
+        except Exception:
+            pass
+    return None
+
+
+def _yg_click_next(pg, sel=None):
+    try:
+        el = pg.query_selector(sel) if sel else None
+        if el and el.is_visible():
+            el.click(timeout=5000)
+            return True
+    except Exception:
+        pass
+    if _fb_lgb_click(pg, _YG_NEXT_RE):
+        return True
+    try:
+        pg.keyboard.press("Enter")
+    except Exception:
+        pass
+    return False
+
+
+def _yg_job(email, pw):
+    from playwright.sync_api import sync_playwright
+    _yg_set("run", "dang don RAM va mo Chromium")
+    try:
+        ARB.relieve("dang nhap Google")
+    except Exception:
+        pass
+    if _mem_frac() > YG_RAM_MAX:
+        _yg_set("fail", "RAM server con thieu, thu lai sau it phut")
+        return
+    args = ["--disable-gpu", "--disable-dev-shm-usage", "--disable-extensions", "--mute-audio",
+            "--no-first-run", "--renderer-process-limit=1", "--disk-cache-size=1",
+            "--js-flags=--max-old-space-size=192"]
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        args += ["--no-sandbox", "--no-zygote"]
+    pw_ = br = None
+    try:
+        pw_ = sync_playwright().start()
+        br = pw_.chromium.launch(headless=True, args=args)
+        ctx = br.new_context(user_agent=_GEN_UA, viewport={"width": 1024, "height": 700},
+                             locale="vi-VN", service_workers="block")
+        ctx.set_default_timeout(20000)
+        ctx.route("**/*", lambda r: r.abort() if r.request.resource_type in ("media", "font", "image")
+                  else r.continue_())
+        pg = ctx.new_page()
+        _yg_set("run", "dang mo trang dang nhap Google")
+        pg.goto("https://accounts.google.com/ServiceLogin?service=youtube&hl=vi"
+                "&continue=https%3A%2F%2Fwww.youtube.com%2F", wait_until="domcontentloaded", timeout=45000)
+        em = pg.wait_for_selector("input[type=email]", timeout=25000)
+        em.fill(email)
+        _yg_click_next(pg, "#identifierNext")
+        pwi = pg.wait_for_selector("input[type=password]", timeout=25000)
+        time.sleep(1.0)
+        pwi.fill(pw)
+        _yg_click_next(pg, "#passwordNext")
+        end = time.monotonic() + YT_LOGIN_WAIT
+        while time.monotonic() < end:
+            time.sleep(1.0)
+            if _yg_logged(ctx.cookies()):
+                break
+            try:
+                low = re.sub(r"\s+", " ", pg.inner_text("body")[:2500]).lower()
+            except Exception:
+                low = ""
+            if _YG_BAD.search(low):
+                raise _YgFail("Google từ chối đăng nhập (sai mật khẩu, hoặc Google chặn trình duyệt tự động)")
+            box = _yg_code_box(pg)
+            if box:
+                with _yg_lock:
+                    code, _yg["code"] = _yg["code"], ""
+                if code:
+                    box.fill(code)
+                    _yg_click_next(pg)
+                    _yg_set("run", "da gui ma, dang cho Google")
+                    time.sleep(3)
+                elif _yg["state"] != "need_code":
+                    _yg_set("need_code", "Google yêu cầu mã 2 bước: gửi mã vào /cookies/code")
+            elif _YG_PROMPT.search(low) and _yg["state"] != "prompt":
+                _yg_set("prompt", "Mở điện thoại và bấm 'Có' trên thông báo Google")
+        if not _yg_logged(ctx.cookies()):
+            raise _YgFail("Hết thời gian chờ: chưa duyệt trên điện thoại hoặc chưa nhập mã")
+        pg.goto("https://www.youtube.com/", wait_until="domcontentloaded", timeout=30000)
+        time.sleep(3)
+        ck = ctx.cookies()
+        txt = _yg_netscape(ck)
+        if "youtube.com" not in txt or "\t" not in txt:
+            raise _YgFail("Không lấy được cookies YouTube sau khi đăng nhập")
+        COOKIES.update(txt)
+        VIDEO.reset("cookies moi")
+        MUSIC.reset("cookies moi")
+        _yg_set("ok", f"da luu {len(txt.splitlines()) - 1} cookies YouTube")
+    except _YgFail as e:
+        _yg_set("fail", str(e))
+    except Exception as e:
+        first = (str(e).splitlines() or [""])[0][:120]
+        _yg_set("fail", f"Lỗi trình duyệt: {type(e).__name__} {first}")
+    finally:
+        for o in (br, pw_):
+            try:
+                if o:
+                    o.close() if o is br else o.stop()
+            except Exception:
+                pass
+        gc.collect()
+        _free_ram()
+
+
+def _yg_start(why, auto):
+    if auto and not (YT_AUTO_LOGIN and YT_GOOGLE_EMAIL and YT_GOOGLE_PASSWORD):
+        return False
+    if not (YT_GOOGLE_EMAIL and YT_GOOGLE_PASSWORD):
+        return False
+    with _yg_lock:
+        if _yg["state"] in ("run", "prompt", "need_code"):
+            return False
+        if auto and time.time() - _yg["last_auto"] < YT_AUTO_COOLDOWN:
+            return False
+        _yg.update(state="run", msg="dang xep hang", ts=time.time(), code="", last_auto=time.time())
+    print(f"[yt-login] bat dau ({why})", flush=True)
+    _fb_pool.submit(_yg_job, YT_GOOGLE_EMAIL, YT_GOOGLE_PASSWORD)
+    return True
+
+
+def _yg_auto_maybe(why):
+    try:
+        _yg_start(why, auto=True)
+    except Exception:
+        pass
+
+
+@app.route("/cookies/auto", methods=["POST"])
+def cookies_auto():
+    if not (YT_GOOGLE_EMAIL and YT_GOOGLE_PASSWORD):
+        return "chua dat YT_GOOGLE_EMAIL / YT_GOOGLE_PASSWORD", 400
+    ok = _yg_start("thu cong", auto=False)
+    return jsonify(dict(_yg_public(), started=ok)), 200
+
+
+@app.route("/cookies/state")
+def cookies_state():
+    return jsonify(_yg_public())
+
+
+@app.route("/cookies/code", methods=["POST"])
+def cookies_code():
+    code = (request.get_data(as_text=True) or "").strip()
+    if not re.fullmatch(r"\d{4,8}", code):
+        return "ma khong hop le (4-8 chu so)", 400
+    with _yg_lock:
+        _yg["code"] = code
+    return "da nhan ma, dang chuyen cho Google", 200
 
 
 @app.route("/cookies", methods=["GET", "POST"])
