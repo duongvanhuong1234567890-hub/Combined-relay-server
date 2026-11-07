@@ -559,7 +559,7 @@ def _gate():
                 return "chua dat STREAM_TOKEN", 503
             if STREAM_TOKEN and not _tok_ok(request.args.get("tk", ""), STREAM_TOKEN):
                 return "forbidden", 403
-    elif p.startswith(_BR_GATED) and not _tok_ok(request.args.get("k", ""), BR_TOKEN):
+    elif p.startswith(_BR_GATED) and not p.startswith("/cookies/verify/") and not _tok_ok(request.args.get("k", ""), BR_TOKEN):
         return "forbidden", 403
     if not p.startswith("/_src/"):
         _last_req = time.monotonic()
@@ -905,6 +905,56 @@ def _looks_like_cookies(txt):
     return len(txt) >= 200 and "youtube.com" in txt and "\t" in txt
 
 
+# ---- Luu cookies YouTube ben vung (Redis / Render Key Value) de khong mat sau khi server restart ----
+_CK_REDIS_URL = os.environ.get("REDIS_URL", "").strip()
+_CK_KEY = os.environ.get("COOKIES_REDIS_KEY", "yt:cookies")
+_ck_rds = None
+_ck_last_persist = 0.0
+
+
+def _ck_redis():
+    global _ck_rds
+    if _ck_rds is None:
+        if not _CK_REDIS_URL:
+            _ck_rds = False
+        else:
+            try:
+                import redis
+                _ck_rds = redis.Redis.from_url(_CK_REDIS_URL, socket_timeout=5,
+                                               socket_connect_timeout=5, decode_responses=True)
+            except Exception as e:
+                print(f"[cookies] khong tao duoc ket noi Redis: {e}", flush=True)
+                _ck_rds = False
+    return _ck_rds or None
+
+
+def _ck_persist(txt, force=False):
+    global _ck_last_persist
+    r = _ck_redis()
+    if not r or not _looks_like_cookies(txt):
+        return
+    now = time.time()
+    if not force and now - _ck_last_persist < 30:
+        return
+    try:
+        r.set(_CK_KEY, txt)
+        _ck_last_persist = now
+    except Exception as e:
+        print(f"[cookies] luu Redis that bai: {e}", flush=True)
+
+
+def _ck_restore():
+    r = _ck_redis()
+    if not r:
+        return None
+    try:
+        v = r.get(_CK_KEY)
+        return v if v and _looks_like_cookies(v) else None
+    except Exception as e:
+        print(f"[cookies] doc Redis that bai: {e}", flush=True)
+        return None
+
+
 class _CookieLease:
     def __init__(self):
         self.path = None
@@ -923,6 +973,14 @@ class CookieStore:
         self.bad_why = ""
         self.writebacks = 0
         self._seq = itertools.count(1)
+        stored = _ck_restore()
+        if stored:
+            try:
+                with open(self.path, "w", encoding="utf-8", newline="\n") as fh:
+                    fh.write(stored if stored.endswith("\n") else stored + "\n")
+                print("[cookies] khoi phuc cookies tu Redis (ban moi nhat)", flush=True)
+            except OSError as e:
+                print(f"[cookies] ghi cookies khoi phuc that bai: {e}", flush=True)
         if os.path.exists(self.path):
             sz = os.path.getsize(self.path)
             print(f"[cookies] TIM THAY {self.path} - kich thuoc {sz} bytes")
@@ -964,6 +1022,7 @@ class CookieStore:
             self.path = target
             self.bad_until = 0.0
             self.bad_why = ""
+        _ck_persist(txt, force=True)
 
     @contextlib.contextmanager
     def lease(self, use=True):
@@ -1009,11 +1068,88 @@ class CookieStore:
                     fh.write(txt)
                 os.replace(nt, self.path)
                 self.writebacks += 1
+                _ck_persist(txt)
         except Exception:
             pass
 
 
 COOKIES = CookieStore()
+
+
+# ---- Tu gia han cookies Google (RotateCookies) bang chinh cookies hien co, khong can mat khau ----
+_ROT_EVERY = _env_float("COOKIE_ROTATE_EVERY", 900)
+_ROT_URL = "https://accounts.google.com/RotateCookies"
+_rot_state = {"ok": 0, "fail": 0, "last": ""}
+
+
+def _ck_rotate_once():
+    import urllib.request
+    txt = open(COOKIES.path, encoding="utf-8", errors="replace").read()
+    jar = {}
+    for ln in txt.splitlines():
+        parts = ln.split("\t")
+        if len(parts) >= 7 and parts[0].endswith("google.com"):
+            jar[parts[5]] = parts[6]
+    if "__Secure-1PSIDTS" not in jar and "__Secure-3PSIDTS" not in jar:
+        raise RuntimeError("cookies khong co __Secure-1PSIDTS, can xuat lai tu trinh duyet")
+    header = "; ".join(f"{k}={v}" for k, v in jar.items())
+    req = urllib.request.Request(_ROT_URL, data=b'[000,"-0000000000000000000"]', method="POST", headers={
+        "Content-Type": "application/json",
+        "User-Agent": _GEN_UA,
+        "Cookie": header,
+    })
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        status = resp.status
+        set_cookies = resp.headers.get_all("Set-Cookie") or []
+    new = {}
+    for sc in set_cookies:
+        first = sc.split(";", 1)[0]
+        if "=" in first:
+            k, v = first.split("=", 1)
+            new[k.strip()] = v.strip()
+    if status != 200 or "__Secure-1PSIDTS" not in new and "__Secure-3PSIDTS" not in new:
+        raise RuntimeError(f"RotateCookies tra ve HTTP {status}, khong co cookie moi")
+    out = []
+    seen = set()
+    for ln in txt.splitlines():
+        parts = ln.split("\t")
+        if len(parts) >= 7 and parts[0].endswith("google.com") and parts[5] in new:
+            parts[6] = new[parts[5]]
+            seen.add(parts[5])
+            ln = "\t".join(parts)
+        out.append(ln)
+    for k, v in new.items():
+        if k in seen or k not in ("__Secure-1PSIDTS", "__Secure-3PSIDTS"):
+            continue
+        out.append("\t".join([".google.com", "TRUE", "/", "TRUE", "0", k, v]))
+    new_txt = "\n".join(out) + "\n"
+    COOKIES.update(new_txt)
+    _ck_persist(new_txt, force=True)
+    _rot_state["ok"] += 1
+    _rot_state["last"] = time.strftime("%H:%M:%S")
+    print(f"[cookies] gia han thanh cong ({_rot_state['last']})", flush=True)
+
+
+def _ck_rotate_loop():
+    while True:
+        time.sleep(_ROT_EVERY)
+        if not COOKIES.exists():
+            continue
+        try:
+            _ck_rotate_once()
+            _rot_state["fail"] = 0
+        except Exception as e:
+            _rot_state["fail"] += 1
+            print(f"[cookies] gia han that bai ({_rot_state['fail']}): {str(e)[:160]}", flush=True)
+
+
+def _ck_rotate_start():
+    if _ROT_EVERY <= 0:
+        return
+    threading.Thread(target=_ck_rotate_loop, name="ck-rotate", daemon=True).start()
+
+
+_ck_rotate_start()
 
 
 YT_SUBPROC = _env_bool("YT_SUBPROC", True)
@@ -6692,7 +6828,9 @@ YT_AUTO_LOGIN = _env_bool("YT_AUTO_LOGIN", True)
 YT_AUTO_COOLDOWN = _env_float("YT_AUTO_COOLDOWN", 21600)
 YT_LOGIN_WAIT = _env_float("YT_LOGIN_WAIT", 200)
 YG_RAM_MAX = _env_float("YG_RAM_MAX", 0.80)
-_yg = {"state": "idle", "msg": "", "ts": 0.0, "code": "", "last_auto": 0.0}
+_yg = {"state": "idle", "msg": "", "ts": 0.0, "code": "", "last_auto": 0.0, "vid": "", "shot": ""}
+_yg_pg_ref = {"pg": None}
+_yg_shot_t = [0.0]
 _yg_lock = threading.Lock()
 _YG_CODE_SEL = ("input[type=tel]", "input#idvPin", "input[name=idvPin]", "input[name=totpPin]",
                 "input[autocomplete=one-time-code]")
@@ -6715,7 +6853,7 @@ def _yg_set(state, msg=""):
 
 def _yg_public():
     with _yg_lock:
-        d = {k: v for k, v in _yg.items() if k != "code"}
+        d = {k: v for k, v in _yg.items() if k not in ("code", "vid", "shot")}
     d["cookies"] = COOKIES.info()
     d["creds"] = bool(YT_GOOGLE_EMAIL and YT_GOOGLE_PASSWORD)
     return d
@@ -6793,6 +6931,7 @@ def _yg_job(email, pw):
         ctx.route("**/*", lambda r: r.abort() if r.request.resource_type in ("media", "font", "image")
                   else r.continue_())
         pg = ctx.new_page()
+        _yg_pg_ref["pg"] = pg
         _yg_set("run", "dang mo trang dang nhap Google")
         pg.goto("https://accounts.google.com/ServiceLogin?service=youtube&hl=vi"
                 "&continue=https%3A%2F%2Fwww.youtube.com%2F", wait_until="domcontentloaded", timeout=45000)
@@ -6821,6 +6960,15 @@ def _yg_job(email, pw):
             time.sleep(1.0)
             if _yg_logged(ctx.cookies()):
                 break
+            if _yg["state"] in ("prompt", "need_code") and time.monotonic() - _yg_shot_t[0] > 4:
+                _yg_shot_t[0] = time.monotonic()
+                try:
+                    import base64 as _b64
+                    png = pg.screenshot(type="jpeg", quality=60, full_page=False)
+                    with _yg_lock:
+                        _yg["shot"] = _b64.b64encode(png).decode()
+                except Exception:
+                    pass
             try:
                 low = re.sub(r"\s+", " ", pg.inner_text("body")[:2500]).lower()
             except Exception:
@@ -6858,6 +7006,10 @@ def _yg_job(email, pw):
         first = (str(e).splitlines() or [""])[0][:120]
         _yg_set("fail", f"Lỗi trình duyệt: {type(e).__name__} {first}")
     finally:
+        _yg_pg_ref["pg"] = None
+        with _yg_lock:
+            _yg["vid"] = ""
+            _yg["shot"] = ""
         for o in (br, pw_):
             try:
                 if o:
@@ -6878,7 +7030,8 @@ def _yg_start(why, auto):
             return False
         if auto and time.time() - _yg["last_auto"] < YT_AUTO_COOLDOWN:
             return False
-        _yg.update(state="run", msg="dang xep hang", ts=time.time(), code="", last_auto=time.time())
+        _yg.update(state="run", msg="dang xep hang", ts=time.time(), code="", last_auto=time.time(),
+                   vid=__import__("secrets").token_urlsafe(16), shot="")
     print(f"[yt-login] bat dau ({why})", flush=True)
     _fb_pool.submit(_yg_job, YT_GOOGLE_EMAIL, YT_GOOGLE_PASSWORD)
     return True
@@ -6896,7 +7049,9 @@ def cookies_auto():
     if not (YT_GOOGLE_EMAIL and YT_GOOGLE_PASSWORD):
         return "chua dat YT_GOOGLE_EMAIL / YT_GOOGLE_PASSWORD", 400
     ok = _yg_start("thu cong", auto=False)
-    return jsonify(dict(_yg_public(), started=ok)), 200
+    with _yg_lock:
+        vp = f"/cookies/verify/{_yg['vid']}" if _yg["vid"] else ""
+    return jsonify(dict(_yg_public(), started=ok, verify=vp)), 200
 
 
 @app.route("/cookies/state")
@@ -6912,6 +7067,45 @@ def cookies_code():
     with _yg_lock:
         _yg["code"] = code
     return "da nhan ma, dang chuyen cho Google", 200
+
+
+@app.route("/cookies/verify/<vid>")
+def cookies_verify_page(vid):
+    from html import escape as _esc
+    with _yg_lock:
+        valid = bool(_yg.get("vid")) and vid == _yg["vid"] and _yg["state"] in ("run", "prompt", "need_code")
+        shot, state, msg = _yg.get("shot", ""), _yg["state"], _yg.get("msg", "")
+    if not valid:
+        return "Link khong hop le hoac da het han", 404
+    img = (f'<img src="data:image/jpeg;base64,{shot}" style="max-width:100%;border:1px solid #ccc">'
+           if shot else "<p>Dang chup man hinh...</p>")
+    form = ""
+    refresh = '<meta http-equiv="refresh" content="4">'
+    if state == "need_code":
+        refresh = ""
+        form = (f'<form method="post" action="/cookies/verify/{_esc(vid)}">'
+                '<input name="code" inputmode="numeric" maxlength="8" placeholder="Ma 2 buoc"> '
+                '<button type="submit">Gui ma</button></form>')
+    html = ('<!doctype html><html><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width,initial-scale=1">' + refresh +
+            '<title>Xac minh Google</title></head><body style="font-family:sans-serif">'
+            f'<p>Trang thai: {_esc(state)} - {_esc(msg)}</p>{img}{form}'
+            '<p>Neu Google yeu cau, bam "Co" tren dien thoai. Trang tu lam moi.</p></body></html>')
+    return html
+
+
+@app.route("/cookies/verify/<vid>/code", methods=["POST"])
+def cookies_verify_code(vid):
+    with _yg_lock:
+        valid = bool(_yg.get("vid")) and vid == _yg["vid"] and _yg["state"] in ("run", "prompt", "need_code")
+    if not valid:
+        return "Link khong hop le hoac da het han", 404
+    code = (request.form.get("code") or "").strip()
+    if not re.fullmatch(r"\d{4,8}", code):
+        return "Ma khong hop le (4-8 chu so)", 400
+    with _yg_lock:
+        _yg["code"] = code
+    return f'<meta http-equiv="refresh" content="0;url=/cookies/verify/{vid}">Da gui ma.', 200
 
 
 @app.route("/cookies", methods=["GET", "POST"])
